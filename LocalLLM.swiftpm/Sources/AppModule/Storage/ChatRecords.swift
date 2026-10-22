@@ -10,15 +10,18 @@ final class Conversation {
     var updatedAt: Date = Date()
     /// 最後に使ったモデルの ID（InstalledModel.id）
     var modelID: String?
+    /// この会話で使うマイアシスタント（Assistant.id）。nil なら通常のチャット
+    var assistantID: UUID?
     @Relationship(deleteRule: .cascade, inverse: \StoredMessage.conversation)
     var messages: [StoredMessage] = []
 
-    init(title: String = "", modelID: String? = nil) {
+    init(title: String = "", modelID: String? = nil, assistantID: UUID? = nil) {
         self.id = UUID()
         self.title = title
         self.createdAt = Date()
         self.updatedAt = Date()
         self.modelID = modelID
+        self.assistantID = assistantID
         self.messages = []
     }
 
@@ -77,6 +80,10 @@ final class StoredMessage {
     var statsData: Data?
     /// 生成エラーの説明（失敗したとき）
     var errorText: String?
+    /// 参考資料の検索結果（user メッセージに付けてモデルへ渡す。画面には出さない）
+    var attachedContext: String?
+    /// 参考にした資料の一覧（"ファイル名 L10-40" の配列を JSON で保存）
+    var sourcesData: Data?
     var conversation: Conversation?
 
     init(role: ChatMessage.Role, content: String, order: Int, modelName: String? = nil) {
@@ -98,7 +105,16 @@ final class StoredMessage {
         set { statsData = newValue.flatMap { try? JSONEncoder().encode($0) } }
     }
 
+    var sources: [String] {
+        get { sourcesData.flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? [] }
+        set { sourcesData = newValue.isEmpty ? nil : (try? JSONEncoder().encode(newValue)) }
+    }
+
+    /// モデルに渡す形。参考資料があれば本文の前に付ける（毎回同じ文字列になるので KV キャッシュも再利用できる）。
     var chatMessage: ChatMessage {
-        ChatMessage(role: role, content: content)
+        if let attachedContext, !attachedContext.isEmpty, role == .user {
+            return ChatMessage(role: role, content: attachedContext + "\n\n" + L("質問: ", "Question: ") + content)
+        }
+        return ChatMessage(role: role, content: content)
     }
 }

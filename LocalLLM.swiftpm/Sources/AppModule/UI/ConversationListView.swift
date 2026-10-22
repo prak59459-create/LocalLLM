@@ -6,10 +6,13 @@ struct ConversationListView: View {
     @Environment(\.modelContext) private var context
     @Environment(ChatController.self) private var chat
     @Query(sort: \Conversation.updatedAt, order: .reverse) private var conversations: [Conversation]
+    @Query(sort: \Assistant.createdAt) private var assistants: [Assistant]
 
     @Binding var selection: UUID?
-    var onNewChat: () -> Void
+    var onNewChat: (Assistant?) -> Void
     var onShowModels: () -> Void
+    var onShowAssistants: () -> Void
+    var onShowStudio: () -> Void
     var onShowSettings: () -> Void
 
     @State private var renaming: Conversation?
@@ -28,7 +31,8 @@ struct ConversationListView: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(conversations) { conversation in
-                    ConversationRow(conversation: conversation)
+                    ConversationRow(conversation: conversation,
+                                    assistant: assistants.first { $0.id == conversation.assistantID })
                         .tag(conversation.id)
                         .contextMenu {
                             Button {
@@ -56,13 +60,19 @@ struct ConversationListView: View {
         .navigationTitle("LocalLLM")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button(action: onNewChat) {
-                    Label(L("新しいチャット", "New Chat"), systemImage: "square.and.pencil")
-                }
+                NewChatMenu(assistants: assistants, onNewChat: onNewChat, onShowAssistants: onShowAssistants)
             }
             ToolbarItemGroup(placement: .bottomBar) {
                 Button(action: onShowModels) {
                     Label(L("モデル", "Models"), systemImage: "cpu")
+                }
+                Spacer()
+                Button(action: onShowAssistants) {
+                    Label(L("アシスタント", "Assistants"), systemImage: "person.crop.rectangle.stack")
+                }
+                Spacer()
+                Button(action: onShowStudio) {
+                    Label(L("ミニLLM工房", "Mini LLM Studio"), systemImage: "hammer")
                 }
                 Spacer()
                 Button(action: onShowSettings) {
@@ -103,13 +113,56 @@ struct ConversationListView: View {
     }
 }
 
+/// 新しいチャットのボタン（長押し・タップでアシスタントも選べる）。
+private struct NewChatMenu: View {
+    let assistants: [Assistant]
+    var onNewChat: (Assistant?) -> Void
+    var onShowAssistants: () -> Void
+
+    var body: some View {
+        Menu {
+            Button {
+                onNewChat(nil)
+            } label: {
+                Label(L("通常のチャット", "Plain chat"), systemImage: "bubble.left")
+            }
+            if !assistants.isEmpty {
+                Section(L("マイアシスタント", "My Assistants")) {
+                    ForEach(assistants) { assistant in
+                        Button {
+                            onNewChat(assistant)
+                        } label: {
+                            Label(assistant.name, systemImage: assistant.symbolName)
+                        }
+                    }
+                }
+            }
+            Button(action: onShowAssistants) {
+                Label(L("アシスタントを作る・編集…", "Create or edit assistants…"), systemImage: "person.crop.rectangle.stack")
+            }
+        } label: {
+            Label(L("新しいチャット", "New Chat"), systemImage: "square.and.pencil")
+        } primaryAction: {
+            onNewChat(nil)
+        }
+    }
+}
+
 private struct ConversationRow: View {
     let conversation: Conversation
+    let assistant: Assistant?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(conversation.displayTitle)
-                .lineLimit(1)
+            HStack(spacing: 4) {
+                if let assistant {
+                    Image(systemName: assistant.symbolName)
+                        .font(.caption)
+                        .foregroundStyle(.tint)
+                }
+                Text(conversation.displayTitle)
+                    .lineLimit(1)
+            }
             Text(conversation.updatedAt, format: .relative(presentation: .named))
                 .font(.caption)
                 .foregroundStyle(.secondary)

@@ -13,20 +13,27 @@ struct RootView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
     @State private var showingModels = false
     @State private var showingSettings = false
+    @State private var showingAssistants = false
+    @State private var showingStudio = false
     @State private var didAutoLoad = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             ConversationListView(selection: $selectedConversationID,
-                                 onNewChat: newConversation,
+                                 onNewChat: { newConversation(assistant: $0) },
                                  onShowModels: { showingModels = true },
+                                 onShowAssistants: { showingAssistants = true },
+                                 onShowStudio: { showingStudio = true },
                                  onShowSettings: { showingSettings = true })
         } detail: {
             if let conversation = selectedConversation {
                 ChatView(conversation: conversation, onShowModels: { showingModels = true })
                     .id(conversation.id)
             } else {
-                WelcomeView(onNewChat: newConversation, onShowModels: { showingModels = true })
+                WelcomeView(onNewChat: { newConversation(assistant: nil) },
+                            onShowModels: { showingModels = true },
+                            onShowAssistants: { showingAssistants = true },
+                            onShowStudio: { showingStudio = true })
             }
         }
         // 言語を切り替えたら画面全体を作り直して文字列を更新する
@@ -36,6 +43,12 @@ struct RootView: View {
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView()
+        }
+        .sheet(isPresented: $showingAssistants) {
+            AssistantsView(onStartChat: { newConversation(assistant: $0) })
+        }
+        .fullScreenCover(isPresented: $showingStudio) {
+            MiniLLMStudioView()
         }
         .task {
             autoLoadIfNeeded()
@@ -59,11 +72,16 @@ struct RootView: View {
         return try? context.fetch(descriptor).first
     }
 
-    private func newConversation() {
-        let conversation = Conversation(modelID: settings.activeModelID)
+    private func newConversation(assistant: Assistant?) {
+        let conversation = Conversation(modelID: settings.activeModelID, assistantID: assistant?.id)
         context.insert(conversation)
         try? context.save()
         selectedConversationID = conversation.id
+        // アシスタントに使うモデルが決まっていて、まだ読み込まれていなければ読み込む
+        if let id = assistant?.preferredModelID, chat.loadedInfo?.modelID != id,
+           library.model(withID: id)?.isComplete == true, !chat.isGenerating {
+            chat.loadModel(id: id, library: library, settings: settings)
+        }
     }
 
     /// 起動時に前回使ったモデルを読み込む。
@@ -84,6 +102,8 @@ struct WelcomeView: View {
     @Environment(ChatController.self) private var chat
     var onNewChat: () -> Void
     var onShowModels: () -> Void
+    var onShowAssistants: () -> Void
+    var onShowStudio: () -> Void
 
     var body: some View {
         VStack(spacing: 20) {
@@ -116,6 +136,17 @@ struct WelcomeView: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
+
+            HStack(spacing: 12) {
+                Button(action: onShowAssistants) {
+                    Label(L("自分専用の AI を作る", "Build your own assistant"), systemImage: "person.crop.rectangle.stack")
+                }
+                Button(action: onShowStudio) {
+                    Label(L("LLM をゼロから学習", "Train an LLM from scratch"), systemImage: "hammer")
+                }
+            }
+            .buttonStyle(.bordered)
+            .font(.callout)
         }
         .padding(32)
         .frame(maxWidth: 520)

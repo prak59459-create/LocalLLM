@@ -6,6 +6,7 @@ struct ChatView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(ModelLibrary.self) private var library
     @Environment(ChatController.self) private var chat
+    @Environment(KnowledgeStore.self) private var knowledge
     @Environment(\.modelContext) private var context
 
     @Bindable var conversation: Conversation
@@ -22,6 +23,9 @@ struct ChatView: View {
         VStack(spacing: 0) {
             if let notice = chat.notice {
                 NoticeBar(text: notice) { chat.notice = nil }
+            }
+            if let assistant {
+                AssistantBanner(assistant: assistant)
             }
             messageList
             if settings.showStats {
@@ -67,7 +71,7 @@ struct ChatView: View {
                             isStreaming: chat.progress?.messageID == message.id,
                             isLast: message.id == messages.last?.id,
                             onRegenerate: {
-                                chat.regenerate(in: conversation, context: context, settings: settings)
+                                chat.regenerate(in: conversation, context: context, settings: settings, assistant: assistant)
                             },
                             onDelete: { delete(message) }
                         )
@@ -93,11 +97,19 @@ struct ChatView: View {
 
     private let bottomID = "bottom"
 
+    /// この会話のアシスタント（あれば）
+    private var assistant: Assistant? {
+        guard let id = conversation.assistantID else { return nil }
+        let descriptor = FetchDescriptor<Assistant>(predicate: #Predicate { $0.id == id })
+        return try? context.fetch(descriptor).first
+    }
+
     private func send() {
         let text = draft
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         draft = ""
-        chat.send(text, in: conversation, context: context, settings: settings)
+        chat.send(text, in: conversation, context: context, settings: settings,
+                  assistant: assistant, knowledge: knowledge)
     }
 
     private func delete(_ message: StoredMessage) {
@@ -105,6 +117,52 @@ struct ChatView: View {
         conversation.messages.removeAll { $0.id == message.id }
         context.delete(message)
         try? context.save()
+    }
+}
+
+/// アシスタントを使っている会話の上部に出す帯。使うモデルが読み込まれていなければ読み込みボタンを出す。
+struct AssistantBanner: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(ModelLibrary.self) private var library
+    @Environment(ChatController.self) private var chat
+    @Environment(KnowledgeStore.self) private var knowledge
+    let assistant: Assistant
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: assistant.symbolName)
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(assistant.name).font(.subheadline.weight(.semibold))
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let preferred = preferredModel, chat.loadedInfo?.modelID != preferred.id, !chat.isBusyLoading {
+                Button {
+                    chat.loadModel(id: preferred.id, library: library, settings: settings)
+                } label: {
+                    Label(L("\(preferred.displayName) を読み込む", "Load \(preferred.displayName)"), systemImage: "arrow.down.to.line")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.accentColor.opacity(0.08))
+    }
+
+    private var preferredModel: InstalledModel? {
+        guard let id = assistant.preferredModelID, let model = library.model(withID: id), model.isComplete else { return nil }
+        return model
+    }
+
+    private var detail: String {
+        let count = knowledge.index(for: assistant.id).sources.count
+        if assistant.useKnowledge && count > 0 {
+            return L("参考資料 \(count) ファイル", "\(count) reference files")
+        }
+        return L("参考資料なし", "No reference files")
     }
 }
 

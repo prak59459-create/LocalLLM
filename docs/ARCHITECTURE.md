@@ -416,3 +416,160 @@ enum ByteFormat { static func string(_ bytes: Int64) -> String }   // 例: "1.9 
 - `ModelLibrary`（@Observable）: インストール済みモデル（`Application Support/Models/<owner>__<name>/` と `manifest.json`）、ダウンロード中のジョブ。
 - `AppSettings`（@Observable、UserDefaults）: 生成パラメータ、システムプロンプト、思考モード、計算ユニット、統計表示、言語、HF トークン。
 - 画面: 会話一覧（サイドバー）＋チャット、モデル（おすすめ / 検索 / インストール済み / 詳細とダウンロード）、設定。
+
+---
+
+## Core/MiniGPT（「ミニLLM工房」: iPad の中で小さな GPT をゼロから学習する）
+
+純 Swift の小さな GPT-2 風モデル（文字単位）。順伝播・逆伝播を手書きし、AdamW で学習する。
+行列積は `#if canImport(Accelerate)` なら `cblas_sgemm`（iPad の CPU / AMX で高速）、それ以外（Linux のテスト）は素朴なループ。
+Swift Playgrounds は最適化なし（-Onone）でビルドされるので、重い処理はできるだけ BLAS / vDSP に任せること。
+
+```swift
+enum MiniGPTPreset: String, Codable, CaseIterable, Sendable {
+    case tiny     // 2 層, 埋め込み 64, 2 ヘッド, 文脈 64
+    case small    // 4 層, 埋め込み 128, 4 ヘッド, 文脈 128
+    case medium   // 6 層, 埋め込み 192, 6 ヘッド, 文脈 128
+}
+
+struct MiniGPTConfig: Codable, Hashable, Sendable {
+    var vocabSize: Int
+    var contextLength: Int
+    var embeddingSize: Int
+    var layerCount: Int
+    var headCount: Int
+    var mlpMultiplier: Int = 4
+    static func preset(_ preset: MiniGPTPreset, vocabSize: Int) -> MiniGPTConfig
+    var parameterCount: Int { get }
+}
+
+struct TrainingHyperparameters: Codable, Hashable, Sendable {
+    var learningRate: Float = 3e-3
+    var minLearningRate: Float = 3e-4
+    var batchSize: Int = 16
+    var weightDecay: Float = 0.01
+    var beta1: Float = 0.9
+    var beta2: Float = 0.99
+    var epsilon: Float = 1e-8
+    var gradientClip: Float = 1.0       // 全体ノルムでクリップ（0 なら無効）
+    var warmupSteps: Int = 50
+    var totalSteps: Int = 2000          // コサイン減衰の長さ
+    var seed: UInt64 = 1
+}
+
+/// 文字（Unicode スカラー）単位の語彙。ID 0 は <unk>。出現頻度の高い順に maxSize - 1 文字まで。
+struct CharVocabulary: Codable, Hashable, Sendable {
+    init(text: String, maxSize: Int = 4096)
+    var size: Int { get }
+    func encode(_ text: String) -> [Int]
+    func decode(_ ids: [Int]) -> String
+}
+
+/// 名前付きのパラメータ（値と勾配。行優先の Float 配列）
+final class MiniGPTParameter {
+    let name: String
+    let shape: [Int]
+    var value: [Float]
+    var gradient: [Float]
+}
+
+final class MiniGPT {
+    let config: MiniGPTConfig
+    /// GPT-2 風の初期化: 重みは N(0, 0.02)、各ブロックの出力射影（attn.proj, mlp.proj）は N(0, 0.02/sqrt(2*層数))、
+    /// バイアス 0、LayerNorm は weight 1 / bias 0。乱数は seed から決定的に作る。
+    init(config: MiniGPTConfig, seed: UInt64)
+    var parameters: [MiniGPTParameter] { get }       // 下の「パラメータの並び」の順
+    func parameter(named name: String) -> MiniGPTParameter?
+    /// 平均交差エントロピー（勾配は計算しない）。inputs / targets は [バッチ][長さ ≤ contextLength]
+    func loss(inputs: [[Int]], targets: [[Int]]) -> Float
+    /// 順伝播 + 逆伝播。勾配を gradient に「加算」して損失を返す。
+    func lossAndGradients(inputs: [[Int]], targets: [[Int]]) -> Float
+    func zeroGradients()
+    /// 文脈（最後の contextLength トークンを使う）の次のトークンの logits
+    func logits(context: [Int]) -> [Float]
+    /// 温度 0 なら argmax。topK 0 なら無効。戻り値は「新しく生成したトークンだけ」（prompt は含まない）。
+    /// prompt が空なら ID 0 から始める。
+    func generate(prompt: [Int], maxNewTokens: Int, temperature: Float, topK: Int, seed: UInt64) -> [Int]
+    /// 保存形式: JSON ヘッダ（config とパラメータ名・形状）+ Float32 リトルエンディアンの重み
+    func save(to url: URL) throws
+    static func load(from url: URL) throws -> MiniGPT
+}
+
+struct AdamWOptimizer {
+    init(hyperparameters: TrainingHyperparameters)
+    /// 勾配の全体ノルムでクリップ → AdamW 更新（バイアス補正あり）。重み減衰は 2 次元以上のパラメータだけ（PyTorch の AdamW と同じ式）。
+    /// 戻り値はクリップ前の勾配ノルム。
+    mutating func step(parameters: [MiniGPTParameter], learningRate: Float) -> Float
+}
+
+/// 学習ループ（データの切り出し、学習率スケジュール、評価）。
+final class MiniGPTTrainer {
+    init(model: MiniGPT, tokens: [Int], hyperparameters: TrainingHyperparameters, validationFraction: Double = 0.1)
+    var stepIndex: Int { get }
+    var currentLearningRate: Float { get }   // 線形ウォームアップ → コサインで minLearningRate まで
+    /// ランダムな位置から batchSize 個の窓を切り出して 1 ステップ学習し、学習損失を返す。
+    func step() -> Float
+    /// 検証データでの平均損失（batches 回ぶん）
+    func validationLoss(batches: Int) -> Float
+    var hasValidationData: Bool { get }
+}
+```
+
+**モデル構造（PyTorch の参照実装と完全に同じにする）**: 入力 x = wte[token] + wpe[位置] →（各層）
+x = x + attn(ln1(x)); x = x + mlp(ln2(x)) → ln_f → logits = x · wteᵀ（重み共有）。
+- 線形層は `y = x W + b`、W の形状は [入力, 出力]（行優先）。
+- attn: qkv = x W_qkv + b（出力 3C: q = [0, C), k = [C, 2C), v = [2C, 3C)）、ヘッドは C/H ずつ連続に分割、
+  因果マスク付き softmax(q kᵀ / sqrt(C/H)) v → ヘッドを連結 → proj。
+- mlp: GELU（tanh 近似、GPT-2 と同じ）。LayerNorm の eps = 1e-5。損失は全位置の平均交差エントロピー。
+
+**パラメータの並び（名前と形状）**: `wte` [V, C], `wpe` [T, C], 各層 i について
+`h.i.ln1.weight` [C], `h.i.ln1.bias` [C], `h.i.attn.qkv.weight` [C, 3C], `h.i.attn.qkv.bias` [3C],
+`h.i.attn.proj.weight` [C, C], `h.i.attn.proj.bias` [C], `h.i.ln2.weight` [C], `h.i.ln2.bias` [C],
+`h.i.mlp.fc.weight` [C, 4C], `h.i.mlp.fc.bias` [4C], `h.i.mlp.proj.weight` [4C, C], `h.i.mlp.proj.bias` [C]、
+最後に `ln_f.weight` [C], `ln_f.bias` [C]。
+
+## Core/Knowledge（「マイアシスタント」の参考資料検索）
+
+自分のコードや文書を小さな塊（チャンク）に分け、質問に関係する部分を BM25 で探してプロンプトに入れる。
+
+```swift
+struct KnowledgeChunk: Codable, Hashable, Identifiable, Sendable {
+    var id: Int
+    var source: String        // ファイル名など
+    var startLine: Int        // 1 始まり
+    var endLine: Int
+    var text: String
+}
+
+enum KnowledgeChunker {
+    /// 行単位で分割する。空行や行頭の宣言（func / class / struct / enum / extension / def / function / # 見出し）を区切りに優先し、
+    /// 1 チャンク maxCharacters 文字以内、前のチャンクと overlapLines 行重ねる。
+    static func chunks(source: String, text: String, maxCharacters: Int = 1200, overlapLines: Int = 2) -> [KnowledgeChunk]
+}
+
+enum KnowledgeTokenizer {
+    /// 検索語に分ける: ASCII の英数字の語は小文字に（camelCase / snake_case は部分語と元の語の両方）、
+    /// 漢字・ひらがな・カタカナは 2 文字ずつ（1 文字だけならその 1 文字）。
+    static func terms(_ text: String) -> [String]
+}
+
+struct KnowledgeSearchResult: Hashable, Sendable {
+    var chunk: KnowledgeChunk
+    var score: Double
+}
+
+struct KnowledgeIndex: Codable, Sendable {
+    init()
+    mutating func add(source: String, text: String)    // 同じ source があれば置き換える
+    mutating func remove(source: String)
+    var sources: [String] { get }
+    var chunkCount: Int { get }
+    /// BM25（k1 = 1.2, b = 0.75）。スコア 0 のものは返さない。
+    func search(_ query: String, limit: Int = 4) -> [KnowledgeSearchResult]
+}
+
+enum KnowledgePromptBuilder {
+    /// 検索結果をプロンプトに入れる文章にする（maxCharacters を超えない範囲で上位から）。結果が空なら空文字。
+    static func contextBlock(results: [KnowledgeSearchResult], maxCharacters: Int) -> String
+}
+```

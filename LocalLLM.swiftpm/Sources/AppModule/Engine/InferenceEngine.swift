@@ -46,13 +46,19 @@ actor InferenceEngine {
 
     private var loaded: Loaded?
     private var currentTask: Task<Void, Never>?
+    private var prefillChunkSize = 128
+    /// 読み込みのたびに増やす。読み込み中に別の読み込み・解放が来たら、古いほうの結果は捨てる。
+    private var loadGeneration = 0
 
     var loadedInfo: LoadedModelInfo? { loaded?.info }
 
     /// モデルを読み込む（既に別のモデルが読み込まれていれば解放してから）。
     func load(files: ModelFiles, computeUnits: MLComputeUnits, prefillChunkSize: Int) async throws -> LoadedModelInfo {
+        loadGeneration += 1
+        let generation = loadGeneration
         await cancelCurrentGeneration()
         loaded = nil   // 先に解放してメモリを空ける
+        self.prefillChunkSize = max(1, prefillChunkSize)
 
         let start = Date()
         let tokenizer = try HFTokenizer(tokenizerJSON: try Data(contentsOf: files.tokenizerJSON),
@@ -70,7 +76,8 @@ actor InferenceEngine {
         if let eos = tokenizer.eosToken, !stopStrings.contains(eos) { stopStrings.append(eos) }
 
         let model = try await CoreMLLanguageModel.load(compiledModelURL: files.compiledModel, computeUnits: computeUnits)
-        model.prefillChunkSize = prefillChunkSize
+        // 待っている間に別の読み込みや解放が始まっていたら、この結果は使わない
+        guard generation == loadGeneration else { throw CancellationError() }
 
         let info = LoadedModelInfo(
             modelID: files.modelID,
@@ -88,17 +95,20 @@ actor InferenceEngine {
 
     /// モデルを解放する。
     func unload() async {
+        loadGeneration += 1
         await cancelCurrentGeneration()
         loaded = nil
     }
 
-    /// 会話の途中経過（KV キャッシュ）を捨てる。
-    func resetCache() {
+    /// 会話の途中経過（KV キャッシュ）を捨てる。生成中なら止めてから。
+    func resetCache() async {
+        await cancelCurrentGeneration()
         loaded?.model.resetCache()
     }
 
+    /// 次の生成から使う（生成中のものには影響しない）。
     func setPrefillChunkSize(_ size: Int) {
-        loaded?.model.prefillChunkSize = size
+        prefillChunkSize = max(1, size)
     }
 
     /// 文章を生成する。返ってくるストリームを途中で止める（for ループを抜ける／Task をキャンセルする）と生成も止まる。
@@ -115,9 +125,12 @@ actor InferenceEngine {
 
     private func startGeneration(_ request: GenerationRequest,
                                  continuation: AsyncThrowingStream<GenerationEvent, Error>.Continuation) async {
-        // 前の生成が残っていれば止めてから始める（同じ state を同時に触らないため）。
-        await cancelCurrentGeneration()
+        // 前の生成が残っていれば止め、それが終わってから始める（同じ state を同時に触らないため）。
+        // ここでは await しないで currentTask を差し替えるので、続けて呼ばれても必ず 1 つずつ順番に動く。
+        let previous = currentTask
+        previous?.cancel()
         let task = Task {
+            await previous?.value
             await self.runGeneration(request, continuation: continuation)
         }
         currentTask = task
@@ -129,20 +142,29 @@ actor InferenceEngine {
         if currentTask == task { currentTask = nil }
     }
 
+    /// 生成中のものをすべて止めて、終わるまで待つ。
     private func cancelCurrentGeneration() async {
-        guard let task = currentTask else { return }
-        task.cancel()
-        await task.value
-        currentTask = nil
+        while let task = currentTask {
+            task.cancel()
+            await task.value
+            if currentTask == task { currentTask = nil }
+        }
     }
 
     private func runGeneration(_ request: GenerationRequest,
                                continuation: AsyncThrowingStream<GenerationEvent, Error>.Continuation) async {
+        var stats = GenerationStats()
+        if Task.isCancelled {
+            stats.stopReason = .cancelled
+            continuation.yield(.finished(stats))
+            continuation.finish()
+            return
+        }
         guard let loaded else {
             continuation.finish(throwing: EngineError.modelNotLoaded)
             return
         }
-        var stats = GenerationStats()
+        let chunkSize = prefillChunkSize
         do {
             let parameters = request.parameters
             let maxContext = loaded.model.maxContext
@@ -162,7 +184,7 @@ actor InferenceEngine {
 
             // プロンプトの読み込み
             let prefillStart = Date()
-            let (firstLogits, reused) = try await loaded.model.evaluate(tokens: prompt.tokens) { done, total in
+            let (firstLogits, reused) = try await loaded.model.evaluate(tokens: prompt.tokens, chunkSize: chunkSize) { done, total in
                 continuation.yield(.prefill(done: done, total: total))
             }
             stats.reusedPromptTokens = reused

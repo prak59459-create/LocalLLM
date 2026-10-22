@@ -134,11 +134,20 @@ final class ChatController {
     // MARK: - 生成
 
     /// ユーザーの発言を追加して、返答を生成する。
-    func send(_ text: String, in conversation: Conversation, context: ModelContext, settings: AppSettings) {
+    /// アシスタントに参考資料があれば、発言に関係する部分を検索して一緒にモデルへ渡す。
+    func send(_ text: String, in conversation: Conversation, context: ModelContext, settings: AppSettings,
+              assistant: Assistant? = nil, knowledge: KnowledgeStore? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isGenerating else { return }
+        guard loadedInfo != nil else {
+            notice = L("先にモデルを選んで読み込んでください。", "Please choose and load a model first.")
+            return
+        }
         let nextOrder = (conversation.orderedMessages.last?.order ?? -1) + 1
         let userMessage = StoredMessage(role: .user, content: trimmed, order: nextOrder)
+        if let assistant, assistant.useKnowledge, let knowledge {
+            attachKnowledge(to: userMessage, query: trimmed, assistant: assistant, knowledge: knowledge)
+        }
         context.insert(userMessage)
         conversation.messages.append(userMessage)
         if conversation.title.isEmpty {
@@ -146,11 +155,12 @@ final class ChatController {
         }
         conversation.updatedAt = Date()
         try? context.save()
-        generateReply(in: conversation, context: context, settings: settings)
+        generateReply(in: conversation, context: context, settings: settings, assistant: assistant)
     }
 
     /// 最後のアシスタントの返答を作り直す。
-    func regenerate(in conversation: Conversation, context: ModelContext, settings: AppSettings) {
+    func regenerate(in conversation: Conversation, context: ModelContext, settings: AppSettings,
+                    assistant: Assistant? = nil) {
         guard !isGenerating else { return }
         var excluded: UUID?
         if let last = conversation.orderedMessages.last, last.role == .assistant {
@@ -159,7 +169,20 @@ final class ChatController {
             context.delete(last)
             try? context.save()
         }
-        generateReply(in: conversation, context: context, settings: settings, excluding: excluded)
+        generateReply(in: conversation, context: context, settings: settings, assistant: assistant, excluding: excluded)
+    }
+
+    /// 参考資料を検索して、ユーザーの発言に付ける。
+    private func attachKnowledge(to message: StoredMessage, query: String, assistant: Assistant, knowledge: KnowledgeStore) {
+        let results = knowledge.search(query, in: assistant.id, limit: max(1, assistant.knowledgeResultCount))
+        guard !results.isEmpty else { return }
+        // コンテキスト長に合わせて入れる量を決める（おおよそ 1 トークン = 1〜3 文字）
+        let contextLength = loadedInfo?.maxContext ?? 2048
+        let maxCharacters = min(6000, max(600, contextLength))
+        let block = KnowledgePromptBuilder.contextBlock(results: results, maxCharacters: maxCharacters)
+        guard !block.isEmpty else { return }
+        message.attachedContext = block
+        message.sources = results.map { "\($0.chunk.source) L\($0.chunk.startLine)-\($0.chunk.endLine)" }
     }
 
     /// 生成を止める。
@@ -169,7 +192,7 @@ final class ChatController {
     }
 
     private func generateReply(in conversation: Conversation, context: ModelContext, settings: AppSettings,
-                               excluding excludedID: UUID? = nil) {
+                               assistant: Assistant?, excluding excludedID: UUID? = nil) {
         guard let info = loadedInfo else {
             notice = L("先にモデルを選んで読み込んでください。", "Please choose and load a model first.")
             return
@@ -188,12 +211,20 @@ final class ChatController {
         conversation.updatedAt = Date()
         try? context.save()
 
-        let systemPrompt = settings.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        // アシスタントがあれば、そのシステムプロンプトと生成設定を使う
+        let rawPrompt = assistant?.systemPrompt ?? settings.systemPrompt
+        let systemPrompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        var parameters = settings.generation
+        var thinking = settings.thinkingMode
+        if let assistant {
+            if assistant.useCustomGeneration { parameters = assistant.generation }
+            if assistant.thinkingMode != .modelDefault { thinking = assistant.thinkingMode }
+        }
         let request = GenerationRequest(
             systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt,
             history: history,
-            parameters: settings.generation,
-            enableThinking: settings.thinkingMode.enableThinking
+            parameters: parameters,
+            enableThinking: thinking.enableThinking
         )
         progress = GenerationProgress(conversationID: conversation.id, messageID: reply.id, phase: .preparing)
         notice = nil
@@ -218,7 +249,7 @@ final class ChatController {
                     case .text(let piece):
                         text += piece
                         progress?.phase = .generating
-                        progress?.generatedCharacters = text.count
+                        progress?.generatedCharacters += piece.count
                         reply.content = text
                         saveIfNeeded(context)
                     case .finished(let stats):

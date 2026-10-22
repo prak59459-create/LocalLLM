@@ -30,13 +30,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python reference implementations
-        run: pip install tokenizers jinja2 transformers
+        run: |
+          pip install tokenizers jinja2 transformers numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Fetch fixtures from Hugging Face
         run: ./Tools/fetch_fixtures.sh
 
       - name: Generate expectations
         run: |
+          shopt -s nullglob
           for script in Tools/fixtures/*.py; do
             echo "== $script"
             python -I "$script"
@@ -46,6 +49,8 @@ jobs:
         run: swift build
 
       - name: Test
+        env:
+          LOCALLLM_LIVE_TESTS: "1"
         run: swift test
 
   app-typecheck-ios:
@@ -65,13 +70,34 @@ jobs:
       - name: Typecheck all app sources against the iOS 18 SDK
         run: |
           SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
-          find LocalLLM.swiftpm/Sources/AppModule -name '*.swift' -print0 | \
-            xargs -0 xcrun --sdk iphonesimulator swiftc -typecheck \
-              -sdk "$SDK" \
-              -target arm64-apple-ios18.0-simulator \
-              -swift-version 5 \
-              -parse-as-library \
-              -module-name AppModule
+          find LocalLLM.swiftpm/Sources/AppModule -name '*.swift' | sort > sources.txt
+          wc -l $(cat sources.txt) | tail -1
+          set +e
+          /usr/bin/time -p xcrun --sdk iphonesimulator swiftc -typecheck \
+            -sdk "$SDK" \
+            -target arm64-apple-ios18.0-simulator \
+            -swift-version 5 \
+            -parse-as-library \
+            -module-name AppModule \
+            -Xfrontend -warn-long-function-bodies=200 \
+            -Xfrontend -warn-long-expression-type-checking=150 \
+            $(cat sources.txt) 2> typecheck.log
+          status=$?
+          set -e
+          grep -E "error:" typecheck.log | head -200 || true
+          echo "----- all diagnostics -----"
+          cat typecheck.log | tail -400
+          exit $status
+
+      # Swift Playgrounds builds without optimization, so slow-to-typecheck code makes the iPad build slow
+      # (and can even crash it). Fail if any function body or expression is slow to typecheck.
+      - name: Check for slow type-checking
+        run: |
+          if grep -E "(instance method|getter|function|closure|initializer|expression|global function|static method).*took [0-9]+ms to type-check|to type-check \(limit" typecheck.log; then
+            echo "::error::Some code is slow to type-check. Split the expression or view into smaller pieces."
+            exit 1
+          fi
+          echo "No slow type-checking found."
 
       - name: Build the Swift Playgrounds app package with xcodebuild
         working-directory: LocalLLM.swiftpm

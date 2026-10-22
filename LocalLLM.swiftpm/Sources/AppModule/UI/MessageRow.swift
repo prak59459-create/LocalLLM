@@ -12,14 +12,20 @@ struct MessageRow: View {
     var body: some View {
         switch message.role {
         case .user:
-            HStack {
-                Spacer(minLength: 48)
-                Text(message.content)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 18))
-                    .contextMenu { menuItems }
+            VStack(alignment: .trailing, spacing: 4) {
+                HStack {
+                    Spacer(minLength: 48)
+                    Text(message.content)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 18))
+                        .contextMenu { menuItems }
+                }
+                let sources = message.sources
+                if !sources.isEmpty {
+                    SourcesCaption(sources: sources)
+                }
             }
         case .assistant, .system:
             AssistantMessageView(message: message, isStreaming: isStreaming)
@@ -124,6 +130,30 @@ private struct AssistantMessageView: View {
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.tertiary)
         }
+    }
+}
+
+/// 参考にした資料の一覧（タップで開く）。
+private struct SourcesCaption: View {
+    let sources: [String]
+    @State private var expanded = false
+
+    var body: some View {
+        Button {
+            expanded.toggle()
+        } label: {
+            VStack(alignment: .trailing, spacing: 2) {
+                Label(L("参考資料 \(sources.count) 件", "\(sources.count) references"), systemImage: "paperclip")
+                if expanded {
+                    ForEach(sources, id: \.self) { source in
+                        Text(source).font(.caption2.monospaced())
+                    }
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
     }
 }
 

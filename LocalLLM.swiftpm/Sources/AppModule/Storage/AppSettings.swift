@@ -5,8 +5,8 @@ import Security
 
 /// 計算に使うチップの選び方（MLComputeUnits）。
 enum ComputeUnitsOption: String, CaseIterable, Codable, Identifiable, Sendable {
-    case all
     case cpuAndGPU
+    case all
     case cpuAndNeuralEngine
     case cpuOnly
 
@@ -23,8 +23,8 @@ enum ComputeUnitsOption: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var label: String {
         switch self {
-        case .all: return L("自動（すべて）", "Automatic (all)")
-        case .cpuAndGPU: return L("CPU + GPU", "CPU + GPU")
+        case .all: return L("すべて（Neural Engine を含む）", "All (incl. Neural Engine)")
+        case .cpuAndGPU: return L("CPU + GPU（推奨）", "CPU + GPU (recommended)")
         case .cpuAndNeuralEngine: return L("CPU + Neural Engine", "CPU + Neural Engine")
         case .cpuOnly: return L("CPU のみ", "CPU only")
         }
@@ -104,7 +104,9 @@ final class AppSettings {
         generation = Self.loadCodable(GenerationParameters.self, forKey: Keys.generation, from: defaults) ?? .default
         systemPrompt = defaults.string(forKey: Keys.systemPrompt) ?? Self.defaultSystemPrompt
         thinkingMode = defaults.string(forKey: Keys.thinkingMode).flatMap(ThinkingMode.init(rawValue:)) ?? .modelDefault
-        computeUnits = defaults.string(forKey: Keys.computeUnits).flatMap(ComputeUnitsOption.init(rawValue:)) ?? .all
+        // 既定は CPU + GPU。可変長入力の LLM は Neural Engine で動かないことが多く、
+        // .all だと初回読み込み時の Neural Engine 向け変換で時間がかかったり失敗したりするため。
+        computeUnits = defaults.string(forKey: Keys.computeUnits).flatMap(ComputeUnitsOption.init(rawValue:)) ?? .cpuAndGPU
         let chunk = defaults.integer(forKey: Keys.prefillChunkSize)
         prefillChunkSize = chunk > 0 ? chunk : 128
         showStats = defaults.object(forKey: Keys.showStats) as? Bool ?? true

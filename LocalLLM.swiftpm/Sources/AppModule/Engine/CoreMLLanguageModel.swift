@@ -1,3 +1,4 @@
+import Accelerate
 import CoreML
 import Foundation
 
@@ -44,8 +45,8 @@ final class CoreMLLanguageModel {
     let model: MLModel
     let interface: ModelInterface
     let maxContext: Int
-    /// プロンプトを流し込むときの 1 回あたりのトークン数。
-    var prefillChunkSize: Int = 128
+    /// 1 回の予測で入力できるトークン数の上限（input_ids と causal_mask の形状から決まる）
+    let maxQueryLength: Int
 
     /// state（または直近の入力）に入っているトークン列。
     private(set) var cachedTokens: [Int] = []
@@ -60,10 +61,14 @@ final class CoreMLLanguageModel {
         switch interface {
         case .unsupported(let reason):
             throw EngineError.unsupportedModel(reason)
-        case .statefulCausalLM(_, _, _, _, let maxContext):
+        case .statefulCausalLM(let idsName, let maskName, _, _, let maxContext):
             self.maxContext = maxContext
+            let idsLimit = specs.inputs.first { $0.name == idsName }?.upperBound(axis: 1) ?? 1
+            let maskLimit = specs.inputs.first { $0.name == maskName }?.upperBound(axis: 2) ?? idsLimit
+            self.maxQueryLength = max(1, min(idsLimit, maskLimit, maxContext))
         case .statelessCausalLM(_, let maskName, _, _, let maxContext):
             self.maxContext = maxContext
+            self.maxQueryLength = maxContext
             if let maskName,
                let constraint = model.modelDescription.inputDescriptionsByName[maskName]?.multiArrayConstraint {
                 attentionMaskDataType = constraint.dataType
@@ -87,15 +92,19 @@ final class CoreMLLanguageModel {
     }
 
     /// モデル内部の系列を `tokens` にそろえ、最後のトークンの次に来る logits を返す。
-    /// - Parameter progress: (処理済みトークン数, 全体) を報告する。
+    /// - Parameters:
+    ///   - chunkSize: プロンプトを流し込むときの 1 回あたりのトークン数（maxQueryLength まで）
+    ///   - progress: (処理済みトークン数, 全体) を報告する。
     /// - Returns: logits と、キャッシュを再利用できたトークン数。
-    func evaluate(tokens: [Int], progress: ((Int, Int) -> Void)? = nil) async throws -> (logits: [Float], reusedTokens: Int) {
+    func evaluate(tokens: [Int], chunkSize: Int = 128,
+                  progress: ((Int, Int) -> Void)? = nil) async throws -> (logits: [Float], reusedTokens: Int) {
         guard !tokens.isEmpty else { throw EngineError.emptyPrompt }
         guard tokens.count <= maxContext else { throw EngineError.contextOverflow(tokens.count, maxContext) }
 
         switch interface {
         case .statefulCausalLM(let idsName, let maskName, let logitsName, let maskType, _):
-            return try await evaluateStateful(tokens: tokens, idsName: idsName, maskName: maskName,
+            let chunk = min(max(chunkSize, 1), maxQueryLength)
+            return try await evaluateStateful(tokens: tokens, chunkSize: chunk, idsName: idsName, maskName: maskName,
                                               logitsName: logitsName, maskType: maskType, progress: progress)
         case .statelessCausalLM(let idsName, let maskName, let logitsName, let fixedLength, _):
             let logits = try await evaluateStateless(tokens: tokens, idsName: idsName, maskName: maskName,
@@ -115,7 +124,7 @@ final class CoreMLLanguageModel {
 
     // MARK: - ステートフル
 
-    private func evaluateStateful(tokens: [Int], idsName: String, maskName: String, logitsName: String,
+    private func evaluateStateful(tokens: [Int], chunkSize: Int, idsName: String, maskName: String, logitsName: String,
                                   maskType: TensorSpec.DataType,
                                   progress: ((Int, Int) -> Void)?) async throws -> (logits: [Float], reusedTokens: Int) {
         if state == nil {
@@ -135,7 +144,7 @@ final class CoreMLLanguageModel {
         progress?(position, tokens.count)
         while position < tokens.count {
             try Task.checkCancellation()
-            let end = min(position + max(prefillChunkSize, 1), tokens.count)
+            let end = min(position + chunkSize, tokens.count)
             let chunk = Array(tokens[position..<end])
             lastLogits = try await predictStateful(chunk: chunk, pastLength: position, state: state,
                                                    idsName: idsName, maskName: maskName,
@@ -171,27 +180,33 @@ final class CoreMLLanguageModel {
         if dataType == .float32 {
             let array = try MLMultiArray(shape: shape, dataType: .float32)
             array.withUnsafeMutableBufferPointer(ofType: Float.self) { pointer, strides in
-                let rowStride = strides[2], colStride = strides[3]
-                for row in 0..<n {
-                    let visible = pastLength + row
-                    for col in 0..<totalLength {
-                        pointer[row * rowStride + col * colStride] = col <= visible ? 0 : -Float.greatestFiniteMagnitude
-                    }
-                }
+                Self.fillMask(pointer, rowStride: strides[2], columnStride: strides[3], rows: n, columns: totalLength,
+                              pastLength: pastLength, visible: 0, hidden: -Float.greatestFiniteMagnitude)
             }
             return array
         } else {
             let array = try MLMultiArray(shape: shape, dataType: .float16)
             array.withUnsafeMutableBufferPointer(ofType: Float16.self) { pointer, strides in
-                let rowStride = strides[2], colStride = strides[3]
-                for row in 0..<n {
-                    let visible = pastLength + row
-                    for col in 0..<totalLength {
-                        pointer[row * rowStride + col * colStride] = col <= visible ? 0 : -Float16.greatestFiniteMagnitude
-                    }
-                }
+                Self.fillMask(pointer, rowStride: strides[2], columnStride: strides[3], rows: n, columns: totalLength,
+                              pastLength: pastLength, visible: 0, hidden: -Float16.greatestFiniteMagnitude)
             }
             return array
+        }
+    }
+
+    /// 行ごとにまとめて埋める（最適化なしのビルドでも速いように）
+    private static func fillMask<T>(_ pointer: UnsafeMutableBufferPointer<T>, rowStride: Int, columnStride: Int,
+                                    rows: Int, columns: Int, pastLength: Int, visible: T, hidden: T) {
+        guard let base = pointer.baseAddress else { return }
+        for row in 0..<rows {
+            let rowStart = base + row * rowStride
+            let visibleCount = min(pastLength + row + 1, columns)
+            if columnStride == 1 {
+                rowStart.update(repeating: visible, count: visibleCount)
+                if columns > visibleCount { (rowStart + visibleCount).update(repeating: hidden, count: columns - visibleCount) }
+            } else {
+                for column in 0..<columns { rowStart[column * columnStride] = column < visibleCount ? visible : hidden }
+            }
         }
     }
 
@@ -271,11 +286,30 @@ final class CoreMLLanguageModel {
         switch logits.dataType {
         case .float16:
             logits.withUnsafeBufferPointer(ofType: Float16.self) { pointer in
-                for index in 0..<vocab { result[index] = Float(pointer[offset + index * vocabStride]) }
+                guard let base = pointer.baseAddress else { return }
+                if vocabStride == 1 {
+                    // 連続していれば vImage でまとめて Float16 → Float に変換する
+                    result.withUnsafeMutableBufferPointer { output in
+                        var source = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: base + offset), height: 1,
+                                                   width: vImagePixelCount(vocab), rowBytes: vocab * 2)
+                        var destination = vImage_Buffer(data: output.baseAddress, height: 1,
+                                                        width: vImagePixelCount(vocab), rowBytes: vocab * 4)
+                        _ = vImageConvert_Planar16FtoPlanarF(&source, &destination, vImage_Flags(kvImageNoFlags))
+                    }
+                } else {
+                    for index in 0..<vocab { result[index] = Float(base[offset + index * vocabStride]) }
+                }
             }
         case .float32:
             logits.withUnsafeBufferPointer(ofType: Float.self) { pointer in
-                for index in 0..<vocab { result[index] = pointer[offset + index * vocabStride] }
+                guard let base = pointer.baseAddress else { return }
+                if vocabStride == 1 {
+                    result.withUnsafeMutableBufferPointer { output in
+                        output.baseAddress?.update(from: base + offset, count: vocab)
+                    }
+                } else {
+                    for index in 0..<vocab { result[index] = base[offset + index * vocabStride] }
+                }
             }
         case .double:
             logits.withUnsafeBufferPointer(ofType: Double.self) { pointer in

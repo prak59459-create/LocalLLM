@@ -84,11 +84,30 @@ struct KnowledgeIndex: Codable, Sendable {
     /// 語 → その語を含むチャンクの数
     private var documentFrequencies: [String: Int] = [:]
     private var nextID = 0
+    /// source → チャンク数（保存しない。読み込み時に作り直す）。取り込み中に毎回全チャンクを調べないため。
+    private var chunkCountBySource: [String: Int] = [:]
 
     static let k1 = 1.2
     static let b = 0.75
 
     init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case chunks, termFrequencies, lengths, documentFrequencies, nextID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        chunks = try container.decode([KnowledgeChunk].self, forKey: .chunks)
+        termFrequencies = try container.decode([[String: Int]].self, forKey: .termFrequencies)
+        lengths = try container.decode([Int].self, forKey: .lengths)
+        documentFrequencies = try container.decode([String: Int].self, forKey: .documentFrequencies)
+        nextID = try container.decode(Int.self, forKey: .nextID)
+        guard termFrequencies.count == chunks.count, lengths.count == chunks.count else {
+            throw DecodingError.dataCorruptedError(forKey: .chunks, in: container, debugDescription: "inconsistent index")
+        }
+        for chunk in chunks { chunkCountBySource[chunk.source, default: 0] += 1 }
+    }
 
     var sources: [String] {
         var seen = Set<String>()
@@ -112,10 +131,12 @@ struct KnowledgeIndex: Codable, Sendable {
             chunks.append(chunk)
             termFrequencies.append(frequencies)
             lengths.append(terms.count)
+            chunkCountBySource[source, default: 0] += 1
         }
     }
 
     mutating func remove(source: String) {
+        guard chunkCountBySource.removeValue(forKey: source) != nil else { return }
         var keepChunks: [KnowledgeChunk] = []
         var keepFrequencies: [[String: Int]] = []
         var keepLengths: [Int] = []

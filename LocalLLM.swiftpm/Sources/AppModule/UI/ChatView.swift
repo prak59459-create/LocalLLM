@@ -56,43 +56,34 @@ struct ChatView: View {
         }
     }
 
+    // 型チェックを速くするため、中身は MessageListContent に分けている
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    let messages = conversation.orderedMessages
-                    if messages.isEmpty {
-                        EmptyChatHint(onShowModels: onShowModels)
-                            .padding(.top, 60)
-                    }
-                    ForEach(messages) { message in
-                        MessageRow(
-                            message: message,
-                            isStreaming: chat.progress?.messageID == message.id,
-                            isLast: message.id == messages.last?.id,
-                            onRegenerate: {
-                                chat.regenerate(in: conversation, context: context, settings: settings, assistant: assistant)
-                            },
-                            onDelete: { delete(message) }
-                        )
-                        .id(message.id)
-                    }
-                    Color.clear.frame(height: 1).id(bottomID)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .frame(maxWidth: 860)
-                .frame(maxWidth: .infinity)
+                MessageListContent(messages: conversation.orderedMessages,
+                                   streamingID: chat.progress?.messageID,
+                                   bottomID: bottomID,
+                                   onShowModels: onShowModels,
+                                   onRegenerate: regenerate,
+                                   onDelete: delete)
             }
             .scrollDismissesKeyboard(.interactively)
-            .onAppear { proxy.scrollTo(bottomID, anchor: .bottom) }
-            .onChange(of: conversation.messages.count) { _, _ in
-                withAnimation { proxy.scrollTo(bottomID, anchor: .bottom) }
-            }
-            .onChange(of: chat.progress?.generatedCharacters) { _, _ in
-                proxy.scrollTo(bottomID, anchor: .bottom)
-            }
+            .onAppear { scrollToBottom(proxy, animated: false) }
+            .onChange(of: conversation.messages.count) { _, _ in scrollToBottom(proxy, animated: true) }
+            .onChange(of: chat.progress?.generatedCharacters) { _, _ in scrollToBottom(proxy, animated: false) }
         }
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        if animated {
+            withAnimation { proxy.scrollTo(bottomID, anchor: .bottom) }
+        } else {
+            proxy.scrollTo(bottomID, anchor: .bottom)
+        }
+    }
+
+    private func regenerate() {
+        chat.regenerate(in: conversation, context: context, settings: settings, assistant: assistant)
     }
 
     private let bottomID = "bottom"
@@ -117,6 +108,42 @@ struct ChatView: View {
         conversation.messages.removeAll { $0.id == message.id }
         context.delete(message)
         try? context.save()
+    }
+}
+
+/// メッセージの並び。
+private struct MessageListContent: View {
+    let messages: [StoredMessage]
+    let streamingID: UUID?
+    let bottomID: String
+    var onShowModels: () -> Void
+    var onRegenerate: () -> Void
+    var onDelete: (StoredMessage) -> Void
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 16) {
+            if messages.isEmpty {
+                EmptyChatHint(onShowModels: onShowModels)
+                    .padding(.top, 60)
+            }
+            ForEach(messages) { message in
+                row(for: message)
+            }
+            Color.clear.frame(height: 1).id(bottomID)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: 860)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func row(for message: StoredMessage) -> some View {
+        MessageRow(message: message,
+                   isStreaming: streamingID == message.id,
+                   isLast: message.id == messages.last?.id,
+                   onRegenerate: onRegenerate,
+                   onDelete: { onDelete(message) })
+            .id(message.id)
     }
 }
 

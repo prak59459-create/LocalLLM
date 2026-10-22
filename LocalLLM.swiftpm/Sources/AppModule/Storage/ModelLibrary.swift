@@ -162,17 +162,18 @@ final class ModelLibrary {
         beginBackgroundTask(for: id)
         updateIdleTimer()
 
-        tasks[id] = Task { [weak self] in
+        // ModelLibrary はアプリが終わるまで生きているので、強く参照してよい
+        tasks[id] = Task { [self] in
             do {
                 try await job.run { progress in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.tasks[id] != nil else { return }
+                    Task { @MainActor in
+                        guard self.tasks[id] != nil else { return }
                         self.downloads[id] = DownloadState(phase: .downloading, progress: progress)
                     }
                 }
-                self?.finishDownload(id: id)
+                finishDownload(id: id)
             } catch {
-                self?.failDownload(id: id, error: error)
+                failDownload(id: id, error: error)
             }
         }
     }

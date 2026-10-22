@@ -17,56 +17,42 @@ struct ModelDetailView: View {
     @State private var loadError: String?
     @State private var actionError: String?
 
+    // 型チェックを速くするため、状態ごとの中身を分けている
     var body: some View {
         List {
             header
-
-            if isLoading {
-                HStack {
-                    ProgressView()
-                    Text(L("リポジトリを調べています…", "Inspecting the repository…"))
-                        .foregroundStyle(.secondary)
-                }
-            } else if let loadError {
-                Label(loadError, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-                Button(L("もう一度", "Retry")) { Task { await load() } }
-            } else if let analysis {
-                warnings(analysis)
-                if analysis.variants.isEmpty {
-                    Text(L("このリポジトリには Core ML のモデル（.mlmodelc / .mlpackage）が見つかりませんでした。",
-                           "No Core ML models (.mlmodelc / .mlpackage) were found in this repository."))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Section(L("モデル", "Models")) {
-                        ForEach(analysis.variants) { variant in
-                            VariantRow(repoID: repoID, variant: variant, analysis: analysis,
-                                       metadata: metadata[variant.path], onUse: onUse,
-                                       onError: { actionError = $0 })
-                        }
-                    }
-                }
-                if let actionError {
-                    Section {
-                        Label(actionError, systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.orange)
-                    }
-                }
-                Section(L("付属ファイル", "Support files")) {
-                    ForEach(analysis.supportFiles, id: \.path) { file in
-                        HStack {
-                            Text(file.path).font(.caption.monospaced())
-                            Spacer()
-                            Text(ByteFormat.string(file.size)).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
+            content
         }
         .navigationTitle(repoID.split(separator: "/").last.map(String.init) ?? repoID)
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
         .refreshable { await load() }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if isLoading {
+            HStack {
+                ProgressView()
+                Text(L("リポジトリを調べています…", "Inspecting the repository…"))
+                    .foregroundStyle(.secondary)
+            }
+        } else if let loadError {
+            Label(loadError, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+            Button(L("もう一度", "Retry")) { Task { await load() } }
+        } else if let analysis {
+            warnings(analysis)
+            VariantsSection(repoID: repoID, analysis: analysis, metadata: metadata, onUse: onUse,
+                            onError: { actionError = $0 })
+            if let actionError {
+                Section {
+                    Label(actionError, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+            }
+            SupportFilesSection(files: analysis.supportFiles)
+        }
     }
 
     @ViewBuilder
@@ -142,6 +128,47 @@ struct ModelDetailView: View {
             metadata = found
         } catch {
             loadError = error.localizedDescription
+        }
+    }
+}
+
+/// モデルの候補の一覧。
+private struct VariantsSection: View {
+    let repoID: String
+    let analysis: RepoAnalysis
+    let metadata: [String: CoreMLMetadata]
+    var onUse: () -> Void
+    var onError: (String) -> Void
+
+    var body: some View {
+        if analysis.variants.isEmpty {
+            Text(L("このリポジトリには Core ML のモデル（.mlmodelc / .mlpackage）が見つかりませんでした。",
+                   "No Core ML models (.mlmodelc / .mlpackage) were found in this repository."))
+                .foregroundStyle(.secondary)
+        } else {
+            Section(L("モデル", "Models")) {
+                ForEach(analysis.variants) { variant in
+                    VariantRow(repoID: repoID, variant: variant, analysis: analysis,
+                               metadata: metadata[variant.path], onUse: onUse, onError: onError)
+                }
+            }
+        }
+    }
+}
+
+/// 付属ファイル（tokenizer.json など）の一覧。
+private struct SupportFilesSection: View {
+    let files: [HFFileEntry]
+
+    var body: some View {
+        Section(L("付属ファイル", "Support files")) {
+            ForEach(files, id: \.path) { file in
+                HStack {
+                    Text(file.path).font(.caption.monospaced())
+                    Spacer()
+                    Text(ByteFormat.string(file.size)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
     }
 }
@@ -236,10 +263,18 @@ private struct VariantRow: View {
             Text(L("必要メモリの目安 \(ByteFormat.string(required))", "Estimated memory \(ByteFormat.string(required))"))
             Text("·")
             Text(fit.label)
-                .foregroundStyle(fit == .comfortable ? Color.green : fit == .tight ? Color.yellow : Color.red)
+                .foregroundStyle(Self.color(for: fit))
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+
+    private static func color(for fit: DeviceMemory.Fit) -> Color {
+        switch fit {
+        case .comfortable: return .green
+        case .tight: return .yellow
+        case .tooLarge: return .red
+        }
     }
 
     @ViewBuilder

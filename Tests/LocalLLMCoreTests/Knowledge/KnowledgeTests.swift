@@ -145,6 +145,23 @@ final class KnowledgeIndexTests: XCTestCase {
         updated.add(source: "New.txt", text: "brand new content about giraffes")
         XCTAssertEqual(updated.search("giraffes").first?.chunk.source, "New.txt")
         XCTAssertEqual(Set(updated.chunks.map(\.id)).count, updated.chunkCount)
+        // 読み込んだあとも、同じ source の置き換えができる
+        let before = updated.chunkCount
+        updated.add(source: "Math.swift", text: "func subtract(_ a: Int, _ b: Int) -> Int { a - b }\n")
+        XCTAssertEqual(updated.chunkCount, before)
+        XCTAssertTrue(updated.search("add").isEmpty)
+        XCTAssertThrowsError(try JSONDecoder().decode(KnowledgeIndex.self, from: Data(#"{"chunks": []}"#.utf8)))
+    }
+
+    func testImportingManyFilesIsFast() {
+        var index = KnowledgeIndex()
+        let start = Date()
+        for file in 0..<1500 {
+            index.add(source: "Sources/File\(file).swift", text: "struct Type\(file) {\n    let value = \(file)\n}\n")
+        }
+        XCTAssertEqual(index.sources.count, 1500)
+        XCTAssertEqual(index.search("Type1234").first?.chunk.source, "Sources/File1234.swift")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
     }
 
     func testPromptBlock() {

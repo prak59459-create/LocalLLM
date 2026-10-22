@@ -19,6 +19,7 @@ struct ConversationListView: View {
     @State private var renameText = ""
     @State private var deleting: Conversation?
 
+    // 型チェックを速くするため、行・ツールバー・確認ダイアログを分けている
     var body: some View {
         List(selection: $selection) {
             Section {
@@ -31,76 +32,90 @@ struct ConversationListView: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(conversations) { conversation in
-                    ConversationRow(conversation: conversation,
-                                    assistant: assistants.first { $0.id == conversation.assistantID })
-                        .tag(conversation.id)
-                        .contextMenu {
-                            Button {
-                                renameText = conversation.displayTitle
-                                renaming = conversation
-                            } label: {
-                                Label(L("名前を変更", "Rename"), systemImage: "pencil")
-                            }
-                            Button(role: .destructive) {
-                                deleting = conversation
-                            } label: {
-                                Label(L("削除", "Delete"), systemImage: "trash")
-                            }
-                        }
-                        .swipeActions {
-                            Button(role: .destructive) {
-                                deleting = conversation
-                            } label: {
-                                Label(L("削除", "Delete"), systemImage: "trash")
-                            }
-                        }
+                    row(for: conversation)
                 }
             }
         }
         .navigationTitle("LocalLLM")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                NewChatMenu(assistants: assistants, onNewChat: onNewChat, onShowAssistants: onShowAssistants)
-            }
-            ToolbarItemGroup(placement: .bottomBar) {
-                Button(action: onShowModels) {
-                    Label(L("モデル", "Models"), systemImage: "cpu")
-                }
-                Spacer()
-                Button(action: onShowAssistants) {
-                    Label(L("アシスタント", "Assistants"), systemImage: "person.crop.rectangle.stack")
-                }
-                Spacer()
-                Button(action: onShowStudio) {
-                    Label(L("ミニLLM工房", "Mini LLM Studio"), systemImage: "hammer")
-                }
-                Spacer()
-                Button(action: onShowSettings) {
-                    Label(L("設定", "Settings"), systemImage: "gearshape")
-                }
-            }
-        }
-        .alert(L("名前を変更", "Rename"), isPresented: Binding(
-            get: { renaming != nil },
-            set: { if !$0 { renaming = nil } }
-        )) {
+        .toolbar { toolbarContent }
+        .alert(L("名前を変更", "Rename"), isPresented: isRenaming) {
             TextField(L("タイトル", "Title"), text: $renameText)
-            Button(L("保存", "Save")) {
-                renaming?.title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-                try? context.save()
-                renaming = nil
-            }
+            Button(L("保存", "Save"), action: saveRename)
             Button(L("キャンセル", "Cancel"), role: .cancel) { renaming = nil }
         }
-        .confirmationDialog(L("この会話を削除しますか？", "Delete this chat?"), isPresented: Binding(
-            get: { deleting != nil },
-            set: { if !$0 { deleting = nil } }
-        ), titleVisibility: .visible) {
-            Button(L("削除", "Delete"), role: .destructive) {
-                if let conversation = deleting { delete(conversation) }
-                deleting = nil
+        .confirmationDialog(L("この会話を削除しますか？", "Delete this chat?"), isPresented: isDeleting,
+                            titleVisibility: .visible) {
+            Button(L("削除", "Delete"), role: .destructive, action: confirmDelete)
+        }
+    }
+
+    private func row(for conversation: Conversation) -> some View {
+        ConversationRow(conversation: conversation,
+                        assistant: assistants.first { $0.id == conversation.assistantID })
+            .tag(conversation.id)
+            .contextMenu {
+                Button {
+                    renameText = conversation.displayTitle
+                    renaming = conversation
+                } label: {
+                    Label(L("名前を変更", "Rename"), systemImage: "pencil")
+                }
+                Button(role: .destructive) {
+                    deleting = conversation
+                } label: {
+                    Label(L("削除", "Delete"), systemImage: "trash")
+                }
+            }
+            .swipeActions {
+                Button(role: .destructive) {
+                    deleting = conversation
+                } label: {
+                    Label(L("削除", "Delete"), systemImage: "trash")
+                }
+            }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            NewChatMenu(assistants: assistants, onNewChat: onNewChat, onShowAssistants: onShowAssistants)
+        }
+        ToolbarItemGroup(placement: .bottomBar) {
+            Button(action: onShowModels) {
+                Label(L("モデル", "Models"), systemImage: "cpu")
+            }
+            Spacer()
+            Button(action: onShowAssistants) {
+                Label(L("アシスタント", "Assistants"), systemImage: "person.crop.rectangle.stack")
+            }
+            Spacer()
+            Button(action: onShowStudio) {
+                Label(L("ミニLLM工房", "Mini LLM Studio"), systemImage: "hammer")
+            }
+            Spacer()
+            Button(action: onShowSettings) {
+                Label(L("設定", "Settings"), systemImage: "gearshape")
             }
         }
+    }
+
+    private var isRenaming: Binding<Bool> {
+        Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+    }
+
+    private var isDeleting: Binding<Bool> {
+        Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })
+    }
+
+    private func saveRename() {
+        renaming?.title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        try? context.save()
+        renaming = nil
+    }
+
+    private func confirmDelete() {
+        if let conversation = deleting { delete(conversation) }
+        deleting = nil
     }
 
     private func delete(_ conversation: Conversation) {

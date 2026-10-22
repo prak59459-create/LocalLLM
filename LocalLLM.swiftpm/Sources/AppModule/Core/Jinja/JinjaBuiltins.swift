@@ -596,29 +596,37 @@ enum JinjaBuiltins {
 
     // MARK: - フィルタ（| ...）
 
+    /// フィルタの引数（位置またはキーワード）
+    private static func filterArgument(_ args: [JinjaValue], _ kwargs: [(String, JinjaValue)], _ index: Int,
+                                       _ key: String) -> JinjaValue? {
+        if let keyword = kwargs.first(where: { $0.0 == key }) { return keyword.1 }
+        return index >= 0 && index < args.count ? args[index] : nil
+    }
+
+    private static func filterItems(_ value: JinjaValue) throws -> [JinjaValue] {
+        guard let items = value.iterationItems else {
+            throw JinjaError.runtime("'\(value.typeName)' object is not iterable")
+        }
+        return items
+    }
+
+    /// "a.b.0" のような属性のたどり方
+    private static func attributePath(_ item: JinjaValue, _ path: String) throws -> JinjaValue {
+        var current = item
+        for part in path.split(separator: ".") {
+            if let number = Int(part) {
+                current = try subscriptValue(current, .int(number))
+            } else {
+                current = try subscriptValue(current, .string(String(part)))
+            }
+        }
+        return current
+    }
+
+    // 1 つの大きな switch は型チェックが遅くなるので、文字列・数値のフィルタと、並び（リスト）のフィルタに分ける。
     static func applyFilter(_ name: String, _ value: JinjaValue, _ args: [JinjaValue], _ kwargs: [(String, JinjaValue)],
                             interpreter: JinjaInterpreter) throws -> JinjaValue {
-        func argument(_ index: Int, _ key: String) -> JinjaValue? {
-            if let keyword = kwargs.first(where: { $0.0 == key }) { return keyword.1 }
-            return index >= 0 && index < args.count ? args[index] : nil
-        }
-        func items(_ value: JinjaValue) throws -> [JinjaValue] {
-            guard let items = value.iterationItems else {
-                throw JinjaError.runtime("'\(value.typeName)' object is not iterable")
-            }
-            return items
-        }
-        func attributePath(_ item: JinjaValue, _ path: String) throws -> JinjaValue {
-            var current = item
-            for part in path.split(separator: ".") {
-                if let number = Int(part) {
-                    current = try subscriptValue(current, .int(number))
-                } else {
-                    current = try subscriptValue(current, .string(String(part)))
-                }
-            }
-            return current
-        }
+        func argument(_ index: Int, _ key: String) -> JinjaValue? { filterArgument(args, kwargs, index, key) }
         switch name {
         case "length", "count":
             switch value {
@@ -639,10 +647,9 @@ enum JinjaBuiltins {
             if name == "string" { return .string(value.isUndefined ? "" : value.pythonStr) }
             return value
         case "e", "escape", "forceescape":
-            let escaped = value.renderedString
-                .replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
-                .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&#34;")
-                .replacingOccurrences(of: "'", with: "&#39;")
+            var escaped = value.renderedString
+            let replacements: [(String, String)] = [("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"), ("\"", "&#34;"), ("'", "&#39;")]
+            for (from, to) in replacements { escaped = escaped.replacingOccurrences(of: from, with: to) }
             return .string(escaped)
         case "upper": return .string(value.renderedString.uppercased())
         case "lower": return .string(value.renderedString.lowercased())
@@ -651,22 +658,6 @@ enum JinjaBuiltins {
             guard let first = text.first else { return .string("") }
             return .string(String(first).uppercased() + text.dropFirst().lowercased())
         case "title": return .string(title(value.renderedString))
-        case "first": return try items(value).first ?? .undefined
-        case "last": return try items(value).last ?? .undefined
-        case "list": return .array(try items(value))
-        case "items":
-            guard case .object(let object) = value else { return .array([]) }
-            return .array(object.pairs.map { .tuple([.string($0.0), $0.1]) })
-        case "dictsort":
-            guard case .object(let object) = value else { return .array([]) }
-            return .array(object.pairs.sorted { $0.0 < $1.0 }.map { .tuple([.string($0.0), $0.1]) })
-        case "join":
-            let separator = argument(0, "d")?.renderedString ?? ""
-            var list = try items(value)
-            if let attribute = argument(1, "attribute")?.renderedString {
-                list = try list.map { try attributePath($0, attribute) }
-            }
-            return .string(list.map(\.renderedString).joined(separator: separator))
         case "default", "d":
             let fallback = argument(0, "default_value") ?? .string("")
             let boolean = argument(1, "boolean")?.truthy ?? false
@@ -699,8 +690,72 @@ enum JinjaBuiltins {
             let method = argument(1, "method")?.renderedString ?? "common"
             let number = value.numericValue ?? 0
             let scale = pow(10, Double(precision))
-            let rule: FloatingPointRoundingRule = method == "ceil" ? .up : method == "floor" ? .down : .toNearestOrEven
+            var rule = FloatingPointRoundingRule.toNearestOrEven
+            if method == "ceil" { rule = .up }
+            if method == "floor" { rule = .down }
             return .double((number * scale).rounded(rule) / scale)
+        case "replace":
+            let old = argument(0, "old")?.renderedString ?? ""
+            let new = argument(1, "new")?.renderedString ?? ""
+            var methodArgs: [JinjaValue] = [.string(old), .string(new)]
+            if let count = argument(2, "count") { methodArgs.append(count) }
+            return try stringMethod(value.renderedString, "replace", methodArgs, []) ?? value
+        case "indent":
+            let width = Int(argument(0, "width")?.numericValue ?? 4)
+            let first = argument(1, "first")?.truthy ?? false
+            let blank = argument(2, "blank")?.truthy ?? false
+            let pad = String(repeating: " ", count: width)
+            let lines = value.renderedString.components(separatedBy: "\n")
+            var result: [String] = []
+            for (index, line) in lines.enumerated() {
+                if index == 0 && !first { result.append(line); continue }
+                result.append(line.isEmpty && !blank ? line : pad + line)
+            }
+            return .string(result.joined(separator: "\n"))
+        case "wordcount":
+            return .int(pythonSplit(value.renderedString, separator: nil, maxSplit: -1).count)
+        case "format":
+            return .string(try percentFormat(value.renderedString, .tuple(args)))
+        case "attr":
+            return try subscriptValue(value, args.first ?? .undefined)
+        case "center":
+            let width = Int(args.first?.numericValue ?? 80)
+            let text = value.renderedString
+            let padding = max(0, width - text.count)
+            let left = padding / 2
+            let leftPad = String(repeating: " ", count: left)
+            let rightPad = String(repeating: " ", count: padding - left)
+            return .string(leftPad + text + rightPad)
+        case "truncate":
+            let length = Int(argument(0, "length")?.numericValue ?? 255)
+            let text = value.renderedString
+            return .string(text.count <= length ? text : String(text.prefix(max(0, length - 3))) + "...")
+        default:
+            return try applyCollectionFilter(name, value, args, kwargs, interpreter: interpreter)
+        }
+    }
+
+    private static func applyCollectionFilter(_ name: String, _ value: JinjaValue, _ args: [JinjaValue],
+                                              _ kwargs: [(String, JinjaValue)], interpreter: JinjaInterpreter) throws -> JinjaValue {
+        func argument(_ index: Int, _ key: String) -> JinjaValue? { filterArgument(args, kwargs, index, key) }
+        func items(_ value: JinjaValue) throws -> [JinjaValue] { try filterItems(value) }
+        switch name {
+        case "first": return try items(value).first ?? .undefined
+        case "last": return try items(value).last ?? .undefined
+        case "list": return .array(try items(value))
+        case "items":
+            guard case .object(let object) = value else { return .array([]) }
+            return .array(object.pairs.map { .tuple([.string($0.0), $0.1]) })
+        case "dictsort":
+            guard case .object(let object) = value else { return .array([]) }
+            return .array(object.pairs.sorted { $0.0 < $1.0 }.map { .tuple([.string($0.0), $0.1]) })
+        case "join":
+            let separator = argument(0, "d")?.renderedString ?? ""
+            var list = try items(value)
+            if let attribute = argument(1, "attribute")?.renderedString {
+                list = try list.map { try attributePath($0, attribute) }
+            }
+            return .string(list.map(\.renderedString).joined(separator: separator))
         case "reverse":
             if case .string(let text) = value { return .string(String(text.reversed())) }
             return .array(try items(value).reversed())
@@ -740,28 +795,6 @@ enum JinjaBuiltins {
                 if (name == "min" && result == .orderedAscending) || (name == "max" && result == .orderedDescending) { best = item }
             }
             return best
-        case "replace":
-            let old = argument(0, "old")?.renderedString ?? ""
-            let new = argument(1, "new")?.renderedString ?? ""
-            return try stringMethod(value.renderedString, "replace", [.string(old), .string(new)] + (argument(2, "count").map { [$0] } ?? []), []) ?? value
-        case "indent":
-            let width = Int(argument(0, "width")?.numericValue ?? 4)
-            let first = argument(1, "first")?.truthy ?? false
-            let blank = argument(2, "blank")?.truthy ?? false
-            let pad = String(repeating: " ", count: width)
-            let lines = value.renderedString.components(separatedBy: "\n")
-            var result: [String] = []
-            for (index, line) in lines.enumerated() {
-                if index == 0 && !first { result.append(line); continue }
-                result.append(line.isEmpty && !blank ? line : pad + line)
-            }
-            return .string(result.joined(separator: "\n"))
-        case "wordcount":
-            return .int(pythonSplit(value.renderedString, separator: nil, maxSplit: -1).count)
-        case "format":
-            return .string(try percentFormat(value.renderedString, .tuple(args)))
-        case "attr":
-            return try subscriptValue(value, args.first ?? .undefined)
         case "map":
             let list = try items(value)
             if let attribute = argument(-1, "attribute")?.renderedString {
@@ -797,16 +830,6 @@ enum JinjaBuiltins {
             let size = max(1, Int(args.first?.numericValue ?? 1))
             let list = try items(value)
             return .array(stride(from: 0, to: list.count, by: size).map { .array(Array(list[$0..<min($0 + size, list.count)])) })
-        case "center":
-            let width = Int(args.first?.numericValue ?? 80)
-            let text = value.renderedString
-            let padding = max(0, width - text.count)
-            let left = padding / 2
-            return .string(String(repeating: " ", count: left) + text + String(repeating: " ", count: padding - left))
-        case "truncate":
-            let length = Int(argument(0, "length")?.numericValue ?? 255)
-            let text = value.renderedString
-            return .string(text.count <= length ? text : String(text.prefix(max(0, length - 3))) + "...")
         default:
             throw JinjaError.runtime("no filter named '\(name)'")
         }

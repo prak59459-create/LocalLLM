@@ -187,11 +187,12 @@ final class MiniLLMStudio {
         let totalSteps = self.totalSteps
         let prompt = samplePrompt
 
-        trainingTask = Task.detached(priority: .userInitiated) { [weak self] in
+        // MiniLLMStudio はアプリが終わるまで生きているので、強く参照してよい
+        trainingTask = Task.detached(priority: .userInitiated) { [self] in
             await MiniLLMStudio.runTrainingLoop(box: box, totalSteps: totalSteps, samplePrompt: prompt) { report in
-                await self?.apply(report)
+                await self.apply(report)
             }
-            await self?.trainingLoopEnded()
+            await self.trainingLoopEnded()
         }
     }
 

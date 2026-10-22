@@ -60,7 +60,7 @@ extension TensorSpec {
         guard let constraint = feature.stateConstraint else { return nil }
         self.init(name: feature.name,
                   dataType: TensorSpec.DataType(constraint.dataType),
-                  shape: constraint.bufferShape.map(\.intValue),
+                  shape: constraint.bufferShape.map { Int(truncating: $0 as NSNumber) },
                   shapeRange: nil)
     }
 }

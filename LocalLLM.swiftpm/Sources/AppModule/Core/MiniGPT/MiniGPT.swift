@@ -153,12 +153,14 @@ final class MiniGPT {
     /// 逆伝播のために順伝播の途中結果をとっておく場所（同じ大きさなら使い回す）
     private var cache = MiniGPTActivations()
 
-    init(config: MiniGPTConfig, seed: UInt64) {
+    /// - Parameter randomize: false なら乱数で初期化しない（読み込み用。重みは 0）
+    init(config: MiniGPTConfig, seed: UInt64, randomize: Bool = true) {
         var random = MiniRandom(seed: seed)
         let c = config.embeddingSize, m = config.hiddenSize
         let projectionScale = 0.02 / (2.0 * Double(config.layerCount)).squareRoot()
         func normal(_ count: Int, _ std: Double) -> [Float] {
-            (0..<count).map { _ in Float(random.nextNormal() * std) }
+            guard randomize else { return [Float](repeating: 0, count: count) }
+            return (0..<count).map { _ in Float(random.nextNormal() * std) }
         }
         var list: [MiniGPTParameter] = []
         func make(_ name: String, _ shape: [Int], _ values: [Float]) -> MiniGPTParameter {
@@ -482,17 +484,23 @@ final class MiniGPT {
 
     static func load(from url: URL) throws -> MiniGPT {
         let data = try Data(contentsOf: url)
-        let bytes = [UInt8](data)
-        guard bytes.count > magic.count + 4, Array(bytes[0..<magic.count]) == magic else {
+        return try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> MiniGPT in
+            try load(raw)
+        }
+    }
+
+    private static func load(_ raw: UnsafeRawBufferPointer) throws -> MiniGPT {
+        guard raw.count > magic.count + 4, Array(raw[0..<magic.count]) == magic else {
             throw MiniGPTError.invalidFile(L("形式が違います", "wrong format"))
         }
         var offset = magic.count
-        let headerLength = Int(UInt32(bytes[offset]) | UInt32(bytes[offset + 1]) << 8 | UInt32(bytes[offset + 2]) << 16 | UInt32(bytes[offset + 3]) << 24)
+        let headerLength = Int(readUInt32(raw, at: offset))
         offset += 4
-        guard offset + headerLength <= bytes.count else { throw MiniGPTError.invalidFile(L("ヘッダが壊れています", "broken header")) }
-        let header = try JSONDecoder().decode(FileHeader.self, from: Data(bytes[offset..<(offset + headerLength)]))
+        guard offset + headerLength <= raw.count else { throw MiniGPTError.invalidFile(L("ヘッダが壊れています", "broken header")) }
+        let headerData = Data(raw[offset..<(offset + headerLength)])
+        let header = try JSONDecoder().decode(FileHeader.self, from: headerData)
         offset += headerLength
-        let model = MiniGPT(config: header.config, seed: 0)
+        let model = MiniGPT(config: header.config, seed: 0, randomize: false)
         guard header.parameters.count == model.parameters.count else {
             throw MiniGPTError.invalidFile(L("パラメータの数が合いません", "parameter count mismatch"))
         }
@@ -501,15 +509,20 @@ final class MiniGPT {
                 throw MiniGPTError.invalidFile(L("パラメータ \(entry.name) の形が合いません", "shape mismatch for \(entry.name)"))
             }
             let byteCount = parameter.count * 4
-            guard offset + byteCount <= bytes.count else { throw MiniGPTError.invalidFile(L("データが足りません", "truncated data")) }
+            guard offset + byteCount <= raw.count else { throw MiniGPTError.invalidFile(L("データが足りません", "truncated data")) }
             for index in 0..<parameter.count {
-                let base = offset + index * 4
-                let bits = UInt32(bytes[base]) | UInt32(bytes[base + 1]) << 8 | UInt32(bytes[base + 2]) << 16 | UInt32(bytes[base + 3]) << 24
+                let bits = readUInt32(raw, at: offset + index * 4)
                 parameter.value[index] = Float(bitPattern: bits)
             }
             offset += byteCount
         }
         return model
+    }
+
+    /// リトルエンディアンの UInt32 を読む（位置は 4 の倍数でなくてもよい）
+    private static func readUInt32(_ raw: UnsafeRawBufferPointer, at offset: Int) -> UInt32 {
+        let value: UInt32 = raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+        return UInt32(littleEndian: value)
     }
 }
 

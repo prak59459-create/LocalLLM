@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-tests-linux:
+    name: Core tests (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Swift
+        run: |
+          curl -sSL -o swift.tgz https://download.swift.org/swift-6.1.2-release/ubuntu2404/swift-6.1.2-RELEASE/swift-6.1.2-RELEASE-ubuntu24.04.tar.gz
+          mkdir -p "$RUNNER_TEMP/swift"
+          tar xzf swift.tgz -C "$RUNNER_TEMP/swift" --strip-components=1
+          echo "$RUNNER_TEMP/swift/usr/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python reference implementations
+        run: pip install tokenizers jinja2 transformers
+
+      - name: Fetch fixtures from Hugging Face
+        run: ./Tools/fetch_fixtures.sh
+
+      - name: Generate expectations
+        run: |
+          for script in Tools/fixtures/*.py; do
+            echo "== $script"
+            python -I "$script"
+          done
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+  app-typecheck-ios:
+    name: App typecheck (iOS SDK)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          ls /Applications | grep Xcode || true
+          sudo xcode-select -s /Applications/Xcode_16.4.app || true
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+
+      - name: Typecheck all app sources against the iOS 18 SDK
+        run: |
+          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+          find LocalLLM.swiftpm/Sources/AppModule -name '*.swift' -print0 | \
+            xargs -0 xcrun --sdk iphonesimulator swiftc -typecheck \
+              -sdk "$SDK" \
+              -target arm64-apple-ios18.0-simulator \
+              -swift-version 5 \
+              -parse-as-library \
+              -module-name AppModule
+
+      - name: Build the Swift Playgrounds app package with xcodebuild
+        working-directory: LocalLLM.swiftpm
+        continue-on-error: true
+        run: |
+          xcodebuild -list || true
+          xcodebuild -scheme LocalLLM -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build | tail -50

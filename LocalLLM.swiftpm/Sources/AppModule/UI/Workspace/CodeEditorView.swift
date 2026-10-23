@@ -32,17 +32,21 @@ private struct EditorTabBar: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 2) {
                 ForEach(session.openTabs, id: \.self) { path in
-                    EditorTab(path: path,
-                              isSelected: session.selectedPath == path,
-                              isDirty: session.isDirty(path),
-                              onSelect: { session.selectedPath = path },
-                              onClose: { session.close(path) })
+                    tab(path)
                 }
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
         }
         .background(Color(uiColor: .secondarySystemBackground))
+    }
+
+    private func tab(_ path: String) -> EditorTab {
+        EditorTab(path: path,
+                  isSelected: session.selectedPath == path,
+                  isDirty: session.isDirty(path),
+                  onSelect: { session.selectedPath = path },
+                  onClose: { session.close(path) })
     }
 }
 
@@ -52,6 +56,8 @@ private struct EditorTab: View {
     let isDirty: Bool
     var onSelect: () -> Void
     var onClose: () -> Void
+
+    private var tabBackground: Color { isSelected ? Color(uiColor: .systemBackground) : Color.clear }
 
     var body: some View {
         HStack(spacing: 6) {
@@ -68,7 +74,7 @@ private struct EditorTab: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(isSelected ? Color(uiColor: .systemBackground) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+        .background(tabBackground, in: RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .help(path)

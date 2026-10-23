@@ -18,82 +18,47 @@ struct AssistantsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                Section {
-                    if assistants.isEmpty {
-                        Text(L("まだアシスタントがありません。下のひな形から作ってみましょう。",
-                               "No assistants yet. Create one from a template below."))
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(assistants) { assistant in
-                        NavigationLink(value: assistant.id) {
-                            AssistantRow(assistant: assistant)
-                        }
-                        .swipeActions {
-                            Button(role: .destructive) {
-                                deleting = assistant
-                            } label: {
-                                Label(L("削除", "Delete"), systemImage: "trash")
-                            }
-                        }
-                    }
-                } header: {
-                    Text(L("マイアシスタント", "My Assistants"))
-                } footer: {
-                    Text(L("モデル・システムプロンプト・生成設定・参考資料（自分のコードや文書）をまとめて、自分専用の AI を作れます。",
-                           "Combine a model, system prompt, settings and your own code or documents into a personal AI."))
-                }
-
-                Section(L("ひな形から作る", "Create from a template")) {
-                    ForEach(AssistantTemplate.all) { template in
-                        Button {
-                            create(from: template)
-                        } label: {
-                            HStack(alignment: .top, spacing: 12) {
-                                Image(systemName: template.symbolName)
-                                    .frame(width: 28)
-                                    .foregroundStyle(.tint)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(template.name).foregroundStyle(.primary)
-                                    Text(template.summary)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                }
+                AssistantListSection(assistants: assistants, onDelete: { deleting = $0 })
+                AssistantTemplateSection(onCreate: create)
             }
             .navigationTitle(L("アシスタント", "Assistants"))
             .navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(for: UUID.self) { id in
-                if let assistant = assistants.first(where: { $0.id == id }) {
-                    AssistantEditorView(assistant: assistant, onStartChat: {
-                        onStartChat(assistant)
-                        dismiss()
-                    })
-                }
-            }
+            .navigationDestination(for: UUID.self, destination: editor(for:))
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button(L("閉じる", "Close")) { dismiss() }
                 }
             }
-            .confirmationDialog(L("このアシスタントを削除しますか？", "Delete this assistant?"), isPresented: Binding(
-                get: { deleting != nil },
-                set: { if !$0 { deleting = nil } }
-            ), titleVisibility: .visible) {
-                Button(L("削除", "Delete"), role: .destructive) {
-                    if let assistant = deleting {
-                        knowledge.deleteAll(for: assistant.id)
-                        context.delete(assistant)
-                        try? context.save()
-                    }
-                    deleting = nil
-                }
+            .confirmationDialog(L("このアシスタントを削除しますか？", "Delete this assistant?"),
+                                isPresented: isDeleting, titleVisibility: .visible) {
+                Button(L("削除", "Delete"), role: .destructive, action: confirmDelete)
             } message: {
                 Text(L("参考資料も削除されます。会話は残ります。", "Its reference files are deleted too. Chats are kept."))
             }
         }
+    }
+
+    @ViewBuilder
+    private func editor(for id: UUID) -> some View {
+        if let assistant = assistants.first(where: { $0.id == id }) {
+            AssistantEditorView(assistant: assistant, onStartChat: {
+                onStartChat(assistant)
+                dismiss()
+            })
+        }
+    }
+
+    private var isDeleting: Binding<Bool> {
+        Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })
+    }
+
+    private func confirmDelete() {
+        if let assistant = deleting {
+            knowledge.deleteAll(for: assistant.id)
+            context.delete(assistant)
+            try? context.save()
+        }
+        deleting = nil
     }
 
     private func create(from template: AssistantTemplate) {
@@ -101,6 +66,78 @@ struct AssistantsView: View {
         context.insert(assistant)
         try? context.save()
         path.append(assistant.id)
+    }
+}
+
+/// 作ったアシスタントの一覧。
+private struct AssistantListSection: View {
+    let assistants: [Assistant]
+    var onDelete: (Assistant) -> Void
+
+    var body: some View {
+        Section {
+            if assistants.isEmpty {
+                Text(L("まだアシスタントがありません。下のひな形から作ってみましょう。",
+                       "No assistants yet. Create one from a template below."))
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(assistants) { assistant in
+                row(assistant)
+            }
+        } header: {
+            Text(L("マイアシスタント", "My Assistants"))
+        } footer: {
+            Text(L("モデル・システムプロンプト・生成設定・参考資料（自分のコードや文書）をまとめて、自分専用の AI を作れます。",
+                   "Combine a model, system prompt, settings and your own code or documents into a personal AI."))
+        }
+    }
+
+    private func row(_ assistant: Assistant) -> some View {
+        NavigationLink(value: assistant.id) {
+            AssistantRow(assistant: assistant)
+        }
+        .swipeActions {
+            Button(role: .destructive) {
+                onDelete(assistant)
+            } label: {
+                Label(L("削除", "Delete"), systemImage: "trash")
+            }
+        }
+    }
+}
+
+/// ひな形からアシスタントを作るボタン。
+private struct AssistantTemplateSection: View {
+    var onCreate: (AssistantTemplate) -> Void
+
+    var body: some View {
+        Section(L("ひな形から作る", "Create from a template")) {
+            ForEach(AssistantTemplate.all) { template in
+                Button {
+                    onCreate(template)
+                } label: {
+                    TemplateLabel(template: template)
+                }
+            }
+        }
+    }
+}
+
+private struct TemplateLabel: View {
+    let template: AssistantTemplate
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: template.symbolName)
+                .frame(width: 28)
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(template.name).foregroundStyle(.primary)
+                Text(template.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 

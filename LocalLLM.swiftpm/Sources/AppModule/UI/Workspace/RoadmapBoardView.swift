@@ -23,23 +23,7 @@ struct RoadmapBoardView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack {
-                BoardGrid(scale: currentScale, offset: totalOffset)
-                RoadmapEdges(roadmap: session.roadmap, position: { position(of: $0, in: geometry.size) },
-                             radius: { RoadmapStyle.diameter(for: $0) * currentScale / 2 })
-                ForEach(session.roadmap.nodes) { node in
-                    nodeView(node, size: geometry.size)
-                }
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-            .contentShape(Rectangle())
-            .gesture(panGesture.simultaneously(with: zoomGesture))
-            .onTapGesture(count: 2, coordinateSpace: .local) { location in
-                addNode(at: location, size: geometry.size)
-            }
-            .onTapGesture { session.selectedNodeID = nil; connectFrom = nil }
-            .onAppear { boardSize = geometry.size }
-            .onChange(of: geometry.size) { _, size in boardSize = size }
+            board(size: geometry.size)
         }
         .clipped()
         .background(Color(uiColor: .systemGroupedBackground))
@@ -51,13 +35,41 @@ struct RoadmapBoardView: View {
         .alert(L("AI に計画を立ててもらう", "Let the AI plan"), isPresented: $planning) {
             TextField(L("作りたいもの・目標", "What do you want to build?"), text: $planGoal)
             Button(L("キャンセル", "Cancel"), role: .cancel) {}
-            Button(L("計画する", "Plan")) {
-                ask(CodingAgentPrompt.planRoadmap(goal: planGoal))
-                planGoal = ""
-            }
+            Button(L("計画する", "Plan"), action: startPlanning)
         } message: {
             Text(L("エージェントが機能を分けて、ロードマップに丸として並べます。", "The agent breaks the goal into features and adds them to the roadmap."))
         }
+    }
+
+    private func board(size: CGSize) -> some View {
+        ZStack {
+            BoardGrid(scale: currentScale, offset: totalOffset)
+            RoadmapEdges(roadmap: session.roadmap,
+                         position: { position(of: $0, in: size) },
+                         radius: { RoadmapStyle.diameter(for: $0) * currentScale / 2 })
+            ForEach(session.roadmap.nodes) { node in
+                nodeView(node, size: size)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .contentShape(Rectangle())
+        .gesture(panGesture.simultaneously(with: zoomGesture))
+        .onTapGesture(count: 2, coordinateSpace: .local) { location in
+            addNode(at: location, size: size)
+        }
+        .onTapGesture(perform: clearSelection)
+        .onAppear { boardSize = size }
+        .onChange(of: size) { _, newSize in boardSize = newSize }
+    }
+
+    private func clearSelection() {
+        session.selectedNodeID = nil
+        connectFrom = nil
+    }
+
+    private func startPlanning() {
+        ask(CodingAgentPrompt.planRoadmap(goal: planGoal))
+        planGoal = ""
     }
 
     // MARK: - 座標

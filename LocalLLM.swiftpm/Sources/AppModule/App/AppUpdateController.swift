@@ -59,7 +59,7 @@ final class AppUpdateController {
     @ObservationIgnored private var pickedSource: URL?
 
     /// アプリの版（実行中のもの）
-    static var runningVersion: String {
+    nonisolated static var runningVersion: String {
         let info = Bundle.main.infoDictionary
         let short = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
@@ -150,7 +150,7 @@ final class AppUpdateController {
                 let zip = workRoot.appendingPathComponent("source.zip")
                 try FileManager.default.moveItem(at: downloaded, to: zip)
                 phase = .working(L("展開しています…", "Extracting…"))
-                try await Self.extract(zip, to: staging)
+                try await UpdateFileOps.extract(zip, to: staging)
             case .file:
                 guard let picked = pickedSource else { throw AppUpdateError.packageNotFound }
                 phase = .working(L("ファイルを読み込んでいます…", "Reading the file…"))
@@ -159,7 +159,7 @@ final class AppUpdateController {
                 if picked.pathExtension.lowercased() == "zip" {
                     let zip = workRoot.appendingPathComponent("source.zip")
                     try FileManager.default.copyItem(at: picked, to: zip)
-                    try await Self.extract(zip, to: staging)
+                    try await UpdateFileOps.extract(zip, to: staging)
                 } else {
                     try FileManager.default.copyItem(at: picked, to: staging.appendingPathComponent(picked.lastPathComponent))
                 }
@@ -181,12 +181,6 @@ final class AppUpdateController {
         }
     }
 
-    nonisolated private static func extract(_ zip: URL, to folder: URL) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            _ = try ZipArchive(url: zip).extract(to: folder, inflate: ZipArchive.systemInflater)
-        }.value
-    }
-
     /// 上書きして版を上げる（変える前のファイルは取っておく）
     func apply() async {
         guard let plan, let package = stagedPackage,
@@ -197,7 +191,7 @@ final class AppUpdateController {
             try await Task.detached(priority: .userInitiated) {
                 let scoped = target.startAccessingSecurityScopedResource()
                 defer { if scoped { target.stopAccessingSecurityScopedResource() } }
-                try Self.coordinatedWrite(at: target) {
+                try UpdateFileOps.coordinatedWrite(at: target) {
                     try AppUpdater.apply(plan, source: package, target: target, backup: backup)
                 }
             }.value
@@ -219,7 +213,7 @@ final class AppUpdateController {
             try await Task.detached(priority: .userInitiated) {
                 let scoped = target.startAccessingSecurityScopedResource()
                 defer { if scoped { target.stopAccessingSecurityScopedResource() } }
-                try Self.coordinatedWrite(at: target) {
+                try UpdateFileOps.coordinatedWrite(at: target) {
                     try AppUpdater.restore(from: backup, target: target)
                 }
                 try? FileManager.default.removeItem(at: backup)
@@ -232,22 +226,33 @@ final class AppUpdateController {
         }
     }
 
-    /// iCloud Drive などのファイルを安全に書き換えるため、NSFileCoordinator を通す
-    nonisolated private static func coordinatedWrite(at url: URL, _ work: () throws -> Void) throws {
-        var coordinationError: NSError?
-        var workError: Error?
-        NSFileCoordinator().coordinate(writingItemAt: url, options: [], error: &coordinationError) { _ in
-            do { try work() } catch { workError = error }
-        }
-        if let workError { throw workError }
-        if let coordinationError { throw coordinationError }
-    }
-
     private enum Keys {
         static let source = "updater.source"
         static let repository = "updater.repository"
         static let branch = "updater.branch"
         static let token = "updater.githubToken"
         static let target = "updater.targetBookmark"
+    }
+}
+
+/// 更新のファイル操作（メインスレッドの外で動かすので、クラスの外に置く）。
+enum UpdateFileOps {
+    static func extract(_ zip: URL, to folder: URL) async throws {
+        let task = Task.detached(priority: .userInitiated) { () throws -> Void in
+            _ = try ZipArchive(url: zip).extract(to: folder, inflate: ZipArchive.systemInflater)
+        }
+        try await task.value
+    }
+
+    /// iCloud Drive などのファイルを安全に書き換えるため、NSFileCoordinator を通す
+    static func coordinatedWrite(at url: URL, _ work: () throws -> Void) throws {
+        var coordinationError: NSError?
+        var accessedURL: URL?
+        NSFileCoordinator().coordinate(writingItemAt: url, options: [], error: &coordinationError) { granted in
+            accessedURL = granted
+        }
+        if let coordinationError { throw coordinationError }
+        _ = accessedURL
+        try work()
     }
 }

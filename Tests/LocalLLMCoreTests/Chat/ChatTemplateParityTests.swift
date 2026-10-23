@@ -31,6 +31,34 @@ final class ChatTemplateParityTests: XCTestCase {
         var eosToken: String?
         var conversations: [String: [Message]]
         var results: [Result]
+        var toolsJSON: String?
+        var toolConversationsJSON: String?
+        var toolResults: [Result]?
+    }
+
+    /// Hugging Face 形式の JSON（ツールの定義と、tool_calls を含む会話）を読み込む
+    static func toolsAndConversations(_ expectation: ChatExpectation) throws -> ([ToolDefinition], [String: [ChatMessage]])? {
+        guard let toolsJSON = expectation.toolsJSON, let conversationsJSON = expectation.toolConversationsJSON else { return nil }
+        let tools = try JSONValue.parse(toolsJSON).arrayValue?.compactMap { item -> ToolDefinition? in
+            guard let function = item["function"], let name = function["name"]?.stringValue else { return nil }
+            return ToolDefinition(name: name, description: function["description"]?.stringValue ?? "",
+                                  parameters: function["parameters"] ?? .object([]))
+        } ?? []
+        var conversations: [String: [ChatMessage]] = [:]
+        for (key, value) in try JSONValue.parse(conversationsJSON).objectValue ?? [] {
+            conversations[key] = (value.arrayValue ?? []).map { message in
+                let calls = message["tool_calls"]?.arrayValue?.map { call in
+                    ToolCall(id: call["id"]?.stringValue ?? "", name: call["function"]?["name"]?.stringValue ?? "",
+                             arguments: call["function"]?["arguments"] ?? .object([]))
+                }
+                return ChatMessage(role: ChatMessage.Role(rawValue: message["role"]?.stringValue ?? "user") ?? .user,
+                                   content: message["content"]?.stringValue ?? "",
+                                   toolCalls: calls,
+                                   toolName: message["name"]?.stringValue,
+                                   toolCallID: message["tool_call_id"]?.stringValue)
+            }
+        }
+        return (tools, conversations)
     }
 
     private var directory: URL {
@@ -98,6 +126,23 @@ final class ChatTemplateParityTests: XCTestCase {
                     }
                 } catch {
                     XCTAssertNil(result.output, "[\(expectation.name)] \(result.conversation) threw \(error)")
+                }
+            }
+            // ツールの定義と呼び出し・結果の描画
+            guard let (tools, conversations) = try Self.toolsAndConversations(expectation) else { continue }
+            for result in expectation.toolResults ?? [] {
+                let messages = conversations[result.conversation] ?? []
+                do {
+                    let output = try renderer.render(messages: messages, addGenerationPrompt: true, enableThinking: nil,
+                                                     tools: tools, extraContext: ["date_string": .string("26 Jul 2024")])
+                    if let expected = result.output {
+                        XCTAssertTrue(output.unicodeScalars.elementsEqual(expected.unicodeScalars),
+                                      "[\(expectation.name)] tools \(result.conversation)\n got: \(output.debugDescription)\nwant: \(expected.debugDescription)")
+                    } else {
+                        XCTFail("[\(expectation.name)] tools \(result.conversation) should raise: \(result.error ?? "")")
+                    }
+                } catch {
+                    XCTAssertNil(result.output, "[\(expectation.name)] tools \(result.conversation) threw \(error)")
                 }
             }
         }

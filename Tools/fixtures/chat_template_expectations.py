@@ -44,6 +44,32 @@ CONVERSATIONS = {
 }
 
 
+# ツール呼び出し（function calling）の描画も比べる
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "web_search", "description": "ウェブを検索する",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "検索する言葉"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read a text file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path"},
+                                                         "offset": {"type": "integer", "description": "First line"}},
+                       "required": ["path"]}}},
+]
+TOOL_CONVERSATIONS = {
+    "tool_ask": [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "東京の天気は？"},
+    ],
+    "tool_result": [
+        {"role": "user", "content": "東京の天気は？"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call00001", "type": "function", "function": {"name": "web_search", "arguments": {"query": "東京 天気"}}}]},
+        {"role": "tool", "tool_call_id": "call00001", "name": "web_search", "content": "晴れ、25度"},
+    ],
+}
+
+
 def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
     return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
@@ -191,9 +217,24 @@ def main():
                         item["output"] = None
                         item["error"] = str(error)
                     results.append(item)
+        tool_results = []
+        for key, conversation in TOOL_CONVERSATIONS.items():
+            item = {"conversation": key, "addGenerationPrompt": True, "enableThinking": None}
+            try:
+                item["output"] = tokenizer.apply_chat_template(
+                    conversation, tools=TOOLS, tokenize=False, add_generation_prompt=True, date_string="26 Jul 2024")
+                item["error"] = None
+            except Exception as error:  # noqa: BLE001
+                item["output"] = None
+                item["error"] = str(error)
+            tool_results.append(item)
         special = {k: v for k, v in tokenizer.special_tokens_map.items() if isinstance(v, str)}
         out = {"name": name, "template": template, "bosToken": tokenizer.bos_token, "eosToken": tokenizer.eos_token,
-               "specialTokens": special, "conversations": CONVERSATIONS, "results": results}
+               "specialTokens": special, "conversations": CONVERSATIONS, "results": results,
+               # キーの順番を保つため、ツールまわりは JSON 文字列で渡す
+               "toolsJSON": json.dumps(TOOLS, ensure_ascii=False),
+               "toolConversationsJSON": json.dumps(TOOL_CONVERSATIONS, ensure_ascii=False),
+               "toolResults": tool_results}
         with open(os.path.join(OUT, name + ".json"), "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=1)
         print("wrote", name, len(results))

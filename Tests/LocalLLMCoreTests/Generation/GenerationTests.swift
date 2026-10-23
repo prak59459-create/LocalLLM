@@ -116,6 +116,71 @@ final class TokenSamplerTests: XCTestCase {
         XCTAssertEqual(tiny[0], 200)
     }
 
+    /// 全語彙を並べ替える素直な実装（比較用）
+    func referenceSample(_ logits: [Float], _ p: GenerationParameters, random: inout SplitMix64) -> Int {
+        let maxValue = logits.max()!
+        let t = Float(p.temperature)
+        var candidates = logits.enumerated().filter { ($0.element - maxValue) / t >= -TokenSampler.cutoff }
+            .map { (index: $0.offset, logit: $0.element) }
+        candidates.sort { $0.logit != $1.logit ? $0.logit > $1.logit : $0.index < $1.index }
+        let limit = p.topK > 0 ? p.topK : TokenSampler.maxCandidates
+        if candidates.count > limit { candidates.removeSubrange(limit...) }
+        var probabilities = candidates.map { exp(Double(($0.logit - maxValue) / t)) }
+        let total = probabilities.reduce(0, +)
+        probabilities = probabilities.map { $0 / total }
+        var keep = probabilities.count
+        if p.topP < 1 {
+            var cumulative = 0.0
+            for index in 0..<keep {
+                cumulative += probabilities[index]
+                if cumulative >= p.topP { keep = index + 1; break }
+            }
+        }
+        let sum = probabilities.prefix(keep).reduce(0, +)
+        let r = Double(random.next() >> 11) / Double(1 << 53) * sum
+        var running = 0.0
+        for index in 0..<keep {
+            running += probabilities[index]
+            if r < running { return candidates[index].index }
+        }
+        return candidates[keep - 1].index
+    }
+
+    func testMatchesFullSortReference() {
+        var generator = SplitMix64(seed: 7)
+        for (topK, topP) in [(40, 0.9), (5, 1.0), (0, 0.95), (100, 0.5)] {
+            var p = parameters(temperature: 0.8, topK: topK, topP: topP, seed: 11)
+            p.repetitionPenalty = 1
+            var sampler = TokenSampler(parameters: p)
+            var reference = SplitMix64(seed: 11)
+            for _ in 0..<30 {
+                // 多くは低い値、いくつか高い値（同点も混ぜる）
+                var logits = (0..<5000).map { _ in Float(generator.next() % 1000) / 100 - 20 }
+                for k in 0..<30 { logits[Int(generator.next() % 5000)] = Float(k % 7) }
+                let expected = referenceSample(logits, p, random: &reference)
+                var copy = logits
+                XCTAssertEqual(sampler.sample(logits: &copy, previousTokens: []), expected, "topK \(topK) topP \(topP)")
+            }
+        }
+    }
+
+    func testLargeVocabularyIsFast() {
+        var generator = SplitMix64(seed: 1)
+        let vocab = 151_936
+        var logits = (0..<vocab).map { _ in Float(generator.next() % 10_000) / 1000 - 5 }
+        for k in 0..<20 { logits[Int(generator.next() % UInt64(vocab))] = 15 + Float(k) / 2 }
+        for p in [parameters(temperature: 0.7, topK: 40, topP: 0.9), parameters(temperature: 0.7, topK: 0, topP: 0.9)] {
+            var sampler = TokenSampler(parameters: p)
+            let start = Date()
+            for _ in 0..<10 {
+                var copy = logits
+                _ = sampler.sample(logits: &copy, previousTokens: Array(0..<64))
+            }
+            // 最適化なし（デバッグ）ビルドでも 1 トークン 40ms 未満（以前は全語彙を並べて 60ms 以上かかっていた）
+            XCTAssertLessThan(Date().timeIntervalSince(start) / 10, 0.04)
+        }
+    }
+
     func testSeedMakesSamplingReproducible() {
         let logits: [Float] = (0..<50).map { Float($0 % 7) * 0.3 }
         func run(seed: UInt64) -> [Int] {

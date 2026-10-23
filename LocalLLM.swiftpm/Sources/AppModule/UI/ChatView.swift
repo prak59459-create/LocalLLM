@@ -7,12 +7,15 @@ struct ChatView: View {
     @Environment(ModelLibrary.self) private var library
     @Environment(ChatController.self) private var chat
     @Environment(KnowledgeStore.self) private var knowledge
+    @Environment(ConnectorStore.self) private var connectors
     @Environment(\.modelContext) private var context
 
     @Bindable var conversation: Conversation
     var onShowModels: () -> Void
 
     @State private var draft = ""
+    /// 次の送信の前に Web 検索する
+    @State private var searchWeb = false
     @FocusState private var composerFocused: Bool
 
     private var isGeneratingHere: Bool {
@@ -38,7 +41,8 @@ struct ChatView: View {
                 canSend: chat.loadedInfo != nil && !chat.isGenerating,
                 focused: $composerFocused,
                 onSend: send,
-                onStop: { chat.stopGenerating() }
+                onStop: { chat.stopGenerating() },
+                accessory: { ComposerOptions(searchWeb: $searchWeb) }
             )
         }
         .navigationTitle(conversation.displayTitle)
@@ -83,7 +87,8 @@ struct ChatView: View {
     }
 
     private func regenerate() {
-        chat.regenerate(in: conversation, context: context, settings: settings, assistant: assistant)
+        chat.regenerate(in: conversation, context: context, settings: settings, assistant: assistant,
+                        connectors: connectors)
     }
 
     private let bottomID = "bottom"
@@ -100,7 +105,8 @@ struct ChatView: View {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         draft = ""
         chat.send(text, in: conversation, context: context, settings: settings,
-                  assistant: assistant, knowledge: knowledge)
+                  assistant: assistant, knowledge: knowledge, connectors: connectors,
+                  options: SendOptions(searchWeb: searchWeb))
     }
 
     private func delete(_ message: StoredMessage) {
@@ -193,17 +199,19 @@ struct AssistantBanner: View {
     }
 }
 
-/// 入力欄。
-struct ComposerView: View {
+/// 入力欄。左に送信オプション（accessory）を置ける。
+struct ComposerView<Accessory: View>: View {
     @Binding var text: String
     var isGenerating: Bool
     var canSend: Bool
     var focused: FocusState<Bool>.Binding
     var onSend: () -> Void
     var onStop: () -> Void
+    @ViewBuilder var accessory: () -> Accessory
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 10) {
+            accessory()
             TextField(L("メッセージを入力", "Message"), text: $text, axis: .vertical)
                 .lineLimit(1...8)
                 .textFieldStyle(.plain)
@@ -233,6 +241,54 @@ struct ComposerView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+}
+
+extension ComposerView where Accessory == EmptyView {
+    init(text: Binding<String>, isGenerating: Bool, canSend: Bool, focused: FocusState<Bool>.Binding,
+         onSend: @escaping () -> Void, onStop: @escaping () -> Void) {
+        self.init(text: text, isGenerating: isGenerating, canSend: canSend, focused: focused,
+                  onSend: onSend, onStop: onStop, accessory: { EmptyView() })
+    }
+}
+
+/// 入力欄の左の、Web 検索とツールの切り替え。
+struct ComposerOptions: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(ConnectorStore.self) private var connectors
+    @Binding var searchWeb: Bool
+
+    var body: some View {
+        @Bindable var settings = settings
+        HStack(spacing: 4) {
+            Button {
+                searchWeb.toggle()
+            } label: {
+                Image(systemName: "globe")
+                    .font(.system(size: 20))
+                    .foregroundStyle(searchWeb ? Color.accentColor : Color.secondary)
+                    .frame(width: 34, height: 40)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(searchWeb ? L("Web 検索してから答える: オン", "Search the web first: on")
+                                          : L("Web 検索してから答える: オフ", "Search the web first: off"))
+            Menu {
+                Toggle(L("モデルにツールを使わせる", "Let the model use tools"), isOn: $settings.toolsEnabled)
+                if settings.toolsEnabled {
+                    Section(L("使えるツール", "Available tools")) {
+                        ForEach(connectors.availableTools, id: \.name) { tool in
+                            Text(tool.name)
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: settings.toolsEnabled ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver")
+                    .font(.system(size: 18))
+                    .foregroundStyle(settings.toolsEnabled ? Color.accentColor : Color.secondary)
+                    .frame(width: 34, height: 40)
+            }
+            .accessibilityLabel(L("ツール", "Tools"))
+        }
     }
 }
 
@@ -312,6 +368,10 @@ struct StatsBar: View {
                           systemImage: "text.viewfinder")
                 case .generating:
                     Label(L("生成中", "Generating"), systemImage: "ellipsis.bubble")
+                case .searching:
+                    Label(L("Web を検索中", "Searching the web"), systemImage: "globe")
+                case .usingTool(let name):
+                    Label(L("ツールを実行中: \(name)", "Running tool: \(name)"), systemImage: "wrench.and.screwdriver")
                 }
             } else if let stats = chat.lastStats {
                 Label(String(format: "%.1f tok/s", stats.decodeTokensPerSecond), systemImage: "speedometer")

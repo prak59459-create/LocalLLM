@@ -23,6 +23,25 @@ struct InstalledModel: Codable, Identifiable, Hashable, Sendable {
     var maxContext: Int?
     var stateBytes: Int64?
     var weightBytes: Int64?
+    /// 分割モデル（kind == .pipeline）の部品（リポジトリ内のパス）
+    var pipeline: PipelineDescriptor?
+    /// ダウンロード先で名前を変えるフォルダ（拡張子の無いモデルのフォルダなど）
+    var renames: [String: String]?
+
+    /// 端末上でのパス（リポジトリ内のパスから）
+    func localPath(for repoPath: String) -> String {
+        ModelVariant.localPath(for: repoPath, renames: renames ?? [:])
+    }
+
+    var kindLabel: String {
+        switch kind {
+        case .compiled: return ".mlmodelc"
+        case .package: return ".mlpackage"
+        case .pipeline: return pipeline?.isMonolithic == true ? L("分割形式（一体型）", "Split format (monolithic)")
+                                                              : L("分割モデル（\(pipeline?.chunks.count ?? 0) チャンク）", "Split (\(pipeline?.chunks.count ?? 0) chunks)")
+        case .archive: return "ZIP"
+        }
+    }
 
     static func makeID(repoID: String, variantPath: String) -> String {
         "\(repoID)::\(variantPath)"

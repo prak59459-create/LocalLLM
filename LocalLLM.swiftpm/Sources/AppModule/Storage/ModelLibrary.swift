@@ -140,7 +140,9 @@ final class ModelLibrary {
             compiledModelPath: nil,
             maxContext: metadata?.interface.maxContext,
             stateBytes: metadata?.stateBytes,
-            weightBytes: weightBytes > 0 ? weightBytes : nil
+            weightBytes: weightBytes > 0 ? weightBytes : nil,
+            pipeline: variant.pipeline,
+            renames: variant.renames
         )
         try fileManager.createDirectory(at: directory(for: model), withIntermediateDirectories: true)
         try save(model)
@@ -153,7 +155,7 @@ final class ModelLibrary {
         guard let model = model(withID: id), !model.isComplete, tasks[id] == nil else { return }
         let items = model.files.map { file in
             ModelDownloadJob.Item(url: client.resolveURL(repo: model.repoID, path: file.path, revision: model.revision),
-                                  relativePath: file.path,
+                                  relativePath: model.localPath(for: file.path),
                                   expectedSize: file.size > 0 ? file.size : nil)
         }
         let job = ModelDownloadJob(items: items, destinationDirectory: directory(for: model),
@@ -206,21 +208,88 @@ final class ModelLibrary {
         tasks[id] = nil
         endBackgroundTask(for: id)
         updateIdleTimer()
-        guard var model = model(withID: id) else { return }
+        guard let model = model(withID: id) else { return }
+        if model.kind == .archive {
+            // ZIP を展開して、中のモデルを調べ直す（時間がかかるので別のスレッドで）
+            downloads[id] = DownloadState(phase: .downloading, progress: downloads[id]?.progress)
+            let folder = directory(for: model)
+            tasks[id] = Task { [self] in
+                do {
+                    let adopted = try await Task.detached(priority: .userInitiated) {
+                        try Self.expandArchive(of: model, in: folder)
+                    }.value
+                    tasks[id] = nil
+                    completeDownload(adopted)
+                } catch {
+                    failDownload(id: id, error: error)
+                }
+            }
+            return
+        }
+        completeDownload(model)
+    }
+
+    private func completeDownload(_ original: InstalledModel) {
+        var model = original
         model.isComplete = true
         if model.kind == .compiled {
-            model.compiledModelPath = model.variantPath
+            model.compiledModelPath = model.localPath(for: model.variantPath)
             // ダウンロードした metadata.json から最大長などを読み直す
-            let metadataURL = directory(for: model).appendingPathComponent(model.variantPath)
+            let metadataURL = directory(for: model).appendingPathComponent(model.compiledModelPath ?? "")
                 .appendingPathComponent("metadata.json")
             if let data = try? Data(contentsOf: metadataURL), let metadata = try? CoreMLMetadata.parse(data) {
                 model.maxContext = metadata.interface.maxContext ?? model.maxContext
                 model.stateBytes = metadata.stateBytes
             }
         }
+        if model.kind == .pipeline, let context = model.pipeline?.contextLength {
+            model.maxContext = context
+        }
         try? save(model)
         replace(model)
-        downloads[id] = nil
+        downloads[model.id] = nil
+    }
+
+    /// ZIP を展開して（ZIP は消す）、中のモデルの種類を決め直す
+    nonisolated private static func expandArchive(of original: InstalledModel, in folder: URL) throws -> InstalledModel {
+        let fileManager = FileManager.default
+        let archiveURL = folder.appendingPathComponent(original.localPath(for: original.variantPath))
+        let written = try ZipArchive(url: archiveURL).extract(to: folder, inflate: ZipArchive.systemInflater)
+        try? fileManager.removeItem(at: archiveURL)
+        let expanded = written.map { path in
+            let size = (try? fileManager.attributesOfItem(atPath: folder.appendingPathComponent(path).path)[.size] as? NSNumber)?.int64Value ?? 0
+            return HFFileEntry(path: path, size: size, lfsSHA256: nil)
+        }
+
+        var model = original
+        let supportFiles = model.files.filter { $0.path != model.variantPath }
+        let analysis = RepoAnalysis.analyze(files: expanded + supportFiles, repoName: model.shortRepoName)
+        guard let variant = analysis.variants.first(where: { $0.kind != .archive }) else {
+            throw ModelLibraryError.missingModelFolder
+        }
+        // 拡張子の無いモデルのフォルダは、ダウンロードしたときと同じように名前を変えておく
+        let renames = variant.renames ?? [:]
+        for (from, to) in renames {
+            let destination = folder.appendingPathComponent(to)
+            try? fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if from.isEmpty {
+                try? fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+                for file in expanded where RepoAnalysis.isLooseModelFile(file.path) {
+                    let target = folder.appendingPathComponent(ModelVariant.localPath(for: file.path, renames: renames))
+                    try? fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? fileManager.moveItem(at: folder.appendingPathComponent(file.path), to: target)
+                }
+            } else {
+                try? fileManager.moveItem(at: folder.appendingPathComponent(from), to: destination)
+            }
+        }
+        model.kind = variant.kind
+        model.variantPath = variant.path
+        model.pipeline = variant.pipeline
+        model.renames = variant.renames
+        model.displayName = variant.displayName
+        model.files = analysis.filesToDownload(for: variant)
+        return model
     }
 
     private func failDownload(id: String, error: Error) {
@@ -236,44 +305,75 @@ final class ModelLibrary {
 
     // MARK: - 読み込みの準備
 
+    /// 初回の読み込みでコンパイルが必要か（.mlpackage が残っている）
+    func needsCompilation(_ model: InstalledModel) -> Bool {
+        switch model.kind {
+        case .package: return model.compiledModelPath == nil
+        case .pipeline: return (model.pipeline?.parts ?? []).contains { model.localPath(for: $0).hasSuffix(".mlpackage") }
+        default: return false
+        }
+    }
+
     /// 推論エンジンに渡すファイル一式を用意する。.mlpackage なら初回だけコンパイルする（数十秒〜数分）。
     func prepareFiles(for id: String) async throws -> ModelFiles {
         guard var model = model(withID: id) else { throw ModelLibraryError.missingModelFolder }
         guard model.isComplete else { throw ModelLibraryError.incomplete }
         let folder = directory(for: model)
 
-        if model.compiledModelPath == nil || !fileManager.fileExists(atPath: folder.appendingPathComponent(model.compiledModelPath ?? "").path) {
-            if model.kind == .compiled {
-                model.compiledModelPath = model.variantPath
-            } else {
-                let packageURL = folder.appendingPathComponent(model.variantPath)
-                guard fileManager.fileExists(atPath: packageURL.path) else { throw ModelLibraryError.missingModelFolder }
+        let source: ModelFiles.Source
+        switch model.kind {
+        case .pipeline:
+            guard var pipeline = model.pipeline else { throw ModelLibraryError.missingModelFolder }
+            // .mlpackage の部品があればコンパイルして、パスを .mlmodelc に置き換える
+            if needsCompilation(model) {
                 compilingModelIDs.insert(id)
                 defer { compilingModelIDs.remove(id) }
-                let compiledTemp = try await MLModel.compileModel(at: packageURL)
-                let compiledPath = (model.variantPath as NSString).deletingPathExtension + ".mlmodelc"
-                let destination = folder.appendingPathComponent(compiledPath)
-                try? fileManager.removeItem(at: destination)
-                try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                do {
-                    try fileManager.moveItem(at: compiledTemp, to: destination)
-                } catch {
-                    try fileManager.copyItem(at: compiledTemp, to: destination)
-                    try? fileManager.removeItem(at: compiledTemp)
+                func compiled(_ path: String?) async throws -> String? {
+                    guard let path else { return nil }
+                    let local = model.localPath(for: path)
+                    guard local.hasSuffix(".mlpackage") else { return path }
+                    return try await compilePackage(at: local, in: folder)
                 }
-                // 容量を節約するため、コンパイル前のパッケージは消す
-                try? fileManager.removeItem(at: packageURL)
-                model.compiledModelPath = compiledPath
+                pipeline.embeddings = try await compiled(pipeline.embeddings)
+                var chunks: [String] = []
+                for chunk in pipeline.chunks { chunks.append(try await compiled(chunk) ?? chunk) }
+                pipeline.chunks = chunks
+                pipeline.lmHead = try await compiled(pipeline.lmHead)
+                model.pipeline = pipeline
+                try save(model)
+                replace(model)
             }
-            try save(model)
-            replace(model)
+            func url(_ path: String) throws -> URL {
+                let url = folder.appendingPathComponent(model.localPath(for: path))
+                guard fileManager.fileExists(atPath: url.path) else { throw ModelLibraryError.missingModelFolder }
+                return url
+            }
+            source = .pipeline(PipelineFiles(embeddings: try pipeline.embeddings.map(url),
+                                             chunks: try pipeline.chunks.map(url),
+                                             lmHead: try pipeline.lmHead.map(url),
+                                             descriptor: pipeline))
+        case .archive:
+            throw ModelLibraryError.incomplete
+        case .compiled, .package:
+            if model.compiledModelPath == nil || !fileManager.fileExists(atPath: folder.appendingPathComponent(model.compiledModelPath ?? "").path) {
+                if model.kind == .compiled {
+                    model.compiledModelPath = model.localPath(for: model.variantPath)
+                } else {
+                    compilingModelIDs.insert(id)
+                    defer { compilingModelIDs.remove(id) }
+                    model.compiledModelPath = try await compilePackage(at: model.localPath(for: model.variantPath), in: folder)
+                }
+                try save(model)
+                replace(model)
+            }
+            guard let compiledPath = model.compiledModelPath else { throw ModelLibraryError.missingModelFolder }
+            source = .single(folder.appendingPathComponent(compiledPath))
         }
 
-        guard let compiledPath = model.compiledModelPath else { throw ModelLibraryError.missingModelFolder }
         guard let tokenizerPath = model.supportFilePath(named: "tokenizer.json") else { throw ModelLibraryError.missingTokenizer }
 
         func url(_ name: String) -> URL? {
-            model.supportFilePath(named: name).map { folder.appendingPathComponent($0) }
+            model.supportFilePath(named: name).map { folder.appendingPathComponent(model.localPath(for: $0)) }
                 .flatMap { fileManager.fileExists(atPath: $0.path) ? $0 : nil }
         }
 
@@ -291,13 +391,33 @@ final class ModelLibrary {
         return ModelFiles(
             modelID: model.id,
             displayName: model.displayName,
-            compiledModel: folder.appendingPathComponent(compiledPath),
-            tokenizerJSON: folder.appendingPathComponent(tokenizerPath),
+            source: source,
+            tokenizerJSON: folder.appendingPathComponent(model.localPath(for: tokenizerPath)),
             tokenizerConfigJSON: url("tokenizer_config.json"),
             generationConfigJSON: url("generation_config.json"),
             configJSON: url("config.json"),
             chatTemplateOverride: templateOverride
         )
+    }
+
+    /// .mlpackage をコンパイルして .mlmodelc にし、元のパッケージは消す。戻り値は .mlmodelc のパス。
+    private func compilePackage(at relativePath: String, in folder: URL) async throws -> String {
+        let packageURL = folder.appendingPathComponent(relativePath)
+        guard fileManager.fileExists(atPath: packageURL.path) else { throw ModelLibraryError.missingModelFolder }
+        let compiledTemp = try await MLModel.compileModel(at: packageURL)
+        let compiledPath = (relativePath as NSString).deletingPathExtension + ".mlmodelc"
+        let destination = folder.appendingPathComponent(compiledPath)
+        try? fileManager.removeItem(at: destination)
+        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        do {
+            try fileManager.moveItem(at: compiledTemp, to: destination)
+        } catch {
+            try fileManager.copyItem(at: compiledTemp, to: destination)
+            try? fileManager.removeItem(at: compiledTemp)
+        }
+        // 容量を節約するため、コンパイル前のパッケージは消す
+        try? fileManager.removeItem(at: packageURL)
+        return compiledPath
     }
 
     // MARK: - 補助

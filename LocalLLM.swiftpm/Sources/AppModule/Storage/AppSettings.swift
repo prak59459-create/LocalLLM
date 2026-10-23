@@ -5,6 +5,7 @@ import Security
 
 /// 計算に使うチップの選び方（MLComputeUnits）。
 enum ComputeUnitsOption: String, CaseIterable, Codable, Identifiable, Sendable {
+    case automatic
     case cpuAndGPU
     case all
     case cpuAndNeuralEngine
@@ -14,6 +15,7 @@ enum ComputeUnitsOption: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var computeUnits: MLComputeUnits {
         switch self {
+        case .automatic: return .cpuAndGPU
         case .all: return .all
         case .cpuAndGPU: return .cpuAndGPU
         case .cpuAndNeuralEngine: return .cpuAndNeuralEngine
@@ -23,8 +25,9 @@ enum ComputeUnitsOption: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var label: String {
         switch self {
+        case .automatic: return L("自動（推奨）", "Automatic (recommended)")
         case .all: return L("すべて（Neural Engine を含む）", "All (incl. Neural Engine)")
-        case .cpuAndGPU: return L("CPU + GPU（推奨）", "CPU + GPU (recommended)")
+        case .cpuAndGPU: return L("CPU + GPU", "CPU + GPU")
         case .cpuAndNeuralEngine: return L("CPU + Neural Engine", "CPU + Neural Engine")
         case .cpuOnly: return L("CPU のみ", "CPU only")
         }
@@ -92,6 +95,10 @@ final class AppSettings {
     var autoLoadLastModel: Bool {
         didSet { defaults.set(autoLoadLastModel, forKey: Keys.autoLoadLastModel) }
     }
+    /// モデルにツール（Web 検索や MCP）を使わせる
+    var toolsEnabled: Bool {
+        didSet { defaults.set(toolsEnabled, forKey: Keys.toolsEnabled) }
+    }
     /// Hugging Face のアクセストークン（ゲート付きモデル用。任意）
     var huggingFaceToken: String {
         didSet { Keychain.set(huggingFaceToken, for: Keys.huggingFaceToken) }
@@ -106,7 +113,7 @@ final class AppSettings {
         thinkingMode = defaults.string(forKey: Keys.thinkingMode).flatMap(ThinkingMode.init(rawValue:)) ?? .modelDefault
         // 既定は CPU + GPU。可変長入力の LLM は Neural Engine で動かないことが多く、
         // .all だと初回読み込み時の Neural Engine 向け変換で時間がかかったり失敗したりするため。
-        computeUnits = defaults.string(forKey: Keys.computeUnits).flatMap(ComputeUnitsOption.init(rawValue:)) ?? .cpuAndGPU
+        computeUnits = defaults.string(forKey: Keys.computeUnits).flatMap(ComputeUnitsOption.init(rawValue:)) ?? .automatic
         let chunk = defaults.integer(forKey: Keys.prefillChunkSize)
         prefillChunkSize = chunk > 0 ? chunk : 128
         showStats = defaults.object(forKey: Keys.showStats) as? Bool ?? true
@@ -114,6 +121,7 @@ final class AppSettings {
         activeModelID = defaults.string(forKey: Keys.activeModelID)
         autoLoadLastModel = defaults.object(forKey: Keys.autoLoadLastModel) as? Bool ?? true
         huggingFaceToken = Keychain.get(Keys.huggingFaceToken) ?? ""
+        toolsEnabled = defaults.object(forKey: Keys.toolsEnabled) as? Bool ?? true
     }
 
     /// 生成パラメータを既定値に戻す。
@@ -137,6 +145,7 @@ final class AppSettings {
         static let activeModelID = "activeModelID"
         static let autoLoadLastModel = "autoLoadLastModel"
         static let huggingFaceToken = "huggingFaceToken"
+        static let toolsEnabled = "toolsEnabled"
     }
 
     private func saveCodable<T: Encodable>(_ value: T, forKey key: String) {

@@ -24,9 +24,17 @@ struct GenerationProgress: Equatable {
 
     enum Phase: Equatable {
         case preparing
+        case searching
         case prefilling
         case generating
+        case usingTool(String)
     }
+}
+
+/// 送信のときの追加の指定
+struct SendOptions {
+    /// 送る前に Web を検索して、結果を一緒にモデルへ渡す
+    var searchWeb = false
 }
 
 /// モデルの読み込みと、会話への返答生成を受け持つ。
@@ -99,7 +107,7 @@ final class ChatController {
         settings.activeModelID = id
         loadTask = Task {
             do {
-                if model.kind == .package && model.compiledModelPath == nil {
+                if library.needsCompilation(model) {
                     loadState = .compiling(model.displayName)
                 } else {
                     loadState = .loading(model.displayName)
@@ -107,7 +115,7 @@ final class ChatController {
                 let files = try await library.prepareFiles(for: id)
                 loadState = .loading(model.displayName)
                 let info = try await engine.load(files: files,
-                                                 computeUnits: settings.computeUnits.computeUnits,
+                                                 computeUnits: settings.computeUnits,
                                                  prefillChunkSize: settings.prefillChunkSize)
                 if Task.isCancelled { return }
                 loadState = .ready(info)
@@ -136,7 +144,8 @@ final class ChatController {
     /// ユーザーの発言を追加して、返答を生成する。
     /// アシスタントに参考資料があれば、発言に関係する部分を検索して一緒にモデルへ渡す。
     func send(_ text: String, in conversation: Conversation, context: ModelContext, settings: AppSettings,
-              assistant: Assistant? = nil, knowledge: KnowledgeStore? = nil) {
+              assistant: Assistant? = nil, knowledge: KnowledgeStore? = nil, connectors: ConnectorStore? = nil,
+              options: SendOptions = SendOptions()) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isGenerating else { return }
         guard loadedInfo != nil else {
@@ -155,21 +164,41 @@ final class ChatController {
         }
         conversation.updatedAt = Date()
         try? context.save()
-        generateReply(in: conversation, context: context, settings: settings, assistant: assistant)
+
+        guard options.searchWeb, let connectors else {
+            generateReply(in: conversation, context: context, settings: settings, assistant: assistant, connectors: connectors)
+            return
+        }
+        // 先に Web を検索して、結果を発言に付けてから生成する
+        progress = GenerationProgress(conversationID: conversation.id, messageID: userMessage.id, phase: .searching)
+        generationTask = Task {
+            do {
+                let results = try await connectors.search(trimmed)
+                attachWebResults(results, to: userMessage)
+                try? context.save()
+            } catch {
+                notice = error.localizedDescription
+            }
+            progress = nil
+            generationTask = nil
+            if !Task.isCancelled {
+                generateReply(in: conversation, context: context, settings: settings, assistant: assistant, connectors: connectors)
+            }
+        }
     }
 
-    /// 最後のアシスタントの返答を作り直す。
+    /// 最後のアシスタントの返答を作り直す（ツールのやり取りも含めて消す）。
     func regenerate(in conversation: Conversation, context: ModelContext, settings: AppSettings,
-                    assistant: Assistant? = nil) {
+                    assistant: Assistant? = nil, connectors: ConnectorStore? = nil) {
         guard !isGenerating else { return }
-        var excluded: UUID?
-        if let last = conversation.orderedMessages.last, last.role == .assistant {
-            excluded = last.id
-            conversation.messages.removeAll { $0.id == last.id }
-            context.delete(last)
-            try? context.save()
+        let ordered = conversation.orderedMessages
+        guard let lastUser = ordered.lastIndex(where: { $0.role == .user }) else { return }
+        for message in ordered[(lastUser + 1)...] {
+            conversation.messages.removeAll { $0.id == message.id }
+            context.delete(message)
         }
-        generateReply(in: conversation, context: context, settings: settings, assistant: assistant, excluding: excluded)
+        try? context.save()
+        generateReply(in: conversation, context: context, settings: settings, assistant: assistant, connectors: connectors)
     }
 
     /// 参考資料を検索して、ユーザーの発言に付ける。
@@ -185,6 +214,18 @@ final class ChatController {
         message.sources = results.map { "\($0.chunk.source) L\($0.chunk.startLine)-\($0.chunk.endLine)" }
     }
 
+    private func attachWebResults(_ results: [WebSearchResult], to message: StoredMessage) {
+        guard !results.isEmpty else { return }
+        let contextLength = loadedInfo?.maxContext ?? 2048
+        let maxCharacters = min(4000, max(500, contextLength))
+        var block = L("以下は Web 検索の結果です。質問に関係する場合は、これをもとに答え、使った情報の番号を [1] のように示してください。",
+                      "Here are web search results. Use them if relevant and cite them like [1].") + "\n\n"
+        block += WebSearchClient.format(results)
+        if block.count > maxCharacters { block = String(block.prefix(maxCharacters)) + "…" }
+        message.attachedContext = [message.attachedContext, block].compactMap { $0 }.joined(separator: "\n\n")
+        message.sources = message.sources + results.map(\.url)
+    }
+
     /// 生成を止める。
     func stopGenerating() {
         generationTask?.cancel()
@@ -192,24 +233,16 @@ final class ChatController {
     }
 
     private func generateReply(in conversation: Conversation, context: ModelContext, settings: AppSettings,
-                               assistant: Assistant?, excluding excludedID: UUID? = nil) {
+                               assistant: Assistant?, connectors: ConnectorStore?) {
         guard let info = loadedInfo else {
             notice = L("先にモデルを選んで読み込んでください。", "Please choose and load a model first.")
             return
         }
-        let messages = conversation.orderedMessages.filter { $0.id != excludedID && !$0.isDeleted }
-        let history = messages
-            .filter { $0.role != .system && !($0.role == .assistant && $0.content.isEmpty) }
+        let history = conversation.orderedMessages
+            .filter { !$0.isDeleted && $0.role != .system }
+            .filter { !($0.role == .assistant && $0.content.isEmpty && $0.toolCalls.isEmpty) }
             .map(\.chatMessage)
-        guard history.last?.role == .user else { return }
-
-        let nextOrder = (messages.last?.order ?? -1) + 1
-        let reply = StoredMessage(role: .assistant, content: "", order: nextOrder, modelName: info.displayName)
-        context.insert(reply)
-        conversation.messages.append(reply)
-        conversation.modelID = info.modelID
-        conversation.updatedAt = Date()
-        try? context.save()
+        guard let last = history.last, last.role == .user || last.role == .tool else { return }
 
         // アシスタントがあれば、そのシステムプロンプトと生成設定を使う
         let rawPrompt = assistant?.systemPrompt ?? settings.systemPrompt
@@ -220,47 +253,81 @@ final class ChatController {
             if assistant.useCustomGeneration { parameters = assistant.generation }
             if assistant.thinkingMode != .modelDefault { thinking = assistant.thinkingMode }
         }
-        let request = GenerationRequest(
-            systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt,
-            history: history,
-            parameters: parameters,
-            enableThinking: thinking.enableThinking
-        )
-        progress = GenerationProgress(conversationID: conversation.id, messageID: reply.id, phase: .preparing)
+        let tools = settings.toolsEnabled ? (connectors?.availableTools ?? []) : []
+        let configuration = AgentLoop.Configuration(systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt,
+                                                    parameters: parameters, enableThinking: thinking.enableThinking,
+                                                    tools: tools, maxRounds: 4)
+        conversation.modelID = info.modelID
+        progress = GenerationProgress(conversationID: conversation.id, messageID: UUID(), phase: .preparing)
         notice = nil
         UIApplication.shared.isIdleTimerDisabled = true
 
-        let stream = engine.generate(request)
+        let loop = AgentLoop(engine: engine)
         generationTask = Task {
-            var text = ""
+            var reply: StoredMessage?
+            var lastDisplay = Date.distantPast
             do {
-                for try await event in stream {
+                try await loop.run(history: history, configuration: configuration, execute: { call in
+                    guard let connectors else { return ToolOutcome(text: "no connectors", isError: true) }
+                    return await connectors.execute(call)
+                }, onEvent: { event in
                     switch event {
+                    case .assistantStarted:
+                        let message = self.appendMessage(role: .assistant, to: conversation, context: context, modelName: info.displayName)
+                        reply = message
+                        self.progress?.messageID = message.id
+                        self.progress?.phase = .preparing
                     case .promptReady(let promptTokens, let dropped):
-                        progress?.promptTokens = promptTokens
-                        progress?.phase = .prefilling
+                        self.progress?.promptTokens = promptTokens
+                        self.progress?.phase = .prefilling
                         if dropped > 0 {
-                            notice = L("コンテキストに収まらないため、古いメッセージ \(dropped) 件を省いて送りました。",
-                                       "\(dropped) older messages were left out to fit the context window.")
+                            self.notice = L("コンテキストに収まらないため、古いメッセージ \(dropped) 件を省いて送りました。",
+                                            "\(dropped) older messages were left out to fit the context window.")
                         }
                     case .prefill(let done, let total):
-                        progress?.prefillDone = done
-                        progress?.prefillTotal = total
-                    case .text(let piece):
-                        text += piece
-                        progress?.phase = .generating
-                        progress?.generatedCharacters += piece.count
-                        reply.content = text
-                        saveIfNeeded(context)
-                    case .finished(let stats):
-                        reply.stats = stats
-                        lastStats = stats
+                        self.progress?.prefillDone = done
+                        self.progress?.prefillTotal = total
+                    case .text(let visible):
+                        // 画面の更新は 1 秒に 12 回までにまとめる（Markdown の再描画が重いので、トークンごとには描かない）
+                        let now = Date()
+                        if now.timeIntervalSince(lastDisplay) >= 0.08 {
+                            lastDisplay = now
+                            if self.progress?.phase != .generating { self.progress?.phase = .generating }
+                            self.progress?.generatedCharacters = visible.count
+                            reply?.content = visible
+                            self.saveIfNeeded(context)
+                        }
+                    case .assistantFinished(let content, let calls, let stats):
+                        reply?.content = content
+                        reply?.toolCalls = calls
+                        reply?.stats = stats
+                        self.lastStats = stats
+                        if calls.isEmpty, content.isEmpty, let reply {
+                            // 何も書かなかった返答は残さない
+                            conversation.messages.removeAll { $0.id == reply.id }
+                            context.delete(reply)
+                        }
+                        try? context.save()
+                    case .toolStarted(let call):
+                        self.progress?.phase = .usingTool(call.name)
+                    case .toolFinished(let call, let outcome):
+                        let message = self.appendMessage(role: .tool, to: conversation, context: context, modelName: nil)
+                        message.content = outcome.text
+                        message.toolName = call.name
+                        message.toolCallID = call.id
+                        if outcome.isError { message.errorText = outcome.text }
+                        try? context.save()
                     }
-                }
+                })
+            } catch is CancellationError {
+                // 止めたときは、そこまでの文章を残す
             } catch {
-                reply.errorText = error.localizedDescription
+                if let reply {
+                    reply.errorText = error.localizedDescription
+                } else {
+                    self.notice = error.localizedDescription
+                }
             }
-            reply.content = text
             conversation.updatedAt = Date()
             try? context.save()
             progress = nil
@@ -268,6 +335,15 @@ final class ChatController {
             UIApplication.shared.isIdleTimerDisabled = false
             refreshMemory()
         }
+    }
+
+    private func appendMessage(role: ChatMessage.Role, to conversation: Conversation, context: ModelContext,
+                               modelName: String?) -> StoredMessage {
+        let order = (conversation.orderedMessages.last?.order ?? -1) + 1
+        let message = StoredMessage(role: role, content: "", order: order, modelName: modelName)
+        context.insert(message)
+        conversation.messages.append(message)
+        return message
     }
 
     /// 生成中は SwiftData への保存を 2 秒ごとにまとめる。

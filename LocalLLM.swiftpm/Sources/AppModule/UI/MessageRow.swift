@@ -27,6 +27,9 @@ struct MessageRow: View {
                     SourcesCaption(sources: sources)
                 }
             }
+        case .tool:
+            ToolResultView(message: message)
+                .contextMenu { menuItems }
         case .assistant, .system:
             AssistantMessageView(message: message, isStreaming: isStreaming)
                 .contextMenu { menuItems }
@@ -95,12 +98,17 @@ private struct AssistantMessageView: View {
             if split.answer.isEmpty {
                 if isStreaming && !split.isThinkingOpen {
                     TypingIndicator()
-                } else if !isStreaming && message.errorText == nil && split.thinking == nil {
+                } else if !isStreaming && message.errorText == nil && split.thinking == nil && message.toolCalls.isEmpty {
                     Text(L("（空の返答）", "(empty reply)"))
                         .foregroundStyle(.secondary)
                 }
             } else {
                 MarkdownText(split.answer)
+            }
+
+            let calls = message.toolCalls
+            if !calls.isEmpty {
+                ToolCallChips(calls: calls)
             }
 
             if let error = message.errorText {
@@ -129,6 +137,67 @@ private struct AssistantMessageView: View {
             }
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.tertiary)
+        }
+    }
+}
+
+/// モデルが呼んだツールの一覧。
+struct ToolCallChips: View {
+    let calls: [ToolCall]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(calls) { call in
+                Label(call.summary, systemImage: ToolResultView.icon(for: call.name))
+                    .font(.caption.monospaced())
+                    .lineLimit(2)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor.opacity(0.1), in: Capsule())
+            }
+        }
+    }
+}
+
+/// ツールの実行結果（折りたたみ）。
+struct ToolResultView: View {
+    let message: StoredMessage
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            Text(message.content)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+        } label: {
+            Label(title, systemImage: message.errorText == nil ? Self.icon(for: message.toolName ?? "") : "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(message.errorText == nil ? Color.secondary : Color.orange)
+        }
+        .padding(10)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var title: String {
+        let name = message.toolName ?? L("ツール", "Tool")
+        let lines = message.content.split(separator: "\n").count
+        return message.errorText == nil ? L("\(name) の結果（\(lines) 行）", "\(name) result (\(lines) lines)")
+                                        : L("\(name) が失敗しました", "\(name) failed")
+    }
+
+    static func icon(for name: String) -> String {
+        switch name {
+        case "web_search": return "globe"
+        case "fetch_page": return "doc.richtext"
+        case "current_time": return "clock"
+        case "read_file", "list_files", "search_files": return "doc.text.magnifyingglass"
+        case "write_file", "edit_file", "create_file": return "square.and.pencil"
+        case "delete_file", "move_file": return "folder.badge.gearshape"
+        case "run_javascript": return "play.rectangle"
+        case "roadmap_add", "roadmap_update", "roadmap_list": return "point.3.connected.trianglepath.dotted"
+        default: return "wrench.and.screwdriver"
         }
     }
 }

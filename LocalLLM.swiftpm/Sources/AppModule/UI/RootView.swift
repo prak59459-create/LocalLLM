@@ -51,7 +51,12 @@ struct RootView: View {
             MiniLLMStudioView()
         }
         .task {
+            removeEmptyConversations(except: nil)
             autoLoadIfNeeded()
+        }
+        // 何も話さなかった会話は、ほかの会話に移ったときに消す（履歴に空の会話を残さない）
+        .onChange(of: selectedConversationID) { _, newID in
+            removeEmptyConversations(except: newID)
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -73,6 +78,10 @@ struct RootView: View {
     }
 
     private func newConversation(assistant: Assistant?) {
+        // いま開いている会話がまだ空で、同じアシスタントなら、それをそのまま使う
+        if let current = selectedConversation, current.messages.isEmpty, current.assistantID == assistant?.id {
+            return
+        }
         let conversation = Conversation(modelID: settings.activeModelID, assistantID: assistant?.id)
         context.insert(conversation)
         try? context.save()
@@ -82,6 +91,18 @@ struct RootView: View {
            library.model(withID: id)?.isComplete == true, !chat.isGenerating {
             chat.loadModel(id: id, library: library, settings: settings)
         }
+    }
+
+    /// メッセージが 1 つもない会話を消す（いま開いているものは残す）。
+    private func removeEmptyConversations(except keepID: UUID?) {
+        guard let all = try? context.fetch(FetchDescriptor<Conversation>()) else { return }
+        var changed = false
+        for conversation in all where conversation.messages.isEmpty && conversation.id != keepID {
+            if chat.progress?.conversationID == conversation.id { continue }
+            context.delete(conversation)
+            changed = true
+        }
+        if changed { try? context.save() }
     }
 
     /// 起動時に前回使ったモデルを読み込む。

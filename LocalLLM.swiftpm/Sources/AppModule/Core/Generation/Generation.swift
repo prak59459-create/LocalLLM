@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Accelerate)
+import Accelerate
+#endif
 
 /// 生成の設定。
 struct GenerationParameters: Codable, Hashable, Sendable {
@@ -55,10 +58,20 @@ struct SplitMix64: RandomNumberGenerator {
 }
 
 /// logits（語彙ごとのスコア）から次のトークンを選ぶ。
+///
+/// 語彙は 15 万語以上あるので、全部を並べ替えると最適化なしのビルドでは 1 トークンに数百 ms かかる。
+/// そこで「上位 K 個がちょうど入るしきい値」を数えながら二分探索し、しきい値以上の候補だけを取り出して並べる。
+/// 数える・取り出す処理は iPad では vDSP（Accelerate）で行う。
 struct TokenSampler {
     let parameters: GenerationParameters
+    /// top-k が無効（0）のときに top-p の前に残す候補の上限
+    static let maxCandidates = 512
+    /// 最大値からこれ以上（温度で割ったあと）離れた候補は確率が exp(-30) 未満なので捨てる
+    static let cutoff: Float = 30
+
     private var seeded: SplitMix64?
     private var system = SystemRandomNumberGenerator()
+    private var scratch = LogitsScratch()
 
     init(parameters: GenerationParameters) {
         self.parameters = parameters
@@ -81,56 +94,33 @@ struct TokenSampler {
             }
         }
 
-        // 2. 最大値を探す（NaN は無視）
-        var best = -1
-        var maxValue = -Float.infinity
-        logits.withUnsafeBufferPointer { buffer in
-            for index in 0..<count {
-                let value = buffer[index]
-                if value > maxValue {
-                    maxValue = value
-                    best = index
-                }
-            }
-        }
-        if best < 0 { return 0 }   // 全部 NaN / -inf
-        if parameters.temperature <= 0 || parameters.topK == 1 { return best }
+        // 2. 最大値（NaN は無視）
+        guard let top = LogitsMath.argmax(logits) else { return 0 }   // 全部 NaN / -inf
+        if parameters.temperature <= 0 || parameters.topK == 1 { return top.index }
 
-        // 3. 温度を掛けたあと、最大値から大きく離れたものは最初から候補にしない（全語彙を並べ替えないため）
+        // 3. 上位の候補だけを取り出す
         let temperature = Float(parameters.temperature)
-        let cutoff: Float = 30   // exp(-30) ≈ 1e-13 は無視できる
-        var candidates: [(index: Int, logit: Float)] = []
-        candidates.reserveCapacity(256)
-        logits.withUnsafeBufferPointer { buffer in
-            for index in 0..<count {
-                let value = buffer[index]
-                guard value.isFinite else { continue }
-                let scaled = (value - maxValue) / temperature
-                if scaled >= -cutoff { candidates.append((index, scaled)) }
-            }
-        }
-        if candidates.isEmpty { return best }
+        let limit = parameters.topK > 0 ? parameters.topK : Self.maxCandidates
+        let lowest = top.value - Self.cutoff * temperature
+        var candidates = scratch.candidates(logits, atLeast: lowest, maxValue: top.value, keep: limit)
+        if candidates.isEmpty { return top.index }
         candidates.sort { $0.logit != $1.logit ? $0.logit > $1.logit : $0.index < $1.index }
+        if candidates.count > limit { candidates.removeSubrange(limit...) }
 
-        // 4. top-k
-        if parameters.topK > 0 && candidates.count > parameters.topK {
-            candidates.removeSubrange(parameters.topK...)
-        }
-
-        // 5. 確率にする（Double で計算）
-        var probabilities = candidates.map { exp(Double($0.logit)) }
+        // 4. 確率にする（Double で計算）
+        var probabilities = candidates.map { exp(Double(($0.logit - top.value) / temperature)) }
         var total = probabilities.reduce(0, +)
-        guard total > 0, total.isFinite else { return best }
+        guard total > 0, total.isFinite else { return top.index }
         for index in probabilities.indices { probabilities[index] /= total }
 
-        // 6. min-p（いちばん高い確率 × minP 未満を捨てる）
+        // 5. min-p（いちばん高い確率 × minP 未満を捨てる）
         var keep = probabilities.count
         if parameters.minP > 0 {
             let threshold = probabilities[0] * parameters.minP
             keep = max(1, probabilities.prefix { $0 >= threshold }.count)
         }
 
-        // 7. top-p（確率の高い順に足して topP に達するまで）
+        // 6. top-p（確率の高い順に足して topP に達するまで）
         if parameters.topP > 0 && parameters.topP < 1 {
             var cumulative = 0.0
             var cut = 0
@@ -142,7 +132,7 @@ struct TokenSampler {
             keep = max(1, cut)
         }
 
-        // 8. 残った候補から確率に比例して選ぶ
+        // 7. 残った候補から確率に比例して選ぶ
         total = probabilities.prefix(keep).reduce(0, +)
         let random = Double(nextRandom() >> 11) / Double(1 << 53) * total
         var running = 0.0
@@ -156,6 +146,174 @@ struct TokenSampler {
     private mutating func nextRandom() -> UInt64 {
         if seeded != nil { return seeded!.next() }
         return system.next()
+    }
+}
+
+/// logits の高速な集計（iPad では vDSP、それ以外は素朴なループ。どちらも同じ結果になる）。
+enum LogitsMath {
+    /// 最大値とその位置（同じ値なら小さい位置）。NaN は無視。すべて NaN / -inf なら nil。
+    static func argmax(_ logits: [Float]) -> (index: Int, value: Float)? {
+        logits.withUnsafeBufferPointer { buffer -> (index: Int, value: Float)? in
+            guard let base = buffer.baseAddress, buffer.count > 0 else { return nil }
+            #if canImport(Accelerate)
+            var sum: Float = 0
+            vDSP_sve(base, 1, &sum, vDSP_Length(buffer.count))
+            if !sum.isNaN {
+                var value: Float = 0
+                var index: vDSP_Length = 0
+                vDSP_maxvi(base, 1, &value, &index, vDSP_Length(buffer.count))
+                return value > -Float.infinity ? (Int(index), value) : nil
+            }
+            #endif
+            var best = -1
+            var value = -Float.infinity
+            var i = 0
+            while i < buffer.count {
+                if base[i] > value {
+                    value = base[i]
+                    best = i
+                }
+                i += 1
+            }
+            return best >= 0 ? (best, value) : nil
+        }
+    }
+
+    /// threshold 以上の要素の数
+    static func count(_ base: UnsafePointer<Float>, _ n: Int, atLeast threshold: Float,
+                      scratch: UnsafeMutablePointer<Float>) -> Int {
+        #if canImport(Accelerate)
+        var t = threshold
+        var one: Float = 1
+        vDSP_vthrsc(base, 1, &t, &one, scratch, 1, vDSP_Length(n))
+        var sum: Float = 0
+        vDSP_sve(scratch, 1, &sum, vDSP_Length(n))
+        return (Int(sum.rounded()) + n) / 2
+        #else
+        var result = 0
+        var i = 0
+        while i < n {
+            if base[i] >= threshold { result += 1 }
+            i += 1
+        }
+        return result
+        #endif
+    }
+}
+
+/// 候補の取り出しに使う作業領域（語彙数ぶん。サンプラーごとに使い回す）
+struct LogitsScratch {
+    private var buffer: [Float] = []
+    private var ramp: [Float] = []
+
+    /// threshold を二分探索して、上位 keep 個（と同点）が入る範囲の候補を返す（並べてはいない）。
+    /// atLeast より小さい要素は候補にしない。
+    mutating func candidates(_ logits: [Float], atLeast lowest: Float, maxValue: Float,
+                             keep: Int) -> [(index: Int, logit: Float)] {
+        let n = logits.count
+        if buffer.count != n {
+            buffer = [Float](repeating: 0, count: n)
+            ramp = (0..<n).map { Float($0) }
+        }
+        return logits.withUnsafeBufferPointer { values -> [(index: Int, logit: Float)] in
+            buffer.withUnsafeMutableBufferPointer { work -> [(index: Int, logit: Float)] in
+                guard let base = values.baseAddress, let scratch = work.baseAddress else { return [] }
+                let (threshold, found) = Self.threshold(base, n, lowest: lowest, maxValue: maxValue, keep: keep,
+                                                        scratch: scratch)
+                return Self.collect(base, n, atLeast: threshold, expected: found, scratch: scratch, ramp: ramp)
+            }
+        }
+    }
+
+    /// count(≥ t) が keep 以上で、なるべく keep に近いしきい値 t と、その count。
+    /// 上位 keep 個はかならず含まれるので、どちらの方法でも並べたあとの結果は同じになる。
+    private static func threshold(_ base: UnsafePointer<Float>, _ n: Int, lowest: Float, maxValue: Float, keep: Int,
+                                  scratch: UnsafeMutablePointer<Float>) -> (Float, Int) {
+        #if canImport(Accelerate)
+        // vDSP で数えるのは速いので、二分探索する
+        var threshold = lowest
+        var found = LogitsMath.count(base, n, atLeast: lowest, scratch: scratch)
+        guard found > keep else { return (threshold, found) }
+        var lo = lowest, hi = maxValue
+        for _ in 0..<24 {
+            let mid = (lo + hi) / 2
+            if mid <= lo || mid >= hi { break }
+            let c = LogitsMath.count(base, n, atLeast: mid, scratch: scratch)
+            if c >= keep {
+                lo = mid
+                threshold = mid
+                found = c
+                if c <= keep * 2 { break }
+            } else {
+                hi = mid
+            }
+        }
+        return (threshold, found)
+        #else
+        // ループは 1 回にしたいので、ヒストグラムで決める（語彙が少なければ全部を候補に）
+        if n <= keep { return (lowest, LogitsMath.count(base, n, atLeast: lowest, scratch: scratch)) }
+        let bucketCount = 1024
+        var buckets = [Int](repeating: 0, count: bucketCount)
+        let span = maxValue - lowest
+        guard span > 0 else { return (lowest, LogitsMath.count(base, n, atLeast: lowest, scratch: scratch)) }
+        let scale = Float(bucketCount - 1) / span
+        buckets.withUnsafeMutableBufferPointer { b in
+            var i = 0
+            while i < n {
+                let x = base[i]
+                if x >= lowest {
+                    b[min(bucketCount - 1, Int((x - lowest) * scale))] += 1
+                }
+                i += 1
+            }
+        }
+        var cumulative = 0
+        var bucket = bucketCount - 1
+        while bucket > 0 {
+            cumulative += buckets[bucket]
+            if cumulative >= keep { break }
+            bucket -= 1
+        }
+        if bucket == 0 { return (lowest, LogitsMath.count(base, n, atLeast: lowest, scratch: scratch)) }
+        // 境目の丸め誤差を避けるため、しきい値の位置で数え直す
+        let threshold = lowest + Float(bucket) / scale
+        return (threshold, LogitsMath.count(base, n, atLeast: threshold, scratch: scratch))
+        #endif
+    }
+
+    private static func collect(_ base: UnsafePointer<Float>, _ n: Int, atLeast threshold: Float, expected: Int,
+                                scratch: UnsafeMutablePointer<Float>, ramp: [Float]) -> [(index: Int, logit: Float)] {
+        guard expected > 0 else { return [] }
+        #if canImport(Accelerate)
+        // scratch = (x ≥ t ? 2 : 0) を目印にして、位置と値をまとめて詰める
+        var t = threshold
+        var one: Float = 1
+        vDSP_vthrsc(base, 1, &t, &one, scratch, 1, vDSP_Length(n))
+        vDSP_vsadd(scratch, 1, &one, scratch, 1, vDSP_Length(n))
+        var indices = [Float](repeating: 0, count: expected)
+        var values = [Float](repeating: 0, count: expected)
+        ramp.withUnsafeBufferPointer { r in
+            indices.withUnsafeMutableBufferPointer { out in
+                vDSP_vcmprs(r.baseAddress!, 1, scratch, 1, out.baseAddress!, 1, vDSP_Length(n))
+            }
+        }
+        values.withUnsafeMutableBufferPointer { out in
+            vDSP_vcmprs(base, 1, scratch, 1, out.baseAddress!, 1, vDSP_Length(n))
+        }
+        var result: [(index: Int, logit: Float)] = []
+        result.reserveCapacity(expected)
+        for k in 0..<expected { result.append((Int(indices[k]), values[k])) }
+        return result
+        #else
+        var result: [(index: Int, logit: Float)] = []
+        result.reserveCapacity(expected)
+        var i = 0
+        while i < n {
+            if base[i] >= threshold { result.append((i, base[i])) }
+            i += 1
+        }
+        return result
+        #endif
     }
 }
 

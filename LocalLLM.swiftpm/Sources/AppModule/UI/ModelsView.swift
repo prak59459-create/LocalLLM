@@ -97,48 +97,26 @@ private struct RecommendedModelsList: View {
     }
 }
 
-/// Hugging Face の検索。
+/// Hugging Face の検索。1 ページ 50 件で、下の「さらに表示」で続きを読み込む。
 private struct ModelSearchView: View {
     @Environment(AppSettings.self) private var settings
 
-    @State private var query = "coreml"
-    @State private var coreMLOnly = true
+    @State private var query = ""
+    @State private var source: HFSearchSource = .coreML
+    @State private var sort: HFSearchSort = .downloads
     @State private var textGenerationOnly = true
     @State private var results: [HFModelSummary] = []
+    @State private var nextPage: URL?
     @State private var isSearching = false
+    @State private var isLoadingMore = false
     @State private var errorMessage: String?
     @State private var directRepo = ""
 
     var body: some View {
         List {
-            Section {
-                HStack {
-                    TextField(L("キーワード（例: qwen coreml）", "Keywords (e.g. qwen coreml)"), text: $query)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .onSubmit { Task { await search() } }
-                    Button {
-                        Task { await search() }
-                    } label: {
-                        if isSearching { ProgressView() } else { Image(systemName: "magnifyingglass") }
-                    }
-                    .disabled(isSearching)
-                }
-                Toggle(L("Core ML のモデルだけ", "Core ML models only"), isOn: $coreMLOnly)
-                Toggle(L("テキスト生成だけ", "Text generation only"), isOn: $textGenerationOnly)
-            }
-
-            Section(L("リポジトリ ID を直接入力", "Enter a repository ID")) {
-                HStack {
-                    TextField("owner/name", text: $directRepo)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    NavigationLink(value: directRepo.trimmingCharacters(in: .whitespaces)) {
-                        Text(L("開く", "Open"))
-                    }
-                    .disabled(!directRepo.contains("/"))
-                }
-            }
+            SearchFormSection(query: $query, source: $source, sort: $sort, textGenerationOnly: $textGenerationOnly,
+                              isSearching: isSearching, onSearch: startSearch)
+            DirectRepoSection(directRepo: $directRepo)
 
             if let errorMessage {
                 Section {
@@ -147,37 +125,51 @@ private struct ModelSearchView: View {
                 }
             }
 
-            Section(results.isEmpty ? "" : L("\(results.count) 件", "\(results.count) results")) {
+            Section {
                 ForEach(results) { model in
                     NavigationLink(value: model.id) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(model.id)
-                                .font(.callout.weight(.medium))
-                                .lineLimit(2)
-                            HStack(spacing: 10) {
-                                if let downloads = model.downloads {
-                                    Label("\(downloads)", systemImage: "arrow.down.circle")
-                                }
-                                if let likes = model.likes {
-                                    Label("\(likes)", systemImage: "heart")
-                                }
-                                if let tag = model.pipelineTag {
-                                    Text(tag)
-                                }
-                                if model.gated {
-                                    Label(L("要トークン", "Gated"), systemImage: "lock")
-                                }
-                            }
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
+                        SearchResultRow(model: model)
                     }
+                }
+                if nextPage != nil {
+                    loadMoreRow
+                }
+            } header: {
+                if !results.isEmpty {
+                    Text(nextPage == nil ? L("\(results.count) 件", "\(results.count) results")
+                                         : L("\(results.count) 件（続きあり）", "\(results.count) results (more available)"))
                 }
             }
         }
         .task {
             if results.isEmpty { await search() }
         }
+        .onChange(of: source) { _, _ in startSearch() }
+        .onChange(of: sort) { _, _ in startSearch() }
+        .onChange(of: textGenerationOnly) { _, _ in startSearch() }
+    }
+
+    private var loadMoreRow: some View {
+        Button {
+            Task { await loadMore() }
+        } label: {
+            HStack {
+                Spacer()
+                if isLoadingMore {
+                    ProgressView()
+                } else {
+                    Label(L("さらに表示", "Show more"), systemImage: "chevron.down")
+                }
+                Spacer()
+            }
+        }
+        .disabled(isLoadingMore)
+        // 一番下まで来たら自動で次のページを読む
+        .onAppear { Task { await loadMore() } }
+    }
+
+    private func startSearch() {
+        Task { await search() }
     }
 
     private func search() async {
@@ -186,16 +178,118 @@ private struct ModelSearchView: View {
         defer { isSearching = false }
         do {
             let client = settings.makeHFClient()
-            results = try await client.searchModels(query: query.trimmingCharacters(in: .whitespaces),
-                                                    coreMLOnly: coreMLOnly,
-                                                    textGenerationOnly: textGenerationOnly,
-                                                    limit: 50)
+            let page = try await client.searchModels(query: query, source: source, textGenerationOnly: textGenerationOnly,
+                                                     sort: sort, limit: 50)
+            results = page.models
+            nextPage = page.next
             if results.isEmpty {
                 errorMessage = L("見つかりませんでした。キーワードや絞り込みを変えてみてください。",
                                  "Nothing found. Try other keywords or filters.")
             }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadMore() async {
+        guard let url = nextPage, !isLoadingMore, !isSearching else { return }
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+        do {
+            let page = try await settings.makeHFClient().searchPage(url)
+            let known = Set(results.map(\.id))
+            results.append(contentsOf: page.models.filter { !known.contains($0.id) })
+            nextPage = page.next
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct SearchFormSection: View {
+    @Binding var query: String
+    @Binding var source: HFSearchSource
+    @Binding var sort: HFSearchSort
+    @Binding var textGenerationOnly: Bool
+    var isSearching: Bool
+    var onSearch: () -> Void
+
+    var body: some View {
+        Section {
+            HStack {
+                TextField(L("キーワード（例: qwen）", "Keywords (e.g. qwen)"), text: $query)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .onSubmit(onSearch)
+                Button(action: onSearch) {
+                    if isSearching { ProgressView() } else { Image(systemName: "magnifyingglass") }
+                }
+                .disabled(isSearching)
+            }
+            Picker(L("探す場所", "Source"), selection: $source) {
+                ForEach(HFSearchSource.allCases) { source in
+                    Text(source.label).tag(source)
+                }
+            }
+            Picker(L("並べ順", "Sort"), selection: $sort) {
+                ForEach(HFSearchSort.allCases) { sort in
+                    Text(sort.label).tag(sort)
+                }
+            }
+            if source != .anemll {
+                Toggle(L("テキスト生成だけ", "Text generation only"), isOn: $textGenerationOnly)
+            }
+        } footer: {
+            if source == .anemll {
+                Text(L("ANEMLL のモデルは、埋め込み・本体（複数のチャンク）・出力層に分かれています。まとめてダウンロードして Neural Engine で動かします。",
+                       "ANEMLL models are split into embeddings, body chunks and an output head. They are downloaded together and run on the Neural Engine."))
+            }
+        }
+    }
+}
+
+private struct DirectRepoSection: View {
+    @Binding var directRepo: String
+
+    var body: some View {
+        Section(L("リポジトリ ID を直接入力", "Enter a repository ID")) {
+            HStack {
+                TextField("owner/name", text: $directRepo)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                NavigationLink(value: directRepo.trimmingCharacters(in: .whitespaces)) {
+                    Text(L("開く", "Open"))
+                }
+                .disabled(!directRepo.contains("/"))
+            }
+        }
+    }
+}
+
+private struct SearchResultRow: View {
+    let model: HFModelSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(model.id)
+                .font(.callout.weight(.medium))
+                .lineLimit(2)
+            HStack(spacing: 10) {
+                if let downloads = model.downloads {
+                    Label("\(downloads)", systemImage: "arrow.down.circle")
+                }
+                if let likes = model.likes {
+                    Label("\(likes)", systemImage: "heart")
+                }
+                if let tag = model.pipelineTag {
+                    Text(tag)
+                }
+                if model.gated {
+                    Label(L("要トークン", "Gated"), systemImage: "lock")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 }
@@ -233,7 +327,7 @@ struct InstalledModelsList: View {
                         if let context = model.maxContext {
                             Text(L("最大 \(context) トークン", "Up to \(context) tokens"))
                         }
-                        Text(model.kind == .compiled ? ".mlmodelc" : ".mlpackage")
+                        Text(model.kindLabel)
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)

@@ -4,9 +4,11 @@ import Foundation
 /// 生成のリクエスト（UI から渡す内容）。
 struct GenerationRequest: Sendable {
     var systemPrompt: String?
-    var history: [ChatMessage]          // 最後が user のメッセージ
+    var history: [ChatMessage]          // 最後が user（または tool）のメッセージ
     var parameters: GenerationParameters
     var enableThinking: Bool?
+    /// モデルに使わせるツール（空なら使わない）
+    var tools: [ToolDefinition] = []
 }
 
 /// 生成中に UI へ流すイベント。
@@ -27,6 +29,7 @@ struct LoadedModelInfo: Sendable, Hashable {
     var displayName: String
     var maxContext: Int
     var interfaceDescription: String
+    var computeDescription: String
     var usesJinjaTemplate: Bool
     var vocabSize: Int
     var loadSeconds: Double
@@ -37,7 +40,7 @@ struct LoadedModelInfo: Sendable, Hashable {
 actor InferenceEngine {
     private struct Loaded {
         var info: LoadedModelInfo
-        var model: CoreMLLanguageModel
+        var model: LanguageModelRunner
         var tokenizer: HFTokenizer
         var renderer: ChatTemplateRenderer
         var stopTokenIDs: Set<Int>
@@ -53,7 +56,7 @@ actor InferenceEngine {
     var loadedInfo: LoadedModelInfo? { loaded?.info }
 
     /// モデルを読み込む（既に別のモデルが読み込まれていれば解放してから）。
-    func load(files: ModelFiles, computeUnits: MLComputeUnits, prefillChunkSize: Int) async throws -> LoadedModelInfo {
+    func load(files: ModelFiles, computeUnits: ComputeUnitsOption, prefillChunkSize: Int) async throws -> LoadedModelInfo {
         loadGeneration += 1
         let generation = loadGeneration
         await cancelCurrentGeneration()
@@ -75,7 +78,13 @@ actor InferenceEngine {
         var stopStrings = renderer.endOfTurnTokens
         if let eos = tokenizer.eosToken, !stopStrings.contains(eos) { stopStrings.append(eos) }
 
-        let model = try await CoreMLLanguageModel.load(compiledModelURL: files.compiledModel, computeUnits: computeUnits)
+        let model: LanguageModelRunner
+        switch files.source {
+        case .single(let url):
+            model = try await CoreMLLanguageModel.load(compiledModelURL: url, computeUnits: computeUnits.resolved(isPipeline: false))
+        case .pipeline(let pipeline):
+            model = try await PipelineLanguageModel.load(files: pipeline, computeUnits: computeUnits.resolved(isPipeline: true))
+        }
         // 待っている間に別の読み込みや解放が始まっていたら、この結果は使わない
         guard generation == loadGeneration else { throw CancellationError() }
 
@@ -83,7 +92,8 @@ actor InferenceEngine {
             modelID: files.modelID,
             displayName: files.displayName,
             maxContext: model.maxContext,
-            interfaceDescription: Self.describe(model.interface),
+            interfaceDescription: model.interfaceDescription,
+            computeDescription: model.computeDescription,
             usesJinjaTemplate: renderer.usesJinja,
             vocabSize: tokenizer.vocabSize,
             loadSeconds: Date().timeIntervalSince(start)
@@ -177,21 +187,22 @@ actor InferenceEngine {
                 tokenizer: loaded.tokenizer,
                 contextLength: maxContext,
                 reserveTokens: reserve,
-                enableThinking: request.enableThinking
+                enableThinking: request.enableThinking,
+                tools: request.tools
             )
             stats.promptTokens = prompt.tokens.count
             continuation.yield(.promptReady(promptTokens: prompt.tokens.count, droppedMessages: prompt.droppedMessageCount))
 
             // プロンプトの読み込み
             let prefillStart = Date()
-            let (firstLogits, reused) = try await loaded.model.evaluate(tokens: prompt.tokens, chunkSize: chunkSize) { done, total in
+            let (firstScores, reused) = try await loaded.model.evaluate(tokens: prompt.tokens, chunkSize: chunkSize) { done, total in
                 continuation.yield(.prefill(done: done, total: total))
             }
             stats.reusedPromptTokens = reused
             stats.prefillSeconds = Date().timeIntervalSince(prefillStart)
 
             // 1 トークンずつ生成
-            var logits = firstLogits
+            var scores = firstScores
             var sampler = TokenSampler(parameters: parameters)
             let detokenizer = StreamingDetokenizer(tokenizer: loaded.tokenizer, skipSpecialTokens: true)
             var stopMatcher = StopSequenceMatcher(stopSequences: loaded.stopStrings)
@@ -202,7 +213,14 @@ actor InferenceEngine {
 
             generation: while stats.generatedTokens < parameters.maxNewTokens {
                 if Task.isCancelled { reason = .cancelled; break }
-                let next = sampler.sample(logits: &logits, previousTokens: history)
+                let next: Int
+                switch scores {
+                case .logits(var logits):
+                    next = sampler.sample(logits: &logits, previousTokens: history)
+                case .token(let token):
+                    // 出力層が選んだトークン（温度などは効かない形式）
+                    next = token
+                }
                 if loaded.stopTokenIDs.contains(next) { reason = .endOfTurn; break }
                 history.append(next)
                 stats.generatedTokens += 1
@@ -220,7 +238,7 @@ actor InferenceEngine {
                 if history.count >= maxContext { reason = .contextFull; break }
                 if stats.generatedTokens >= parameters.maxNewTokens { reason = .maxTokens; break }
                 do {
-                    logits = try await loaded.model.append(token: next)
+                    scores = try await loaded.model.append(token: next)
                 } catch is CancellationError {
                     reason = .cancelled
                     break
@@ -248,27 +266,20 @@ actor InferenceEngine {
         }
     }
 
-    private static func describe(_ interface: ModelInterface) -> String {
-        switch interface {
-        case .statefulCausalLM(_, _, _, _, let maxContext):
-            return L("ステートフル（KV キャッシュあり）・最大 \(maxContext) トークン",
-                     "Stateful (KV cache) · up to \(maxContext) tokens")
-        case .statelessCausalLM(_, _, _, let fixedLength, let maxContext):
-            if let fixedLength {
-                return L("ステートレス（固定長 \(fixedLength)）", "Stateless (fixed length \(fixedLength))")
-            }
-            return L("ステートレス・最大 \(maxContext) トークン", "Stateless · up to \(maxContext) tokens")
-        case .unsupported(let reason):
-            return L("非対応: \(reason)", "Unsupported: \(reason)")
-        }
-    }
 }
 
 /// 読み込みに必要なファイルの場所。
 struct ModelFiles: Sendable {
+    enum Source: Sendable {
+        /// 1 つの .mlmodelc
+        case single(URL)
+        /// 分割モデル（ANEMLL）
+        case pipeline(PipelineFiles)
+    }
+
     var modelID: String
     var displayName: String
-    var compiledModel: URL
+    var source: Source
     var tokenizerJSON: URL
     var tokenizerConfigJSON: URL?
     var generationConfigJSON: URL?

@@ -3,15 +3,34 @@ import Foundation
 /// チャットのメッセージ 1 つ。
 struct ChatMessage: Codable, Hashable, Sendable {
     enum Role: String, Codable, Sendable {
-        case system, user, assistant
+        case system, user, assistant, tool
     }
 
     var role: Role
     var content: String
+    /// assistant がツールを呼び出したとき
+    var toolCalls: [ToolCall]?
+    /// tool の結果のとき: ツールの名前と、呼び出しの ID
+    var toolName: String?
+    var toolCallID: String?
 
-    init(role: Role, content: String) {
+    init(role: Role, content: String, toolCalls: [ToolCall]? = nil, toolName: String? = nil, toolCallID: String? = nil) {
         self.role = role
         self.content = content
+        self.toolCalls = toolCalls
+        self.toolName = toolName
+        self.toolCallID = toolCallID
+    }
+
+    /// チャットテンプレートの messages に入れる形（Hugging Face と同じキー）
+    var templateValue: JinjaValue {
+        var pairs: [(String, JinjaValue)] = [("role", .string(role.rawValue)), ("content", .string(content))]
+        if let toolCalls, !toolCalls.isEmpty {
+            pairs.append(("tool_calls", .array(toolCalls.map { $0.templateValue.jinjaValue })))
+        }
+        if let toolName { pairs.append(("name", .string(toolName))) }
+        if let toolCallID { pairs.append(("tool_call_id", .string(toolCallID))) }
+        return .object(JinjaObject(pairs))
     }
 }
 
@@ -58,7 +77,9 @@ enum BuiltinChatFormat: String, Codable, CaseIterable, Sendable {
         }
     }
 
-    func render(messages: [ChatMessage], addGenerationPrompt: Bool, bosToken: String?, eosToken: String?) -> String {
+    func render(messages original: [ChatMessage], addGenerationPrompt: Bool, bosToken: String?, eosToken: String?) -> String {
+        // 組み込みの書式には tool の役割が無いので、普通の文章に書き直す
+        let messages = ToolPrompt.flatten(original)
         var output = ""
         switch self {
         case .chatML:
@@ -98,7 +119,7 @@ enum BuiltinChatFormat: String, Codable, CaseIterable, Sendable {
             for message in messages {
                 switch message.role {
                 case .system: output += message.content
-                case .user: output += "<｜User｜>\(message.content)"
+                case .user, .tool: output += "<｜User｜>\(message.content)"
                 case .assistant: output += "<｜Assistant｜>\(message.content)\(eosToken ?? "<｜end▁of▁sentence｜>")"
                 }
             }
@@ -113,7 +134,7 @@ enum BuiltinChatFormat: String, Codable, CaseIterable, Sendable {
             for message in messages {
                 switch message.role {
                 case .system: output += "\(message.content)\n\n"
-                case .user: output += "User: \(message.content)\n"
+                case .user, .tool: output += "User: \(message.content)\n"
                 case .assistant: output += "Assistant: \(message.content)\n"
                 }
             }
@@ -157,6 +178,12 @@ struct ChatTemplateRenderer {
     /// 実際に Jinja のテンプレートを使うか（false なら組み込みの書式）
     var usesJinja: Bool { compiled != nil }
 
+    /// テンプレートがツール（tools 変数と tool の役割）を扱えるか
+    var supportsTools: Bool {
+        guard compiled != nil, let template else { return false }
+        return template.contains("tools") && (template.contains("tool_calls") || template.contains("tool_call"))
+    }
+
     /// テンプレートから推定した「ターン終了」トークン
     var endOfTurnTokens: [String] {
         var tokens: [String] = []
@@ -174,16 +201,14 @@ struct ChatTemplateRenderer {
     ///   - enableThinking: テンプレート変数 enable_thinking（nil なら渡さない）
     ///   - extraContext: 追加の変数（テスト用の date_string など）
     func render(messages: [ChatMessage], addGenerationPrompt: Bool, enableThinking: Bool?,
-                extraContext: [String: JinjaValue] = [:]) throws -> String {
+                tools: [ToolDefinition] = [], extraContext: [String: JinjaValue] = [:]) throws -> String {
         guard let compiled else {
             return renderBuiltin(messages: messages, addGenerationPrompt: addGenerationPrompt)
         }
         var context: [String: JinjaValue] = [
-            "messages": .array(messages.map { message in
-                .object(JinjaObject([("role", .string(message.role.rawValue)), ("content", .string(message.content))]))
-            }),
+            "messages": .array(messages.map(\.templateValue)),
             "add_generation_prompt": .bool(addGenerationPrompt),
-            "tools": .none,
+            "tools": tools.isEmpty ? .none : .array(tools.map { $0.templateValue.jinjaValue }),
             "documents": .none,
         ]
         if let bosToken { context["bos_token"] = .string(bosToken) }
@@ -258,14 +283,23 @@ struct PromptAssembler {
 
     static func assemble(systemPrompt: String?, history: [ChatMessage], renderer: ChatTemplateRenderer,
                          tokenizer: TextTokenizer, contextLength: Int, reserveTokens: Int,
-                         enableThinking: Bool?) throws -> Result {
-        let system = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 過去のアシスタントの発話から思考部分を除き、同じ役割が続くものはまとめる
+                         enableThinking: Bool?, tools: [ToolDefinition] = []) throws -> Result {
+        var system = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // テンプレートがツールに対応していなければ、説明をシステムプロンプトに書き、ツールのやり取りを文章にする
+        let nativeTools = !tools.isEmpty && renderer.supportsTools
+        var source = history
+        if !tools.isEmpty && !nativeTools {
+            let instructions = ToolPrompt.instructions(for: tools)
+            system = (system?.isEmpty ?? true) ? instructions : system! + "\n\n" + instructions
+            source = ToolPrompt.flatten(history)
+        }
+        // 過去のアシスタントの発話から思考部分を除き、同じ役割が続くものはまとめる（ツールのやり取りはまとめない）
         var cleaned: [ChatMessage] = []
-        for message in history where message.role != .system {
+        for message in source where message.role != .system {
             var item = message
             if item.role == .assistant { item.content = ThinkingSplit.split(item.content).answer }
-            if let last = cleaned.last, last.role == item.role {
+            if let last = cleaned.last, last.role == item.role, item.role != .tool,
+               last.toolCalls == nil, item.toolCalls == nil {
                 cleaned[cleaned.count - 1].content += "\n\n" + item.content
             } else {
                 cleaned.append(item)
@@ -277,7 +311,8 @@ struct PromptAssembler {
             var messages: [ChatMessage] = []
             if let system, !system.isEmpty { messages.append(ChatMessage(role: .system, content: system)) }
             messages.append(contentsOf: cleaned[dropped...])
-            let text = try renderLeniently(messages, renderer: renderer, enableThinking: enableThinking)
+            let text = try renderLeniently(messages, renderer: renderer, enableThinking: enableThinking,
+                                           tools: nativeTools ? tools : [])
             var tokens = tokenizer.encode(text, addSpecialTokens: false)
             let remaining = cleaned.count - dropped
             if tokens.count <= budget || remaining <= 1 {
@@ -287,7 +322,7 @@ struct PromptAssembler {
                 }
                 return Result(text: text, tokens: tokens, droppedMessageCount: dropped)
             }
-            // 古いものから捨てる（user から始まるように、続く assistant も一緒に）
+            // 古いものから捨てる（user から始まるように、続く assistant / tool も一緒に）
             dropped += 1
             while dropped < cleaned.count - 1 && cleaned[dropped].role != .user { dropped += 1 }
         }
@@ -295,12 +330,14 @@ struct PromptAssembler {
 
     /// テンプレートが system を拒否したら最初の user にまとめて再挑戦し、それでもだめなら組み込みの書式にする。
     private static func renderLeniently(_ messages: [ChatMessage], renderer: ChatTemplateRenderer,
-                                        enableThinking: Bool?) throws -> String {
+                                        enableThinking: Bool?, tools: [ToolDefinition]) throws -> String {
         do {
-            return try renderer.render(messages: messages, addGenerationPrompt: true, enableThinking: enableThinking)
+            return try renderer.render(messages: messages, addGenerationPrompt: true, enableThinking: enableThinking,
+                                       tools: tools)
         } catch {
             let merged = BuiltinChatFormat.mergingSystemIntoFirstUser(messages)
-            if let text = try? renderer.render(messages: merged, addGenerationPrompt: true, enableThinking: enableThinking) {
+            if let text = try? renderer.render(messages: merged, addGenerationPrompt: true, enableThinking: enableThinking,
+                                               tools: tools) {
                 return text
             }
             return renderer.renderBuiltin(messages: messages, addGenerationPrompt: true)

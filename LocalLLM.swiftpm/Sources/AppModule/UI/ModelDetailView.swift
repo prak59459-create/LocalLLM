@@ -112,7 +112,16 @@ struct ModelDetailView: View {
             async let infoTask = client.modelInfo(repo: repoID)
             async let filesTask = client.listFiles(repo: repoID, revision: "main")
             let (info, files) = try await (infoTask, filesTask)
-            let analysis = RepoAnalysis.analyze(files: files)
+            // 分割モデルの説明（meta.yaml）は小さいので先に取ってくる
+            var metaFiles: [String: String] = [:]
+            for path in RepoAnalysis.metaFilePaths(in: files).prefix(8) {
+                if let data = try? await client.fetchData(repo: repoID, path: path, revision: "main"),
+                   let text = String(data: data, encoding: .utf8) {
+                    metaFiles[path] = text
+                }
+            }
+            let repoName = repoID.split(separator: "/").last.map(String.init) ?? "model"
+            let analysis = RepoAnalysis.analyze(files: files, metaFiles: metaFiles, repoName: repoName)
             self.info = info
             self.analysis = analysis
             // .mlmodelc の metadata.json は小さいので、先に取得して対応形式か調べる
@@ -142,8 +151,8 @@ private struct VariantsSection: View {
 
     var body: some View {
         if analysis.variants.isEmpty {
-            Text(L("このリポジトリには Core ML のモデル（.mlmodelc / .mlpackage）が見つかりませんでした。",
-                   "No Core ML models (.mlmodelc / .mlpackage) were found in this repository."))
+            Text(L("このリポジトリには Core ML のモデル（.mlmodelc / .mlpackage / 分割モデル / ZIP）が見つかりませんでした。",
+                   "No Core ML models (.mlmodelc / .mlpackage / split models / ZIP) were found in this repository."))
                 .foregroundStyle(.secondary)
         } else {
             Section(L("モデル", "Models")) {
@@ -170,6 +179,40 @@ private struct SupportFilesSection: View {
                 }
             }
         }
+    }
+}
+
+/// 分割モデルの部品の一覧。
+private struct PipelinePartsView: View {
+    let pipeline: PipelineDescriptor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(pipeline.parts.enumerated()), id: \.offset) { _, part in
+                Label((part as NSString).lastPathComponent, systemImage: icon(for: part))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Text(details)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var details: String {
+        var items: [String] = []
+        if let batch = pipeline.batchSize { items.append(L("バッチ \(batch)", "batch \(batch)")) }
+        if let window = pipeline.slidingWindow { items.append(L("スライディング窓 \(window)", "sliding window \(window)")) }
+        if pipeline.argmaxInModel { items.append(L("モデル内で argmax", "argmax in model")) }
+        if let architecture = pipeline.architecture { items.append(architecture) }
+        return items.joined(separator: " · ")
+    }
+
+    private func icon(for part: String) -> String {
+        if part == pipeline.embeddings { return "textformat.abc" }
+        if part == pipeline.lmHead { return "text.cursor" }
+        return "square.stack.3d.up"
     }
 }
 
@@ -207,11 +250,12 @@ private struct VariantRow: View {
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Text(variant.kind == .compiled
-                 ? L("コンパイル済み（.mlmodelc）", "Compiled (.mlmodelc)")
-                 : L(".mlpackage（初回の読み込み時に端末でコンパイルします）", ".mlpackage (compiled on device at first load)"))
+            Text(kindDescription)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let pipeline = variant.pipeline {
+                PipelinePartsView(pipeline: pipeline)
+            }
 
             compatibility
             memoryEstimate
@@ -220,9 +264,36 @@ private struct VariantRow: View {
         .padding(.vertical, 4)
     }
 
+    private var kindDescription: String {
+        switch variant.kind {
+        case .compiled:
+            return L("コンパイル済み（.mlmodelc）", "Compiled (.mlmodelc)")
+        case .package:
+            return L(".mlpackage（初回の読み込み時に端末でコンパイルします）", ".mlpackage (compiled on device at first load)")
+        case .pipeline:
+            return L("分割モデル（埋め込み・本体のチャンク・出力層をつないで動かします。Neural Engine 向け）",
+                     "Split model (embeddings, chunks and LM head run in sequence; made for the Neural Engine)")
+        case .archive:
+            return L("ZIP（ダウンロード後に端末で展開して、中のモデルを調べます）",
+                     "ZIP (expanded on device after download, then inspected)")
+        }
+    }
+
+    /// ZIP は中に tokenizer.json が入っていることがあるので、付属ファイルが無くてもダウンロードできる
+    private var canDownload: Bool {
+        if variant.kind == .archive { return true }
+        return analysis.hasTokenizer && metadata?.interface.isSupported != false
+    }
+
     @ViewBuilder
     private var compatibility: some View {
-        if let metadata {
+        if let pipeline = variant.pipeline {
+            Label(pipeline.contextLength.map { L("対応: 分割モデル・最大 \($0) トークン", "Supported: split model · up to \($0) tokens") }
+                  ?? L("対応: 分割モデル", "Supported: split model"),
+                  systemImage: "checkmark.seal.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+        } else if let metadata {
             switch metadata.interface {
             case .statefulCausalLM(_, _, _, _, let maxContext):
                 Label(L("対応: ステートフル・最大 \(maxContext) トークン", "Supported: stateful · up to \(maxContext) tokens"),
@@ -323,7 +394,7 @@ private struct VariantRow: View {
                 Label(L("ダウンロード", "Download"), systemImage: "arrow.down.circle.fill")
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!analysis.hasTokenizer || metadata?.interface.isSupported == false)
+            .disabled(!canDownload)
         }
     }
 }

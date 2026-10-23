@@ -16,6 +16,7 @@ struct SettingsView: View {
                 SystemPromptSection()
                 ThinkingSettingsSection()
                 ExecutionSettingsSection()
+                ConnectorsLinkSection()
                 DisplaySettingsSection()
                 TokenSettingsSection()
                 DeviceSettingsSection(onDeleteChats: { confirmingDeleteChats = true })
@@ -161,8 +162,30 @@ private struct ExecutionSettingsSection: View {
         } header: {
             Text(L("実行", "Execution"))
         } footer: {
-            Text(L("計算ユニットの変更は次の読み込みから有効です。分割サイズを小さくするとメモリを節約できますが、読み込みは遅くなります。",
-                   "Compute unit changes apply on the next load. A smaller chunk size saves memory but reads prompts more slowly."))
+            Text(L("計算ユニットの変更は次の読み込みから有効です。「自動」は分割モデルを Neural Engine、それ以外を GPU で動かします。分割サイズを小さくするとメモリを節約できますが、読み込みは遅くなります。",
+                   "Compute unit changes apply on the next load. Automatic runs split models on the Neural Engine and others on the GPU. A smaller chunk size saves memory but reads prompts more slowly."))
+        }
+    }
+}
+
+private struct ConnectorsLinkSection: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(ConnectorStore.self) private var connectors
+
+    var body: some View {
+        Section {
+            NavigationLink {
+                ConnectorsView()
+            } label: {
+                LabeledContent {
+                    Text(settings.toolsEnabled ? L("ツール \(connectors.availableTools.count) 個", "\(connectors.availableTools.count) tools")
+                                               : L("オフ", "Off"))
+                } label: {
+                    Label(L("コネクタ（Web 検索・MCP）", "Connectors (web search, MCP)"), systemImage: "puzzlepiece.extension")
+                }
+            }
+        } header: {
+            Text(L("ツール", "Tools"))
         }
     }
 }

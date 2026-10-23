@@ -15,6 +15,44 @@ struct HFModelSummary: Codable, Hashable, Identifiable, Sendable {
     var gated: Bool
 }
 
+/// 検索結果の 1 ページ。
+struct HFSearchPage: Sendable {
+    var models: [HFModelSummary]
+    var next: URL?
+}
+
+/// どこから探すか。
+enum HFSearchSource: String, CaseIterable, Identifiable, Sendable {
+    case coreML     // coreml タグの付いたモデル
+    case anemll     // ANEMLL の分割モデル
+    case all        // すべて
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .coreML: return L("Core ML", "Core ML")
+        case .anemll: return L("分割モデル（ANEMLL）", "Split models (ANEMLL)")
+        case .all: return L("すべて", "All")
+        }
+    }
+}
+
+enum HFSearchSort: String, CaseIterable, Identifiable, Sendable {
+    case downloads, likes, trendingScore, lastModified
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .downloads: return L("ダウンロード数", "Downloads")
+        case .likes: return L("いいね", "Likes")
+        case .trendingScore: return L("話題", "Trending")
+        case .lastModified: return L("更新が新しい", "Recently updated")
+        }
+    }
+}
+
 /// リポジトリ内のファイル 1 つ。
 struct HFFileEntry: Codable, Hashable, Sendable {
     var path: String
@@ -92,22 +130,47 @@ final class HFClient: @unchecked Sendable {
     // MARK: - API
 
     func searchModels(query: String, coreMLOnly: Bool, textGenerationOnly: Bool, limit: Int) async throws -> [HFModelSummary] {
+        try await searchModels(query: query, source: coreMLOnly ? .coreML : .all, textGenerationOnly: textGenerationOnly,
+                               sort: .downloads, limit: limit).models
+    }
+
+    /// 検索の 1 ページ目。続きは `searchPage(_:)` に `next` を渡して取る。
+    func searchModels(query: String, source: HFSearchSource, textGenerationOnly: Bool, sort: HFSearchSort,
+                      limit: Int) async throws -> HFSearchPage {
+        try await searchPage(searchURL(query: query, source: source, textGenerationOnly: textGenerationOnly,
+                                       sort: sort, limit: limit))
+    }
+
+    func searchURL(query: String, source: HFSearchSource, textGenerationOnly: Bool, sort: HFSearchSort, limit: Int) -> URL {
         var components = URLComponents(url: endpoint.appendingPathComponent("api/models"), resolvingAgainstBaseURL: false)!
         var items = [
-            URLQueryItem(name: "sort", value: "downloads"),
+            URLQueryItem(name: "sort", value: sort.rawValue),
             URLQueryItem(name: "direction", value: "-1"),
             URLQueryItem(name: "limit", value: String(limit)),
         ]
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { items.append(URLQueryItem(name: "search", value: trimmed)) }
-        if coreMLOnly { items.append(URLQueryItem(name: "filter", value: "coreml")) }
-        if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
+        switch source {
+        case .coreML:
+            items.append(URLQueryItem(name: "filter", value: "coreml"))
+            if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
+        case .anemll:
+            // ANEMLL（Neural Engine 向けに分割したモデル）はタグが付いていないので、作者で探す
+            items.append(URLQueryItem(name: "author", value: "anemll"))
+        case .all:
+            if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
+        }
         components.queryItems = items
-        let (data, _) = try await get(components.url!)
+        return components.url!
+    }
+
+    /// 検索結果の 1 ページ（Link ヘッダに次のページがあれば next に入る）
+    func searchPage(_ url: URL) async throws -> HFSearchPage {
+        let (data, response) = try await get(url)
         guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             throw HFError.invalidResponse("models")
         }
-        return array.compactMap { item in
+        let models = array.compactMap { item -> HFModelSummary? in
             guard let id = item["id"] as? String ?? item["modelId"] as? String else { return nil }
             return HFModelSummary(id: id,
                                   downloads: item["downloads"] as? Int,
@@ -118,6 +181,7 @@ final class HFClient: @unchecked Sendable {
                                   lastModified: (item["lastModified"] as? String).flatMap(Self.parseDate),
                                   gated: Self.isGated(item["gated"]))
         }
+        return HFSearchPage(models: models, next: response.value(forHTTPHeaderField: "Link").flatMap(Self.nextLink))
     }
 
     func modelInfo(repo: String) async throws -> HFModelInfo {
@@ -234,95 +298,5 @@ final class HFClient: @unchecked Sendable {
         if let date = formatter.date(from: text) { return date }
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: text)
-    }
-}
-
-// MARK: - リポジトリの解析
-
-/// リポジトリ内のモデルの候補（.mlmodelc / .mlpackage のフォルダ）。
-struct ModelVariant: Codable, Hashable, Identifiable, Sendable {
-    enum Kind: String, Codable, Sendable {
-        case compiled   // .mlmodelc
-        case package    // .mlpackage
-    }
-
-    var id: String { path }
-    var path: String
-    var kind: Kind
-    var files: [HFFileEntry]
-    var totalBytes: Int64
-    var displayName: String
-}
-
-struct RepoAnalysis: Hashable, Sendable {
-    var variants: [ModelVariant]
-    var supportFiles: [HFFileEntry]
-    var hasTokenizer: Bool
-
-    /// ダウンロードする付属ファイルの名前
-    static let supportFileNames: Set<String> = [
-        "tokenizer.json", "tokenizer_config.json", "config.json", "generation_config.json",
-        "special_tokens_map.json", "chat_template.jinja", "chat_template.json", "added_tokens.json",
-    ]
-
-    static func analyze(files: [HFFileEntry]) -> RepoAnalysis {
-        var groups: [String: [HFFileEntry]] = [:]
-        for file in files {
-            guard let root = modelRoot(of: file.path) else { continue }
-            groups[root, default: []].append(file)
-        }
-        let variants = groups.map { root, entries -> ModelVariant in
-            let kind: ModelVariant.Kind = root.hasSuffix(".mlmodelc") ? .compiled : .package
-            let name = (root as NSString).lastPathComponent
-            let displayName = (name as NSString).deletingPathExtension
-            return ModelVariant(path: root, kind: kind, files: entries.sorted { $0.path < $1.path },
-                                totalBytes: entries.reduce(Int64(0)) { $0 + $1.size }, displayName: displayName)
-        }
-        .sorted { lhs, rhs in
-            if lhs.kind != rhs.kind { return lhs.kind == .compiled }
-            return lhs.path < rhs.path
-        }
-        let support = files.filter { supportFileNames.contains(($0.path as NSString).lastPathComponent) && modelRoot(of: $0.path) == nil }
-        let hasTokenizer = support.contains { ($0.path as NSString).lastPathComponent == "tokenizer.json" }
-        return RepoAnalysis(variants: variants, supportFiles: support.sorted { $0.path < $1.path }, hasTokenizer: hasTokenizer)
-    }
-
-    /// パスの中で最初に出てくる .mlmodelc / .mlpackage のフォルダ（入れ子の内側は無視）
-    static func modelRoot(of path: String) -> String? {
-        let components = path.split(separator: "/").map(String.init)
-        for (index, component) in components.enumerated() where index < components.count - 1 {
-            if component.hasSuffix(".mlmodelc") || component.hasSuffix(".mlpackage") {
-                return components[0...index].joined(separator: "/")
-            }
-        }
-        return nil
-    }
-
-    /// 選んだモデルのダウンロード対象（モデルのフォルダ + そのモデルに近い付属ファイル）
-    func filesToDownload(for variant: ModelVariant) -> [HFFileEntry] {
-        let variantParent = (variant.path as NSString).deletingLastPathComponent
-        var chosen: [String: HFFileEntry] = [:]
-        for file in supportFiles {
-            let name = (file.path as NSString).lastPathComponent
-            let candidateParent = (file.path as NSString).deletingLastPathComponent
-            if let existing = chosen[name] {
-                let existingParent = (existing.path as NSString).deletingLastPathComponent
-                if Self.distance(from: variantParent, to: candidateParent) < Self.distance(from: variantParent, to: existingParent) {
-                    chosen[name] = file
-                }
-            } else {
-                chosen[name] = file
-            }
-        }
-        return variant.files + chosen.values.sorted { $0.path < $1.path }
-    }
-
-    /// フォルダどうしの近さ（同じフォルダ 0、祖先は段数、それ以外は大きな値 + 深さ）
-    private static func distance(from base: String, to folder: String) -> Int {
-        if base == folder { return 0 }
-        let baseParts = base.split(separator: "/")
-        let folderParts = folder.split(separator: "/")
-        if baseParts.starts(with: folderParts) { return baseParts.count - folderParts.count }
-        return 100 + folderParts.count
     }
 }

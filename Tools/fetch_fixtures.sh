@@ -60,6 +60,7 @@ TREE_REPOS=(
   "aufklarer/Qwen3-0.6B-Chat-CoreML"
   "apple/mistral-coreml"
   "takanori-ishikawa/Qwen3.5-ANE-CoreML"
+  "anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4"
 )
 mkdir -p "$OUT/trees"
 for repo in "${TREE_REPOS[@]}"; do
@@ -67,4 +68,15 @@ for repo in "${TREE_REPOS[@]}"; do
   if [ -s "$OUT/trees/$name" ]; then continue; fi
   curl -sSL -o "$OUT/trees/$name" "https://huggingface.co/api/models/$repo/tree/main?recursive=true"
   echo "tree fixture: $name"
+done
+
+# ANEMLL（分割モデル）の meta.yaml
+ANEMLL_REPOS=(
+  "anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4"
+)
+for repo in "${ANEMLL_REPOS[@]}"; do
+  name="${repo//\//__}.meta.yaml"
+  if [ -s "$OUT/trees/$name" ]; then continue; fi
+  curl -sSL -o "$OUT/trees/$name" "https://huggingface.co/$repo/resolve/main/meta.yaml"
+  echo "meta fixture: $name"
 done

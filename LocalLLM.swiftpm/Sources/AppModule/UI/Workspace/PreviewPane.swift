@@ -77,26 +77,48 @@ private struct ConsoleView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 4)
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(session.consoleLines.enumerated()), id: \.offset) { index, line in
-                            Text(line)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(line.hasPrefix("[error]") ? Color.red : (line.hasPrefix("[warn]") ? Color.orange : Color.primary))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(index)
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                }
-                .onChange(of: session.consoleLines.count) { _, count in
-                    proxy.scrollTo(count - 1, anchor: .bottom)
-                }
-            }
+            ConsoleLines(lines: session.consoleLines)
         }
         .background(Color(uiColor: .secondarySystemBackground))
+    }
+}
+
+private struct ConsoleLines: View {
+    let lines: [String]
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(lines.indices, id: \.self) { index in
+                        ConsoleLine(text: lines[index])
+                            .id(index)
+                    }
+                }
+                .padding(.horizontal, 12)
+            }
+            .onChange(of: lines.count) { _, count in
+                proxy.scrollTo(count - 1, anchor: .bottom)
+            }
+        }
+    }
+}
+
+private struct ConsoleLine: View {
+    let text: String
+
+    private var color: Color {
+        if text.hasPrefix("[error]") { return .red }
+        if text.hasPrefix("[warn]") { return .orange }
+        return .primary
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.caption.monospaced())
+            .foregroundStyle(color)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

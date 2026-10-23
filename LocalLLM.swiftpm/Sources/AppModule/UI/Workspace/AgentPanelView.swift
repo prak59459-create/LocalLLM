@@ -28,29 +28,7 @@ struct AgentPanelView: View {
     }
 
     private var messageList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    if session.messages.isEmpty {
-                        AgentSuggestions(onPick: { draft = $0; focused = true })
-                    }
-                    ForEach(session.messages) { message in
-                        AgentMessageRow(message: message, session: session,
-                                        isStreaming: session.streamingMessageID == message.id)
-                            .id(message.id)
-                    }
-                    Color.clear.frame(height: 1).id("agent-bottom")
-                }
-                .padding(12)
-            }
-            .scrollDismissesKeyboard(.interactively)
-            .onChange(of: session.messages.last?.content.count) { _, _ in
-                proxy.scrollTo("agent-bottom", anchor: .bottom)
-            }
-            .onChange(of: session.messages.count) { _, _ in
-                withAnimation { proxy.scrollTo("agent-bottom", anchor: .bottom) }
-            }
-        }
+        AgentMessageList(session: session, onPick: { draft = $0; focused = true })
     }
 
     private var composer: some View {
@@ -83,6 +61,45 @@ struct AgentPanelView: View {
         let text = draft
         draft = ""
         session.sendToAgent(text, chat: chat, settings: settings, connectors: connectors)
+    }
+}
+
+/// やり取りの一覧（新しいものが来たら下へ送る）。
+private struct AgentMessageList: View {
+    @Bindable var session: WorkspaceSession
+    var onPick: (String) -> Void
+
+    private var lastLength: Int { session.messages.last?.content.count ?? 0 }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                content
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .onChange(of: lastLength) { _, _ in proxy.scrollTo("agent-bottom", anchor: .bottom) }
+            .onChange(of: session.messages.count) { _, _ in
+                withAnimation { proxy.scrollTo("agent-bottom", anchor: .bottom) }
+            }
+        }
+    }
+
+    private var content: some View {
+        LazyVStack(alignment: .leading, spacing: 12) {
+            if session.messages.isEmpty {
+                AgentSuggestions(onPick: onPick)
+            }
+            ForEach(session.messages) { message in
+                row(message)
+            }
+            Color.clear.frame(height: 1).id("agent-bottom")
+        }
+        .padding(12)
+    }
+
+    private func row(_ message: AgentMessage) -> some View {
+        AgentMessageRow(message: message, session: session, isStreaming: session.streamingMessageID == message.id)
+            .id(message.id)
     }
 }
 

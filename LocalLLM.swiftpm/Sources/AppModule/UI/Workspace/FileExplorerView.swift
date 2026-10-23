@@ -30,45 +30,66 @@ struct FileExplorerView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(session.visibleEntries) { entry in
-                        FileRow(entry: entry,
-                                isExpanded: session.expanded.contains(entry.path),
-                                isSelected: session.selectedPath == entry.path,
-                                isDirty: session.isDirty(entry.path))
-                            .onTapGesture { tap(entry) }
-                            .contextMenu { menu(for: entry) }
-                    }
-                    if session.visibleEntries.isEmpty {
-                        Text(L("ファイルがありません", "No files"))
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .padding()
-                    }
-                }
-                .padding(.vertical, 4)
-            }
-            .refreshable { session.refreshTree() }
+            tree
         }
         .background(Color(uiColor: .secondarySystemBackground).opacity(0.5))
-        .alert(prompt?.title ?? "", isPresented: Binding(get: { prompt != nil }, set: { if !$0 { prompt = nil } })) {
+        .alert(prompt?.title ?? "", isPresented: isPrompting) {
             TextField(L("名前", "Name"), text: $promptText)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
             Button(L("キャンセル", "Cancel"), role: .cancel) { prompt = nil }
             Button("OK", action: commitPrompt)
         }
-        .confirmationDialog(L("「\(deleting?.name ?? "")」を削除しますか？", "Delete \"\(deleting?.name ?? "")\"?"),
-                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
-                            titleVisibility: .visible) {
-            Button(L("削除", "Delete"), role: .destructive) {
-                if let deleting { session.delete(deleting.path) }
-                deleting = nil
-            }
+        .confirmationDialog(deleteTitle, isPresented: isDeleting, titleVisibility: .visible) {
+            Button(L("削除", "Delete"), role: .destructive, action: confirmDelete)
         } message: {
             Text(L("テキストのファイルは変更履歴から元に戻せます。", "Text files can be restored from the change history."))
         }
+    }
+
+    private var tree: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(session.visibleEntries) { entry in
+                    row(entry)
+                }
+                if session.visibleEntries.isEmpty {
+                    Text(L("ファイルがありません", "No files"))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding()
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .refreshable { session.refreshTree() }
+    }
+
+    private func row(_ entry: WorkspaceEntry) -> some View {
+        FileRow(entry: entry,
+                isExpanded: session.expanded.contains(entry.path),
+                isSelected: session.selectedPath == entry.path,
+                isDirty: session.isDirty(entry.path))
+            .onTapGesture { tap(entry) }
+            .contextMenu { menu(for: entry) }
+    }
+
+    private var isPrompting: Binding<Bool> {
+        Binding(get: { prompt != nil }, set: { if !$0 { prompt = nil } })
+    }
+
+    private var isDeleting: Binding<Bool> {
+        Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })
+    }
+
+    private var deleteTitle: String {
+        let name = deleting?.name ?? ""
+        return L("「\(name)」を削除しますか？", "Delete \"\(name)\"?")
+    }
+
+    private func confirmDelete() {
+        if let deleting { session.delete(deleting.path) }
+        deleting = nil
     }
 
     private var header: some View {

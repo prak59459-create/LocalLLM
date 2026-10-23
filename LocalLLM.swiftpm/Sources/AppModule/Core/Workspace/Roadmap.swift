@@ -200,32 +200,9 @@ struct Roadmap: Codable, Sendable {
     /// 木の形に並べ直す（根を左に、子を右へ。兄弟は縦に並べる）。
     mutating func autoLayout() {
         guard !nodes.isEmpty else { return }
-        let childIDs = Set(edges.map(\.to))
-        var roots = nodes.filter { !childIDs.contains($0.id) }
-        if roots.isEmpty { roots = [nodes[0]] }
-        var placed = Set<UUID>()
-        var nextRow = 0.0
-        func place(_ id: UUID, depth: Int) -> Double {
-            placed.insert(id)
-            let kids = children(of: id).filter { !placed.contains($0.id) }.sorted { $0.number < $1.number }
-            let y: Double
-            if kids.isEmpty {
-                y = nextRow
-                nextRow += 1
-            } else {
-                let rows = kids.map { place($0.id, depth: depth + 1) }
-                y = ((rows.first ?? 0) + (rows.last ?? 0)) / 2
-            }
-            move(id, to: (Double(depth) * Self.spacing * 1.3, y * Self.spacing * 0.8))
-            return y
-        }
-        for root in roots.sorted(by: { $0.number < $1.number }) where !placed.contains(root.id) {
-            _ = place(root.id, depth: 0)
-            nextRow += 0.5
-        }
-        // つながっていない輪の中のものなど
-        for node in nodes where !placed.contains(node.id) {
-            _ = place(node.id, depth: 0)
+        var layout = RoadmapTreeLayout(roadmap: self)
+        for (id, point) in layout.run() {
+            move(id, to: point)
         }
     }
 
@@ -251,5 +228,64 @@ struct Roadmap: Codable, Sendable {
     var progress: (done: Int, total: Int) {
         let counted = nodes.filter { $0.kind != .note }
         return (counted.filter { $0.status == .done }.count, counted.count)
+    }
+}
+
+/// 木の形の並べ方（型チェックを速くするため、入れ子の関数にせず型に分けている）。
+private struct RoadmapTreeLayout {
+    private let children: [UUID: [UUID]]
+    private let roots: [UUID]
+    private let all: [UUID]
+    private var placed: Set<UUID> = []
+    private var nextRow: Double = 0
+    private var positions: [UUID: (x: Double, y: Double)] = [:]
+
+    init(roadmap: Roadmap) {
+        let sorted: [RoadmapNode] = roadmap.nodes.sorted { $0.number < $1.number }
+        let numbers: [UUID: Int] = Dictionary(uniqueKeysWithValues: sorted.map { ($0.id, $0.number) })
+        var children: [UUID: [UUID]] = [:]
+        for edge in roadmap.edges {
+            children[edge.from, default: []].append(edge.to)
+        }
+        for (key, value) in children {
+            children[key] = value.sorted { (numbers[$0] ?? 0) < (numbers[$1] ?? 0) }
+        }
+        let childIDs: Set<UUID> = Set(roadmap.edges.map(\.to))
+        let rootIDs: [UUID] = sorted.filter { !childIDs.contains($0.id) }.map(\.id)
+        let ids: [UUID] = sorted.map(\.id)
+        self.children = children
+        self.all = ids
+        self.roots = rootIDs.isEmpty ? Array(ids.prefix(1)) : rootIDs
+    }
+
+    mutating func run() -> [UUID: (x: Double, y: Double)] {
+        for root in roots where !placed.contains(root) {
+            _ = place(root, depth: 0)
+            nextRow += 0.5
+        }
+        // つながっていない輪の中のものなど
+        for id in all where !placed.contains(id) {
+            _ = place(id, depth: 0)
+        }
+        return positions
+    }
+
+    private mutating func place(_ id: UUID, depth: Int) -> Double {
+        placed.insert(id)
+        var rows: [Double] = []
+        for kid in children[id] ?? [] where !placed.contains(kid) {
+            rows.append(place(kid, depth: depth + 1))
+        }
+        let row: Double
+        if let first = rows.first, let last = rows.last {
+            row = (first + last) / 2
+        } else {
+            row = nextRow
+            nextRow += 1
+        }
+        let x: Double = Double(depth) * Roadmap.spacing * 1.3
+        let y: Double = row * Roadmap.spacing * 0.8
+        positions[id] = (x, y)
+        return row
     }
 }

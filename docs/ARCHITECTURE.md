@@ -25,9 +25,12 @@
 | `Core/Jinja` | チャットテンプレート用の Jinja サブセット | ✅ |
 | `Core/Chat` | チャットメッセージ型、テンプレート描画、思考ブロックの分離、プロンプト組み立て | ✅ |
 | `Core/Generation` | サンプラー、ストリーミング復号、停止判定、生成パラメータ | ✅ |
-| `Core/Hub` | Hugging Face API、リポジトリ解析、Core ML モデルの入出力判定、再開可能ダウンロード | ✅ |
+| `Core/Hub` | Hugging Face API、リポジトリ解析、分割モデル（ANEMLL）、ZIP、Core ML モデルの入出力判定、再開可能ダウンロード | ✅ |
+| `Core/Tools` | JSON、ツールの呼び出しの読み取り、Web 検索・ページ取得、MCP クライアント | ✅ |
+| `Core/Workspace` | CDWS: フォルダの中だけを触るファイル操作、差分、変更履歴、ロードマップ、ひな形、エージェントのツール、色付け | ✅ |
+| `Core/Update` | アプリの更新（版の上げ方、上書きの計画、バックアップと取り消し） | ✅ |
 | `Core/Util` | 多言語化、バイト数表示など | ✅ |
-| `Engine` | Core ML 推論（ステートフル／ステートレス） | ❌（iOS のみ） |
+| `Engine` | Core ML 推論（ステートフル／ステートレス／分割モデルのパイプライン） | ❌（iOS のみ） |
 | `Storage` | SwiftData の会話履歴、インストール済みモデルの管理 | ❌ |
 | `UI`, `App` | SwiftUI 画面、アプリ全体の状態 | ❌ |
 
@@ -201,6 +204,8 @@ struct GenerationParameters: Codable, Hashable, Sendable {
     static let `default` = GenerationParameters()
 }
 
+/// 語彙全体を並べ替えずに、上位の候補だけを取り出してから並べる（最適化なしのビルドでも 1 トークン数 ms）。
+/// 候補の下限は「最大の logit − 30×温度」を二分探索で決め、vDSP で数えて取り出す（Accelerate が無ければ 1024 区間のヒストグラム）。
 struct TokenSampler {
     init(parameters: GenerationParameters)
     /// logits（語彙サイズの配列）から次のトークン ID を選ぶ。logits は書き換えてよい。
@@ -408,7 +413,12 @@ enum ByteFormat { static func string(_ bytes: Int64) -> String }   // 例: "1.9 
     （マスクの最後の次元 = 過去の長さ + 今回の長さ、で位置が決まるため、共通部分の長さまで巻き戻すだけでよい）。
   - プロンプトはチャンク（既定 128 トークン）に分けて流し込み、logits のメモリを抑える。
   - ステートレス: 毎回トークン列全体を入れる（固定長なら右側をパディング）。
+- `PipelineLanguageModel`: ANEMLL 形式の分割モデル。埋め込み（input_ids → hidden_states）→ FFN のチャンク（multifunction の
+  `prefill` / `infer`、Gemma 3 のスライディング窓では `*_rotate`）→ 出力層（`logits1..N` をつなぐか、モデル内の `argmax_idx/argmax_val`）。
+  KV キャッシュの `MLState` は最初のチャンクの prefill 関数から 1 つ作り、全チャンクで共有する。プロンプトはバッチの長さ（例 64）にそろえて流す。
+- どちらも `LanguageModelRunner` プロトコル（`evaluate(tokens:)` / `append(token:)` が `NextTokenScores`（logits かトークン）を返す）に従う。
 - `InferenceEngine`（actor）: モデルとトークナイザの読み込み、生成ループ（`AsyncThrowingStream` でイベントを返す）、統計。
+  `GenerationRequest.tools` があればテンプレートに `tools` を渡す（対応していないテンプレートには説明文で代用）。
 
 ## Storage / App / UI（iOS 専用）
 
@@ -416,6 +426,65 @@ enum ByteFormat { static func string(_ bytes: Int64) -> String }   // 例: "1.9 
 - `ModelLibrary`（@Observable）: インストール済みモデル（`Application Support/Models/<owner>__<name>/` と `manifest.json`）、ダウンロード中のジョブ。
 - `AppSettings`（@Observable、UserDefaults）: 生成パラメータ、システムプロンプト、思考モード、計算ユニット、統計表示、言語、HF トークン。
 - 画面: 会話一覧（サイドバー）＋チャット、モデル（おすすめ / 検索 / インストール済み / 詳細とダウンロード）、設定。
+- `AgentLoop`: 生成 → ツールの呼び出しを読み取る → 実行（必要なら確認）→ 結果を `role: tool` で渡して再び生成、を繰り返す。
+  チャット（`ChatController` + `ConnectorStore`）と CDWS（`WorkspaceSession`）の両方で使う。
+- `ConnectorStore`: 組み込みツール（web_search / fetch_page / current_time）と MCP サーバー（Streamable HTTP）の設定とツールの実行。
+- `WorkspaceStore` / `WorkspaceSession`: CDWS のプロジェクト一覧（外のフォルダはブックマーク）と、開いたプロジェクトの状態
+  （ファイルの木、エディタのバッファと自動保存、`.cdws/roadmap.json`・`history.json`・`agent.json`、プレビュー、エージェント）。
+- `AppUpdateController`: 選んだ `.swiftpm`（ブックマーク）を GitHub の ZIP などで上書きする。`NSFileCoordinator` を通して書き、
+  変える前のファイルは `Application Support/AppUpdateBackup` に残す。
+
+## Core/Tools
+
+```swift
+enum JSONValue { case null, bool(Bool), int(Int), double(Double), string(String), array([JSONValue]), object([(String, JSONValue)]) }
+    // キーの順番を保つ。parse(_:lenient:) はモデルが書きがちな崩れた JSON（' や末尾の , など）も読む
+struct ToolDefinition { var name: String; var description: String; var parameters: JSONValue }   // JSON Schema
+struct ToolCall { var id: String; var name: String; var arguments: JSONValue }
+enum ToolCallParser {
+    /// Qwen/Hermes の <tool_call>、Llama の {"name","parameters"} と <|python_tag|>、Mistral の [TOOL_CALLS]、
+    /// <function=…>、コードブロックの JSON を読む。knownTools に無い名前は無視。
+    static func parse(_ text: String, knownTools: Set<String>) -> Result   // (content, calls)
+    static func visiblePart(of text: String) -> String   // 生成中に、呼び出し部分を隠した本文
+}
+enum ToolPrompt { static func instructions(for:) -> String; static func flatten(_:) -> [ChatMessage] }  // tools 非対応のテンプレート用
+struct WebSearchClient { func search(_:limit:) async throws -> [WebSearchResult]; func fetchPage(_:maxCharacters:) async throws -> (title, text) }
+actor MCPClient { func listTools() async throws -> [MCPTool]; func callTool(_:arguments:) async throws -> (text: String, isError: Bool) }
+```
+
+## Core/Workspace（CDWS）
+
+```swift
+struct WorkspaceFileSystem {        // root の外を指すパス（.. や絶対パス）はエラー
+    func children(of:), walk(_:maxDepth:limit:), tree(_:maxDepth:maxEntries:) -> String
+    func read(_:), readNumbered(_:offset:limit:maxCharacters:)
+    func write(_:_:) -> FileChange, edit(_:old:new:replaceAll:) -> FileChange   // old は 1 か所だけ。行末の空白・CRLF の違いは許す
+    func delete(_:) -> [FileChange], move(_:to:) -> FileChange, search(_:in:isRegex:...), find(_:)
+}
+struct FileChange { path, kind (created/modified/deleted/moved), before, after, actor, batchID }
+struct ChangeHistory { mutating func record(_:), undo(_:in:), undoBatch(_:in:) }
+enum TextDiff { static func diff(old:new:) -> [DiffLine]; static func hunks(old:new:context:) -> [DiffHunk]; static func unified(old:new:path:) -> String }
+struct Roadmap { nodes: [RoadmapNode], edges: [RoadmapEdge]   // 丸（#番号・状態・種類・位置）と、親 → 子の線
+    mutating func add(title:detail:kind:status:parent:at:) -> RoadmapNode   // 親の周りの空いた場所に置く
+    mutating func autoLayout(); func summary(maxNodes:) -> String }
+enum WorkspaceToolbox { static func definitions(profile:javaScript:) -> [ToolDefinition] }   // minimal / standard / full
+struct WorkspaceToolExecutor { func execute(_:roadmap:) -> WorkspaceToolResult; func preview(_:) -> ProposedChange? }
+enum CodingAgentPrompt { static func system(...), implement(_:), brainstorm(from:count:), planRoadmap(goal:) }
+enum SyntaxHighlighter { static func tokens(in:language:) -> [HighlightToken] }   // UTF-16 の位置
+```
+
+## Core/Update
+
+```swift
+struct PackageVersion { var display: String; var bundle: Int
+    static func next(current:incoming:) -> PackageVersion   // bundle は毎回 +1。display は新しいソースの方が大きければそれ、そうでなければ最後の数字を +1
+}
+enum AppUpdater {
+    static func packageRoot(in:preferredName:) -> URL?      // ZIP の中から Package.swift と Sources/ のあるフォルダを探す
+    static func plan(source:target:) throws -> UpdatePlan    // 追加・変更・削除（削除は Sources/ の中だけ。.swiftpm/ や .git は触らない）
+    static func apply(_:source:target:backup:) throws; static func restore(from:target:) throws
+}
+```
 
 ---
 

@@ -93,8 +93,8 @@ jobs:
             -swift-version 5 \
             -parse-as-library \
             -module-name AppModule \
-            -Xfrontend -warn-long-function-bodies=200 \
-            -Xfrontend -warn-long-expression-type-checking=150 \
+            -Xfrontend -warn-long-function-bodies=100 \
+            -Xfrontend -warn-long-expression-type-checking=80 \
             $(cat sources.txt) 2> typecheck.log
           status=$?
           set -e
@@ -105,13 +105,23 @@ jobs:
 
       # Swift Playgrounds builds without optimization, so slow-to-typecheck code makes the iPad build slow
       # (and can even crash it). Fail if any function body or expression is slow to typecheck.
+      # 型チェックは 100ms / 80ms から表示して（余裕の少ない箇所を見つけるため）、
+      # 関数 200ms・式 150ms を超えたら失敗にする。
       - name: Check for slow type-checking
         run: |
-          if grep -E "(instance method|getter|function|closure|initializer|expression|global function|static method).*took [0-9]+ms to type-check|to type-check \(limit" typecheck.log; then
+          grep -E "Sources/AppModule/.*took [0-9]+ms to type-check" typecheck.log | sed -E 's/^.*Sources\/AppModule\///' | sort -u > slow.txt || true
+          echo "----- slow-ish (warning only) -----"
+          cat slow.txt
+          fail=$(awk '
+            /expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 150) print }
+            /(function|getter|method|closure|initializer).*took/ && !/expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 200) print }
+          ' slow.txt)
+          if [ -n "$fail" ]; then
+            echo "$fail"
             echo "::error::Some code is slow to type-check. Split the expression or view into smaller pieces."
             exit 1
           fi
-          echo "No slow type-checking found."
+          echo "No slow type-checking over the limits."
 
       - name: Build the Swift Playgrounds app package with xcodebuild
         working-directory: LocalLLM.swiftpm

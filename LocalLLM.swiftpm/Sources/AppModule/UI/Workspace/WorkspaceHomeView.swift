@@ -11,6 +11,13 @@ struct WorkspaceHomeView: View {
     @State private var importingFolder = false
     @State private var error: String?
     @State private var removing: WorkspaceProject?
+    /// 作ったばかりのプロジェクト（作成画面が閉じてから開く）
+    @State private var created: CreatedProject?
+
+    private struct CreatedProject {
+        var project: WorkspaceProject
+        var roadmap: Roadmap
+    }
 
     var body: some View {
         NavigationStack {
@@ -21,9 +28,9 @@ struct WorkspaceHomeView: View {
                 .navigationDestination(item: $openSession) { session in
                     WorkspaceView(session: session, onClose: { close(session) })
                 }
-                .sheet(isPresented: $creating) {
+                .sheet(isPresented: $creating, onDismiss: openCreated) {
                     NewProjectSheet(onCreated: { project, roadmap in
-                        open(project, roadmap: roadmap)
+                        created = CreatedProject(project: project, roadmap: roadmap)
                     })
                 }
                 .fileImporter(isPresented: $importingFolder, allowedContentTypes: [.folder]) { result in
@@ -112,6 +119,12 @@ struct WorkspaceHomeView: View {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    private func openCreated() {
+        guard let created else { return }
+        self.created = nil
+        open(created.project, roadmap: created.roadmap)
     }
 
     private func close(_ session: WorkspaceSession) {
@@ -268,8 +281,8 @@ private struct NewProjectSheet: View {
     private func create() {
         do {
             let (project, roadmap) = try store.create(name: name.trimmingCharacters(in: .whitespaces), template: template, in: parentFolder)
-            dismiss()
             onCreated(project, roadmap)
+            dismiss()
         } catch {
             self.error = error.localizedDescription
         }

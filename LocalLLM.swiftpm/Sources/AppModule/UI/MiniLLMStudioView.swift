@@ -56,40 +56,8 @@ private struct StudioDatasetSection: View {
 
     var body: some View {
         Section {
-            LabeledContent(L("データ", "Dataset"), value: studio.datasetName)
-            LabeledContent(L("文字数", "Characters"), value: "\(studio.datasetCharacterCount)")
-            LabeledContent(L("文字の種類", "Unique characters"), value: "\(studio.datasetUniqueCharacters)")
-            Text(String(studio.datasetText.prefix(300)) + (studio.datasetCharacterCount > 300 ? "…" : ""))
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(6)
-
-            Menu {
-                Button(L("吾輩は猫である（冒頭）", "Wagahai wa Neko de Aru (opening)")) {
-                    studio.useSample(SampleCorpora.wagahai, name: L("吾輩は猫である（冒頭）", "Wagahai wa Neko de Aru (opening)"))
-                }
-                Button(L("Swift のコード例", "Swift code samples")) {
-                    studio.useSample(SampleCorpora.swiftCode, name: L("Swift のコード例", "Swift code samples"))
-                }
-                Button(L("Tiny Shakespeare をダウンロード（1.1MB）", "Download Tiny Shakespeare (1.1 MB)")) {
-                    Task { message = await studio.downloadTinyShakespeare() }
-                }
-                Button(L("クリップボードから貼り付け", "Paste from clipboard")) {
-                    if let text = UIPasteboard.general.string, !text.isEmpty {
-                        studio.useSample(text, name: L("貼り付けた文章", "Pasted text"))
-                    }
-                }
-                Button(L("ファイル・フォルダから読み込む…", "Load from files or folders…")) {
-                    importing = true
-                }
-                Button(L("自分で書く・編集する…", "Write or edit…")) {
-                    editing = true
-                }
-            } label: {
-                Label(L("データを選ぶ", "Choose data"), systemImage: "doc.text")
-            }
-            .disabled(studio.status == .training)
-
+            DatasetInfoRows()
+            DatasetSourceMenu(message: $message, importing: $importing, editing: $editing)
             if studio.isDownloadingDataset {
                 ProgressView()
             }
@@ -111,6 +79,61 @@ private struct StudioDatasetSection: View {
         }
         .sheet(isPresented: $editing) {
             DatasetEditorSheet()
+        }
+    }
+}
+
+/// いまの学習データの情報（型チェックを速くするため分けている）。
+private struct DatasetInfoRows: View {
+    @Environment(MiniLLMStudio.self) private var studio
+
+    private var preview: String {
+        String(studio.datasetText.prefix(300)) + (studio.datasetCharacterCount > 300 ? "…" : "")
+    }
+
+    var body: some View {
+        LabeledContent(L("データ", "Dataset"), value: studio.datasetName)
+        LabeledContent(L("文字数", "Characters"), value: "\(studio.datasetCharacterCount)")
+        LabeledContent(L("文字の種類", "Unique characters"), value: "\(studio.datasetUniqueCharacters)")
+        Text(preview)
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+            .lineLimit(6)
+    }
+}
+
+/// 学習データの選び方のメニュー。
+private struct DatasetSourceMenu: View {
+    @Environment(MiniLLMStudio.self) private var studio
+    @Binding var message: String?
+    @Binding var importing: Bool
+    @Binding var editing: Bool
+
+    var body: some View {
+        Menu {
+            Button(L("吾輩は猫である（冒頭）", "Wagahai wa Neko de Aru (opening)")) {
+                studio.useSample(SampleCorpora.wagahai, name: L("吾輩は猫である（冒頭）", "Wagahai wa Neko de Aru (opening)"))
+            }
+            Button(L("Swift のコード例", "Swift code samples")) {
+                studio.useSample(SampleCorpora.swiftCode, name: L("Swift のコード例", "Swift code samples"))
+            }
+            Button(L("Tiny Shakespeare をダウンロード（1.1MB）", "Download Tiny Shakespeare (1.1 MB)"), action: downloadShakespeare)
+            Button(L("クリップボードから貼り付け", "Paste from clipboard"), action: paste)
+            Button(L("ファイル・フォルダから読み込む…", "Load from files or folders…")) { importing = true }
+            Button(L("自分で書く・編集する…", "Write or edit…")) { editing = true }
+        } label: {
+            Label(L("データを選ぶ", "Choose data"), systemImage: "doc.text")
+        }
+        .disabled(studio.status == .training)
+    }
+
+    private func downloadShakespeare() {
+        Task { message = await studio.downloadTinyShakespeare() }
+    }
+
+    private func paste() {
+        if let text = UIPasteboard.general.string, !text.isEmpty {
+            studio.useSample(text, name: L("貼り付けた文章", "Pasted text"))
         }
     }
 }

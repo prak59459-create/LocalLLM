@@ -105,23 +105,62 @@ private struct AgentMessageList: View {
 
 private struct AgentHeader: View {
     @Bindable var session: WorkspaceSession
-    @Environment(ChatController.self) private var chat
 
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "sparkles").foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 1) {
                 Text(L("エージェント", "Agent")).font(.subheadline.weight(.semibold))
-                Text(chat.loadedInfo?.displayName ?? L("モデル未読み込み", "No model loaded"))
-                    .font(.caption)
-                    .foregroundStyle(chat.loadedInfo == nil ? Color.orange : Color.secondary)
-                    .lineLimit(1)
+                AgentModelMenu()
             }
             Spacer()
             AgentSettingsMenu(session: session)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+}
+
+/// エージェントに使うモデルの切り替え（ワークスペースから出なくても読み込める）。
+private struct AgentModelMenu: View {
+    @Environment(ChatController.self) private var chat
+    @Environment(ModelLibrary.self) private var library
+    @Environment(AppSettings.self) private var settings
+
+    private var title: String {
+        switch chat.loadState {
+        case .ready(let info): return info.displayName
+        case .loading(let name), .compiling(let name): return L("読み込み中: ", "Loading: ") + name
+        case .failed: return L("読み込みに失敗しました", "Load failed")
+        case .idle: return L("モデルを選ぶ", "Choose a model")
+        }
+    }
+
+    var body: some View {
+        Menu {
+            if library.completedModels.isEmpty {
+                Text(L("モデルがありません（チャット画面のモデルから入手してください）", "No models (get one from Models in the chat screen)"))
+            }
+            ForEach(library.completedModels) { model in
+                Button {
+                    chat.loadModel(id: model.id, library: library, settings: settings)
+                } label: {
+                    if chat.loadedInfo?.modelID == model.id {
+                        Label(model.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(model.displayName)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                if chat.isBusyLoading { ProgressView().controlSize(.mini) }
+                Text(title).lineLimit(1)
+                Image(systemName: "chevron.down").font(.caption2)
+            }
+            .font(.caption)
+            .foregroundStyle(chat.loadedInfo == nil ? Color.orange : Color.secondary)
+        }
     }
 }
 

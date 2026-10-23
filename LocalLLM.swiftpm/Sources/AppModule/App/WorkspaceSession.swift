@@ -505,8 +505,8 @@ final class WorkspaceSession {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isAgentRunning else { return }
         guard let info = chat.loadedInfo else {
-            notice = L("先にチャット画面でモデルを読み込んでください（ツールの呼び出しに対応したモデルがおすすめです）。",
-                       "Load a model first (one that supports tool calling works best).")
+            notice = L("先にエージェントの欄の上にある「モデルを選ぶ」から、モデルを読み込んでください（ツールの呼び出しに対応したモデルがおすすめです）。",
+                       "Load a model first with \"Choose a model\" at the top of the agent panel (one that supports tool calling works best).")
             return
         }
         chat.stopGenerating()

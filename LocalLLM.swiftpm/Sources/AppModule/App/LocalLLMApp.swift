@@ -9,6 +9,7 @@ struct LocalLLMApp: App {
     @State private var knowledge = KnowledgeStore()
     @State private var studio = MiniLLMStudio()
     @State private var connectors = ConnectorStore()
+    @State private var workspaces = WorkspaceStore()
 
     var body: some Scene {
         WindowGroup {
@@ -19,6 +20,7 @@ struct LocalLLMApp: App {
                 .environment(knowledge)
                 .environment(studio)
                 .environment(connectors)
+                .environment(workspaces)
         }
         .modelContainer(for: [Conversation.self, StoredMessage.self, Assistant.self])
     }

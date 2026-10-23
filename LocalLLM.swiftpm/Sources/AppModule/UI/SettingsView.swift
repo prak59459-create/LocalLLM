@@ -20,6 +20,7 @@ struct SettingsView: View {
                 DisplaySettingsSection()
                 TokenSettingsSection()
                 DeviceSettingsSection(onDeleteChats: { confirmingDeleteChats = true })
+                UpdateLinkSection()
             }
             .navigationTitle(L("設定", "Settings"))
             .navigationBarTitleDisplayMode(.inline)
@@ -241,6 +242,24 @@ private struct DeviceSettingsSection: View {
             Button(L("すべての会話を削除", "Delete all chats"), role: .destructive, action: onDeleteChats)
         } header: {
             Text(L("端末", "Device"))
+        }
+    }
+}
+
+private struct UpdateLinkSection: View {
+    var body: some View {
+        Section {
+            NavigationLink {
+                UpdateView()
+            } label: {
+                LabeledContent {
+                    Text(AppUpdateController.runningVersion).monospacedDigit()
+                } label: {
+                    Label(L("アプリの更新", "Update the App"), systemImage: "arrow.down.app")
+                }
+            }
+        } header: {
+            Text(L("このアプリ", "This app"))
         }
     }
 }

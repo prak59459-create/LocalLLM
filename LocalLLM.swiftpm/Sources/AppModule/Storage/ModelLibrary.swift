@@ -343,14 +343,14 @@ final class ModelLibrary {
                 try save(model)
                 replace(model)
             }
-            func url(_ path: String) throws -> URL {
+            func partURL(_ path: String) throws -> URL {
                 let url = folder.appendingPathComponent(model.localPath(for: path))
                 guard fileManager.fileExists(atPath: url.path) else { throw ModelLibraryError.missingModelFolder }
                 return url
             }
-            source = .pipeline(PipelineFiles(embeddings: try pipeline.embeddings.map(url),
-                                             chunks: try pipeline.chunks.map(url),
-                                             lmHead: try pipeline.lmHead.map(url),
+            source = .pipeline(PipelineFiles(embeddings: try pipeline.embeddings.map(partURL),
+                                             chunks: try pipeline.chunks.map(partURL),
+                                             lmHead: try pipeline.lmHead.map(partURL),
                                              descriptor: pipeline))
         case .archive:
             throw ModelLibraryError.incomplete

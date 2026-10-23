@@ -202,12 +202,13 @@ enum ToolCallParser {
         if let list = value["tool_calls"]?.arrayValue {
             return list.flatMap { interpret($0, knownTools: knownTools) }
         }
-        let function = value["function"]
-        let name = value["name"]?.stringValue ?? function?["name"]?.stringValue ?? value["tool"]?.stringValue
-            ?? value["tool_name"]?.stringValue
-        guard let name, knownTools.contains(name) else { return [] }
-        var arguments = value["arguments"] ?? value["parameters"] ?? value["args"] ?? value["input"]
-            ?? function?["arguments"] ?? function?["parameters"] ?? .object([])
+        let function: JSONValue = value["function"] ?? .null
+        // 型チェックを速くするため、?? を長くつながずに候補の配列から選ぶ
+        let names: [JSONValue?] = [value["name"], function["name"], value["tool"], value["tool_name"]]
+        guard let name = names.lazy.compactMap({ $0?.stringValue }).first, knownTools.contains(name) else { return [] }
+        let candidates: [JSONValue?] = [value["arguments"], value["parameters"], value["args"], value["input"],
+                                        function["arguments"], function["parameters"]]
+        var arguments: JSONValue = candidates.lazy.compactMap({ $0 }).first ?? .object([])
         if case .string(let text) = arguments {
             arguments = (try? JSONValue.parse(text, lenient: true)) ?? .object([("input", .string(text))])
         }

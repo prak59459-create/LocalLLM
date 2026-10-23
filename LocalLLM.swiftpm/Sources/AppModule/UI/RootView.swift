@@ -15,6 +15,7 @@ struct RootView: View {
     @State private var showingSettings = false
     @State private var showingAssistants = false
     @State private var showingStudio = false
+    @State private var showingWorkspace = false
     @State private var didAutoLoad = false
 
     var body: some View {
@@ -24,6 +25,7 @@ struct RootView: View {
                                  onShowModels: { showingModels = true },
                                  onShowAssistants: { showingAssistants = true },
                                  onShowStudio: { showingStudio = true },
+                                 onShowWorkspace: { showingWorkspace = true },
                                  onShowSettings: { showingSettings = true })
         } detail: {
             if let conversation = selectedConversation {
@@ -33,7 +35,8 @@ struct RootView: View {
                 WelcomeView(onNewChat: { newConversation(assistant: nil) },
                             onShowModels: { showingModels = true },
                             onShowAssistants: { showingAssistants = true },
-                            onShowStudio: { showingStudio = true })
+                            onShowStudio: { showingStudio = true },
+                            onShowWorkspace: { showingWorkspace = true })
             }
         }
         // 言語を切り替えたら画面全体を作り直して文字列を更新する
@@ -49,6 +52,9 @@ struct RootView: View {
         }
         .fullScreenCover(isPresented: $showingStudio) {
             MiniLLMStudioView()
+        }
+        .fullScreenCover(isPresented: $showingWorkspace) {
+            WorkspaceHomeView()
         }
         .task {
             removeEmptyConversations(except: nil)
@@ -125,6 +131,7 @@ struct WelcomeView: View {
     var onShowModels: () -> Void
     var onShowAssistants: () -> Void
     var onShowStudio: () -> Void
+    var onShowWorkspace: () -> Void
 
     var body: some View {
         VStack(spacing: 20) {
@@ -166,6 +173,12 @@ struct WelcomeView: View {
                     Label(L("LLM をゼロから学習", "Train an LLM from scratch"), systemImage: "hammer")
                 }
             }
+            Button(action: onShowWorkspace) {
+                Label(L("AI と一緒にコードを書く（CDWS）", "Code together with the AI (CDWS)"),
+                      systemImage: "chevron.left.forwardslash.chevron.right")
+            }
+            .buttonStyle(.bordered)
+            .font(.callout)
             .buttonStyle(.bordered)
             .font(.callout)
         }

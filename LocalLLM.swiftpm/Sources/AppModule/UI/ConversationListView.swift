@@ -13,6 +13,7 @@ struct ConversationListView: View {
     var onShowModels: () -> Void
     var onShowAssistants: () -> Void
     var onShowStudio: () -> Void
+    var onShowWorkspace: () -> Void
     var onShowSettings: () -> Void
 
     @State private var renaming: Conversation?
@@ -161,7 +162,8 @@ struct ConversationListView: View {
             }
             ToolbarItemGroup(placement: .bottomBar) {
                 SidebarBottomButtons(onShowModels: onShowModels, onShowAssistants: onShowAssistants,
-                                     onShowStudio: onShowStudio, onShowSettings: onShowSettings)
+                                     onShowStudio: onShowStudio, onShowWorkspace: onShowWorkspace,
+                                     onShowSettings: onShowSettings)
             }
         }
     }
@@ -224,11 +226,16 @@ private struct SidebarBottomButtons: View {
     var onShowModels: () -> Void
     var onShowAssistants: () -> Void
     var onShowStudio: () -> Void
+    var onShowWorkspace: () -> Void
     var onShowSettings: () -> Void
 
     var body: some View {
         Button(action: onShowModels) {
             Label(L("モデル", "Models"), systemImage: "cpu")
+        }
+        Spacer()
+        Button(action: onShowWorkspace) {
+            Label(L("コーディング", "Coding"), systemImage: "chevron.left.forwardslash.chevron.right")
         }
         Spacer()
         Button(action: onShowAssistants) {

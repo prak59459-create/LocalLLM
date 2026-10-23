@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/xcode/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+Package.resolved
+LocalLLM.swiftpm/.swiftpm/
+Tests/Fixtures/
+__pycache__/

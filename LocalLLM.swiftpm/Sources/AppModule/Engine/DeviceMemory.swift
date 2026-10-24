@@ -56,3 +56,57 @@ enum DeviceMemory {
         return .tooLarge
     }
 }
+
+extension DeviceMemory {
+    /// 今のメモリの見積もり（測れない環境では nil）
+    static var budget: MemoryBudget? {
+        let available = availableBytes
+        guard available > 0 else { return nil }
+        return MemoryBudget(available: available, appLimit: (footprintBytes ?? 0) + available)
+    }
+}
+
+/// 推論の 1 回ごとにメモリを確かめる。足りなくなったら、iOS に強制終了される前に自分で止める。
+/// InferenceEngine（actor）の中だけで使う。
+final class MemoryGate {
+    /// 語彙数と logits 1 つあたりのバイト数（1 回の出力の大きさの見積もりに使う）
+    var vocabSize = 32_000
+    var bytesPerLogit = 2
+    /// iOS からメモリ不足の警告を受けた（しばらくは控えめに計算する）
+    private(set) var warnedAt: Date?
+
+    func noteWarning() { warnedAt = Date() }
+
+    private var recentlyWarned: Bool {
+        guard let warnedAt else { return false }
+        return Date().timeIntervalSince(warnedAt) < 90
+    }
+
+    /// 計算の前に呼ぶ。残りが危ないところまで減っていたら EngineError.lowMemory を投げる。
+    func check() throws {
+        guard let budget = DeviceMemory.budget else { return }
+        if budget.isCritical || (recentlyWarned && budget.isLow) {
+            throw EngineError.lowMemory(available: budget.available)
+        }
+    }
+
+    /// プロンプトを流し込む 1 回あたりのトークン数（メモリが少ないほど小さくする）
+    func chunk(_ requested: Int) -> Int {
+        guard let budget = DeviceMemory.budget else { return requested }
+        var size = budget.prefillChunk(requested: requested, vocabSize: vocabSize, bytesPerLogit: bytesPerLogit)
+        if recentlyWarned { size = min(size, 16) }
+        return size
+    }
+
+    /// 毎回系列全体を入力するモデルで、安全に扱える長さ（測れなければ nil）
+    func statelessLimit() -> Int? {
+        DeviceMemory.budget?.statelessTokenLimit(vocabSize: vocabSize, bytesPerLogit: bytesPerLogit)
+    }
+
+    /// 新しく確保する bytes が、危ないところまで食い込まないか
+    func canAllocate(_ bytes: Int64) -> Bool {
+        guard let budget = DeviceMemory.budget else { return true }
+        return budget.available - bytes > budget.critical
+    }
+}
+

@@ -420,6 +420,17 @@ enum ByteFormat { static func string(_ bytes: Int64) -> String }   // 例: "1.9 
 - `InferenceEngine`（actor）: モデルとトークナイザの読み込み、生成ループ（`AsyncThrowingStream` でイベントを返す）、統計。
   `GenerationRequest.tools` があればテンプレートに `tools` を渡す（対応していないテンプレートには説明文で代用）。
 
+### メモリを使い切らない（落ちる前に止める）
+
+- `MemoryBudget`（Core/Generation）: 残り（`os_proc_available_memory`）とアプリの上限から、危ない線（`critical`）・少ない線（`low`）、
+  プロンプトを流し込む 1 回の大きさ（logits [n, 語彙] が収まる n）、毎回全体を入力するモデルで扱える長さを計算する。
+- `MemoryGate`（Engine/DeviceMemory）: prefill のチャンクごと・生成の 1 トークンごとに残りを確かめ、危なければ `EngineError.lowMemory`。
+  エンジンはそれを `StopReason.lowMemory` として普通に終わらせる（iOS に強制終了されない）。メモリ警告のあとはしばらく控えめにし、
+  生成していなければ KV キャッシュを捨てる。読み込んだときより大きく増えていたら、次の生成の前にモデルだけ読み直して空ける。
+  KV キャッシュを作る前に、その大きさ（`stateBytes`）が空きに収まるかも確かめる。
+- CDWS: `AgentContext.compact` で、直近の依頼だけ・古いツールの結果は 1 行・書いたファイルの中身（引数）は省いて渡す。
+  メモリ不足で止まったあとは `Budget.tight` でさらに短くする。
+
 ## Storage / App / UI（iOS 専用）
 
 - SwiftData: `Conversation`（タイトル、作成・更新日時、使ったモデル ID）と `StoredMessage`（役割、本文、順番、統計）。
@@ -474,6 +485,20 @@ struct WorkspaceToolExecutor { func execute(_:roadmap:) -> WorkspaceToolResult; 
 enum CodingAgentPrompt { static func system(...), implement(_:), brainstorm(from:count:), planRoadmap(goal:) }
 enum SyntaxHighlighter { static func tokens(in:language:) -> [HighlightToken] }   // UTF-16 の位置
 ```
+
+## Core/Tokenizer: tokenizer.json の無いモデル（TokenizerSynthesizer）
+
+- `tokenizer.model`（SentencePiece の BPE）・`vocab.json` + `merges.txt`（バイト単位の BPE）・tiktoken 形式から、
+  `transformers` の変換と同じ規則で tokenizer.json を作る（結合規則はピースを 2 つに分けて両方が語彙にあるもの、並びはスコア・順位）。
+  作ったものは `tokenizer.synthesized.json` としてモデルのフォルダに取っておく。
+- どれも無ければ `TokenizerFallback` が base_model や名前から系列を推測して、公開リポジトリから tokenizer.json などを
+  `tokenizer-source/` に取ってくる。
+- テストで、作ったトークナイザが元の tokenizer.json と同じトークン列になることを確かめている（TinyLlama・Gemma 2・Qwen2.5・Llama 3.2）
+
+## Core/Hub: 分けて置かれたモデル（SplitParts・ModelArchiveExpander）
+
+- `weight.bin.part1`…・`model.zip.001`…・`-00001-of-00003`・`.partaa`… を 1 つのファイルとして調べ、ダウンロード後につなげる。
+- 部品ごとの `X.mlmodelc.zip` は分割モデルの部品として扱い、ダウンロード後にその場で展開する（中にフォルダがあっても無くてもよい）。
 
 ## Core/Hub: コンテキスト長の変更（ContextResizer）
 

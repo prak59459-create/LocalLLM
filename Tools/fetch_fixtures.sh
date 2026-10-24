@@ -23,7 +23,7 @@ TOKENIZER_REPOS=(
   "unsloth/gemma-2-2b-it"
   "unsloth/mistral-7b-instruct-v0.3"
 )
-SUPPORT_FILES=(tokenizer.json tokenizer_config.json generation_config.json config.json special_tokens_map.json chat_template.jinja chat_template.json)
+SUPPORT_FILES=(tokenizer.json tokenizer_config.json generation_config.json config.json special_tokens_map.json chat_template.jinja chat_template.json tokenizer.model)
 
 for repo in "${TOKENIZER_REPOS[@]}"; do
   dir="$OUT/tokenizers/${repo//\//__}"

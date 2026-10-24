@@ -79,7 +79,7 @@ private struct ConsoleView: View {
             .padding(.vertical, 4)
             ConsoleLines(lines: session.consoleLines)
         }
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(CDWSTheme.panel)
     }
 }
 

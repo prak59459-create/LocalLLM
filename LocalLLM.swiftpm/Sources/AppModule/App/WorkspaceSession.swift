@@ -119,6 +119,8 @@ final class WorkspaceSession {
     private(set) var pendingApproval: PendingApproval?
     /// エージェントの欄を開いてほしいとき（ロードマップから依頼したときなど）に増える
     private(set) var agentPanelRequest = 0
+    /// 直近にモデルへ渡したプロンプトのトークン数（下の帯のメーターに出す）
+    private(set) var lastPromptTokens = 0
     var notice: String?
     var approvalMode: AgentApprovalMode {
         didSet { UserDefaults.standard.set(approvalMode.rawValue, forKey: "cdws.approvalMode") }
@@ -589,7 +591,8 @@ final class WorkspaceSession {
             messages.append(message)
             streamingMessageID = message.id
             agentStatus = L("考えています…", "Thinking…")
-        case .promptReady(_, let dropped):
+        case .promptReady(let tokens, let dropped):
+            lastPromptTokens = tokens
             if dropped > 0 {
                 notice = L("コンテキストに収まらないため、古いやり取り \(dropped) 件を省きました。",
                            "\(dropped) older messages were left out to fit the context.")

@@ -114,6 +114,7 @@ final class ChatController {
                 }
                 let files = try await library.prepareFiles(for: id)
                 loadState = .loading(model.displayName)
+                await engine.setContextLimit(settings.contextLimit)
                 let info = try await engine.load(files: files,
                                                  computeUnits: settings.computeUnits,
                                                  prefillChunkSize: settings.prefillChunkSize)
@@ -126,6 +127,21 @@ final class ChatController {
             }
             refreshMemory()
         }
+    }
+
+    /// モデルを解放して、終わるまで待つ（モデルのファイルを書き換える前など）。
+    func unloadModelAndWait() async {
+        stopGenerating()
+        loadTask?.cancel()
+        await engine.unload()
+        loadState = .idle
+        refreshMemory()
+    }
+
+    /// 実際に使えるコンテキスト長（設定の上限を考えたもの）
+    func effectiveContext(settings: AppSettings) -> Int? {
+        guard let info = loadedInfo else { return nil }
+        return settings.contextLimit > 0 ? min(info.maxContext, max(settings.contextLimit, 256)) : info.maxContext
     }
 
     /// モデルを解放する。

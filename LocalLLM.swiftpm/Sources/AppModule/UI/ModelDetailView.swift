@@ -182,6 +182,36 @@ private struct SupportFilesSection: View {
     }
 }
 
+/// コンテキスト長（一度に覚えておける長さ）と、あとから広げられることの案内。
+private struct ContextInfoLine: View {
+    let context: Int?
+    let stateBytes: Int64?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let context {
+                HStack(spacing: 6) {
+                    Image(systemName: "text.alignleft")
+                    Text(L("コンテキスト長 \(context.formatted()) トークン", "Context length \(context.formatted()) tokens"))
+                        .fontWeight(.semibold)
+                    if let stateBytes, stateBytes > 0 {
+                        Text(L("（KV キャッシュ \(ByteFormat.string(stateBytes))）", "(KV cache \(ByteFormat.string(stateBytes)))"))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(L("ダウンロード後に「コンテキスト長…」から、最大 128k トークンまで広げられます（メモリが足りる範囲で）。",
+                       "After downloading, you can extend it up to 128k tokens from \"Context…\" (as far as memory allows)."))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Label(L("コンテキスト長はダウンロード後に表示します", "The context length is shown after download"), systemImage: "text.alignleft")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
+    }
+}
+
 /// 分割モデルの部品の一覧。
 private struct PipelinePartsView: View {
     let pipeline: PipelineDescriptor
@@ -258,6 +288,8 @@ private struct VariantRow: View {
             }
 
             compatibility
+            ContextInfoLine(context: metadata?.interface.maxContext ?? variant.pipeline?.contextLength,
+                            stateBytes: metadata?.stateBytes)
             memoryEstimate
             actions
         }

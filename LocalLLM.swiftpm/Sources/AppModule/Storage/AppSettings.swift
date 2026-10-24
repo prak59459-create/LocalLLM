@@ -99,6 +99,10 @@ final class AppSettings {
     var toolsEnabled: Bool {
         didSet { defaults.set(toolsEnabled, forKey: Keys.toolsEnabled) }
     }
+    /// 1 回に使うコンテキストの上限（0 ならモデルの最大まで）。メモリと速度を節約したいときに小さくする。
+    var contextLimit: Int {
+        didSet { defaults.set(contextLimit, forKey: Keys.contextLimit) }
+    }
     /// Hugging Face のアクセストークン（ゲート付きモデル用。任意）
     var huggingFaceToken: String {
         didSet { Keychain.set(huggingFaceToken, for: Keys.huggingFaceToken) }
@@ -122,6 +126,7 @@ final class AppSettings {
         autoLoadLastModel = defaults.object(forKey: Keys.autoLoadLastModel) as? Bool ?? true
         huggingFaceToken = Keychain.get(Keys.huggingFaceToken) ?? ""
         toolsEnabled = defaults.object(forKey: Keys.toolsEnabled) as? Bool ?? true
+        contextLimit = max(0, defaults.integer(forKey: Keys.contextLimit))
     }
 
     /// 生成パラメータを既定値に戻す。
@@ -146,6 +151,7 @@ final class AppSettings {
         static let autoLoadLastModel = "autoLoadLastModel"
         static let huggingFaceToken = "huggingFaceToken"
         static let toolsEnabled = "toolsEnabled"
+        static let contextLimit = "contextLimit"
     }
 
     private func saveCodable<T: Encodable>(_ value: T, forKey key: String) {

@@ -50,6 +50,7 @@ actor InferenceEngine {
     private var loaded: Loaded?
     private var currentTask: Task<Void, Never>?
     private var prefillChunkSize = 128
+    private var contextLimit = 0
     /// 読み込みのたびに増やす。読み込み中に別の読み込み・解放が来たら、古いほうの結果は捨てる。
     private var loadGeneration = 0
 
@@ -117,6 +118,11 @@ actor InferenceEngine {
     }
 
     /// 次の生成から使う（生成中のものには影響しない）。
+    /// 1 回に使うコンテキストの上限（0 ならモデルの最大まで）
+    func setContextLimit(_ limit: Int) {
+        contextLimit = max(0, limit)
+    }
+
     func setPrefillChunkSize(_ size: Int) {
         prefillChunkSize = max(1, size)
     }
@@ -177,7 +183,7 @@ actor InferenceEngine {
         let chunkSize = prefillChunkSize
         do {
             let parameters = request.parameters
-            let maxContext = loaded.model.maxContext
+            let maxContext = contextLimit > 0 ? min(loaded.model.maxContext, max(contextLimit, 256)) : loaded.model.maxContext
             // 生成用に残しておく枠（コンテキストの半分まで）。
             let reserve = max(16, min(parameters.maxNewTokens, maxContext / 2))
             let prompt = try PromptAssembler.assemble(

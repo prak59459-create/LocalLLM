@@ -45,6 +45,8 @@ final class ModelLibrary {
     private(set) var downloads: [String: DownloadState] = [:]
     /// .mlpackage をコンパイル中のモデル ID
     private(set) var compilingModelIDs: Set<String> = []
+    /// コンテキスト長を変えている途中のモデル ID
+    private(set) var resizingModelIDs: Set<String> = []
 
     @ObservationIgnored private var tasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var backgroundTasks: [String: UIBackgroundTaskIdentifier] = [:]
@@ -418,6 +420,112 @@ final class ModelLibrary {
         // 容量を節約するため、コンパイル前のパッケージは消す
         try? fileManager.removeItem(at: packageURL)
         return compiledPath
+    }
+
+    // MARK: - コンテキスト長
+
+    /// コンテキスト長の書き換えの対象になる .mlmodelc（分割モデルは本体のチャンクだけ）
+    private func contextTargets(for model: InstalledModel) -> [URL] {
+        let folder = directory(for: model)
+        switch model.kind {
+        case .pipeline:
+            return (model.pipeline?.chunks ?? []).map { folder.appendingPathComponent(model.localPath(for: $0)) }
+        case .compiled, .package:
+            return model.compiledModelPath.map { [folder.appendingPathComponent($0)] } ?? []
+        case .archive:
+            return []
+        }
+    }
+
+    private func contextBackup(for model: InstalledModel, index: Int) -> URL {
+        directory(for: model).appendingPathComponent(".context-backup", isDirectory: true)
+            .appendingPathComponent("part\(index)", isDirectory: true)
+    }
+
+    /// コンテキスト長を変えられるかを調べる（今の値・1 トークンあたりの KV キャッシュ）
+    func contextAnalysis(for id: String) async throws -> ContextResizer.Analysis {
+        // .mlpackage は先にコンパイルする
+        if let model = model(withID: id), needsCompilation(model) {
+            _ = try await prepareFiles(for: id)
+        }
+        guard let model = model(withID: id) else { throw ModelLibraryError.missingModelFolder }
+        let targets = contextTargets(for: model)
+        guard let first = targets.first else {
+            throw ContextResizer.ResizeError.unsupported(L("コンパイル済みのモデルが見つかりません", "no compiled model was found"))
+        }
+        return try await Task.detached(priority: .userInitiated) {
+            try ContextResizer.analyze(modelDirectory: first)
+        }.value
+    }
+
+    /// コンテキスト長を変える。書き換えたあと Core ML で読み込めるか確かめ、だめなら元に戻す。
+    func resizeContext(id: String, to newContext: Int) async throws {
+        if let model = model(withID: id), needsCompilation(model) {
+            _ = try await prepareFiles(for: id)
+        }
+        guard var model = model(withID: id) else { throw ModelLibraryError.missingModelFolder }
+        let targets = contextTargets(for: model)
+        guard !targets.isEmpty else {
+            throw ContextResizer.ResizeError.unsupported(L("コンパイル済みのモデルが見つかりません", "no compiled model was found"))
+        }
+        let backups = targets.indices.map { contextBackup(for: model, index: $0) }
+        resizingModelIDs.insert(id)
+        defer { resizingModelIDs.remove(id) }
+
+        let original = try await Task.detached(priority: .userInitiated) { () throws -> Int in
+            var originalContext = 0
+            do {
+                for (index, target) in targets.enumerated() {
+                    let analysis = try ContextResizer.resize(modelDirectory: target, to: newContext, backup: backups[index])
+                    originalContext = analysis.context
+                }
+                // 書き換えたモデルが読み込めるか（型や形の食い違いがあればここで分かる）
+                for target in targets {
+                    try ModelLoadCheck.verify(target)
+                }
+            } catch {
+                for (index, target) in targets.enumerated() {
+                    try? ContextResizer.restore(modelDirectory: target, backup: backups[index])
+                }
+                throw error
+            }
+            return originalContext
+        }.value
+
+        if model.originalContext == nil { model.originalContext = original }
+        if newContext == model.originalContext { model.originalContext = nil }
+        model.maxContext = newContext
+        if model.kind == .pipeline { model.pipeline?.contextLength = newContext }
+        // KV キャッシュの大きさを読み直す
+        if let first = targets.first, let data = try? Data(contentsOf: first.appendingPathComponent("metadata.json")),
+           let metadata = try? CoreMLMetadata.parse(data) {
+            model.stateBytes = metadata.stateBytes
+        }
+        try save(model)
+        replace(model)
+    }
+
+    /// 元のコンテキスト長に戻す
+    func restoreContext(id: String) async throws {
+        guard var model = model(withID: id), let original = model.originalContext else { return }
+        let targets = contextTargets(for: model)
+        let backups = targets.indices.map { contextBackup(for: model, index: $0) }
+        resizingModelIDs.insert(id)
+        defer { resizingModelIDs.remove(id) }
+        try await Task.detached(priority: .userInitiated) {
+            for (index, target) in targets.enumerated() {
+                try ContextResizer.restore(modelDirectory: target, backup: backups[index])
+            }
+        }.value
+        model.maxContext = original
+        if model.kind == .pipeline { model.pipeline?.contextLength = original }
+        if let first = targets.first, let data = try? Data(contentsOf: first.appendingPathComponent("metadata.json")),
+           let metadata = try? CoreMLMetadata.parse(data) {
+            model.stateBytes = metadata.stateBytes
+        }
+        model.originalContext = nil
+        try save(model)
+        replace(model)
     }
 
     // MARK: - 補助

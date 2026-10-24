@@ -154,6 +154,15 @@ private struct ExecutionSettingsSection: View {
             .onChange(of: settings.prefillChunkSize) { _, size in
                 Task { await chat.engine.setPrefillChunkSize(size) }
             }
+            Picker(L("コンテキストの上限", "Context limit"), selection: $settings.contextLimit) {
+                Text(L("モデルの最大まで", "Model maximum")).tag(0)
+                ForEach([1024, 2048, 4096, 8192, 16_384, 32_768, 65_536], id: \.self) { value in
+                    Text("\(value / 1024)k").tag(value)
+                }
+            }
+            .onChange(of: settings.contextLimit) { _, limit in
+                Task { await chat.engine.setContextLimit(limit) }
+            }
             Toggle(L("起動時に前回のモデルを読み込む", "Load last model at launch"), isOn: $settings.autoLoadLastModel)
             if let id = chat.loadedInfo?.modelID {
                 Button(L("今のモデルを読み込み直す", "Reload current model")) {
@@ -163,8 +172,8 @@ private struct ExecutionSettingsSection: View {
         } header: {
             Text(L("実行", "Execution"))
         } footer: {
-            Text(L("計算ユニットの変更は次の読み込みから有効です。「自動」は分割モデルを Neural Engine、それ以外を GPU で動かします。分割サイズを小さくするとメモリを節約できますが、読み込みは遅くなります。",
-                   "Compute unit changes apply on the next load. Automatic runs split models on the Neural Engine and others on the GPU. A smaller chunk size saves memory but reads prompts more slowly."))
+            Text(L("計算ユニットの変更は次の読み込みから有効です。「自動」は分割モデルを Neural Engine、それ以外を GPU で動かします。分割サイズを小さくするとメモリを節約できますが、読み込みは遅くなります。コンテキストの上限を小さくすると、長い会話で古いメッセージを早めに省いて速度とメモリを保ちます（モデル自体の長さは「モデル → インストール済み → コンテキスト長…」で広げられます）。",
+                   "Compute unit changes apply on the next load. Automatic runs split models on the Neural Engine and others on the GPU. A smaller chunk size saves memory but reads prompts more slowly. A lower context limit drops old messages earlier to keep long chats fast (extend the model itself under Models → Installed → Context…)."))
         }
     }
 }

@@ -355,6 +355,7 @@ struct ModelPickerMenu: View {
 /// 速度とメモリの表示。
 struct StatsBar: View {
     @Environment(ChatController.self) private var chat
+    @Environment(AppSettings.self) private var settings
 
     var body: some View {
         HStack(spacing: 14) {
@@ -379,6 +380,7 @@ struct StatsBar: View {
                        "In \(stats.promptTokens) (reused \(stats.reusedPromptTokens)) · Out \(stats.generatedTokens)"))
             }
             Spacer(minLength: 8)
+            ContextUsageLabel(used: contextUsed, total: chat.effectiveContext(settings: settings))
             if let footprint = chat.memoryFootprint {
                 Label(L("使用 \(ByteFormat.string(footprint))・残り \(ByteFormat.string(chat.memoryAvailable))",
                         "Used \(ByteFormat.string(footprint)) · Free \(ByteFormat.string(chat.memoryAvailable))"),
@@ -391,6 +393,29 @@ struct StatsBar: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
         .background(.bar)
+    }
+}
+
+extension StatsBar {
+    /// いまの会話で使っているコンテキスト（入力 + 出力）
+    fileprivate var contextUsed: Int? {
+        if let progress = chat.progress, progress.promptTokens > 0 { return progress.promptTokens }
+        if let stats = chat.lastStats { return stats.promptTokens + stats.generatedTokens }
+        return nil
+    }
+}
+
+/// 「文脈 1,234 / 4,096」の表示（8 割を超えたら色を変える）。
+private struct ContextUsageLabel: View {
+    let used: Int?
+    let total: Int?
+
+    var body: some View {
+        if let used, let total, total > 0 {
+            Label("\(used.formatted())/\(total.formatted())", systemImage: "text.alignleft")
+                .foregroundStyle(Double(used) / Double(total) > 0.8 ? Color.orange : Color.secondary)
+                .help(L("使っているコンテキスト / 最大", "Context used / maximum"))
+        }
     }
 }
 

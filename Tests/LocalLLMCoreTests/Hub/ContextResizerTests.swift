@@ -296,3 +296,12 @@ final class ContextResizerTests: XCTestCase {
         XCTAssertThrowsError(try ContextResizer.analyze(mil: mil))
     }
 }
+
+final class ModelConfigInfoTests: XCTestCase {
+    func testReadsTrainedLength() {
+        XCTAssertEqual(ModelConfigInfo.maxPositions(from: Data(#"{"max_position_embeddings": 32768}"#.utf8)), 32768)
+        XCTAssertEqual(ModelConfigInfo.maxPositions(from: Data(#"{"text_config": {"max_position_embeddings": 131072}}"#.utf8)), 131_072)
+        XCTAssertEqual(ModelConfigInfo.maxPositions(from: Data(#"{"n_positions": 1024}"#.utf8)), 1024)
+        XCTAssertNil(ModelConfigInfo.maxPositions(from: Data("{}".utf8)))
+    }
+}

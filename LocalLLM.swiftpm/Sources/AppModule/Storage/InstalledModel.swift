@@ -27,6 +27,8 @@ struct InstalledModel: Codable, Identifiable, Hashable, Sendable {
     var pipeline: PipelineDescriptor?
     /// ダウンロード先で名前を変えるフォルダ（拡張子の無いモデルのフォルダなど）
     var renames: [String: String]?
+    /// コンテキスト長を変える前の、元の最大コンテキスト長（変えていなければ nil）
+    var originalContext: Int?
 
     /// 端末上でのパス（リポジトリ内のパスから）
     func localPath(for repoPath: String) -> String {

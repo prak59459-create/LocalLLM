@@ -302,6 +302,11 @@ struct InstalledModelsList: View {
     var onDone: () -> Void
 
     @State private var deleting: InstalledModel?
+    @State private var contextModelID: ContextTarget?
+
+    struct ContextTarget: Identifiable {
+        var id: String
+    }
 
     var body: some View {
         List {
@@ -311,54 +316,8 @@ struct InstalledModelsList: View {
                     .foregroundStyle(.secondary)
             }
             ForEach(library.models) { model in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(model.displayName).font(.headline)
-                            Text(model.repoID).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if chat.loadedInfo?.modelID == model.id {
-                            Badge(text: L("使用中", "In use"), color: .green)
-                        }
-                    }
-                    HStack(spacing: 10) {
-                        Text(ByteFormat.string(model.totalBytes))
-                        if let context = model.maxContext {
-                            Text(L("最大 \(context) トークン", "Up to \(context) tokens"))
-                        }
-                        Text(model.kindLabel)
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                    if let state = library.downloads[model.id], !model.isComplete {
-                        DownloadStatusView(state: state)
-                    }
-
-                    HStack {
-                        if model.isComplete {
-                            Button {
-                                chat.loadModel(id: model.id, library: library, settings: settings)
-                                onDone()
-                            } label: {
-                                Label(L("使う", "Use"), systemImage: "play.fill")
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(chat.loadedInfo?.modelID == model.id)
-                        } else {
-                            DownloadControls(modelID: model.id)
-                        }
-                        Spacer()
-                        Button(role: .destructive) {
-                            deleting = model
-                        } label: {
-                            Label(L("削除", "Delete"), systemImage: "trash")
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-                .padding(.vertical, 4)
+                InstalledModelRow(model: model, onDone: onDone, onDelete: { deleting = model },
+                                  onContext: { contextModelID = ContextTarget(id: model.id) })
             }
 
             Section {
@@ -381,6 +340,83 @@ struct InstalledModelsList: View {
             }
         } message: {
             Text(deleting.map { "\($0.displayName)（\(ByteFormat.string($0.totalBytes))）" } ?? "")
+        }
+        .sheet(item: $contextModelID) { target in
+            ContextSettingsView(modelID: target.id)
+        }
+    }
+}
+
+/// インストール済みのモデル 1 つ分の行。
+private struct InstalledModelRow: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(ModelLibrary.self) private var library
+    @Environment(ChatController.self) private var chat
+    let model: InstalledModel
+    var onDone: () -> Void
+    var onDelete: () -> Void
+    var onContext: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.displayName).font(.headline)
+                    Text(model.repoID).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if chat.loadedInfo?.modelID == model.id {
+                    Badge(text: L("使用中", "In use"), color: .green)
+                }
+            }
+            details
+            if let state = library.downloads[model.id], !model.isComplete {
+                DownloadStatusView(state: state)
+            }
+            actions
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var details: some View {
+        HStack(spacing: 10) {
+            Text(ByteFormat.string(model.totalBytes))
+            if let context = model.maxContext {
+                Label(L("最大 \(context.formatted()) トークン", "Up to \(context.formatted()) tokens"), systemImage: "text.alignleft")
+            }
+            if model.originalContext != nil {
+                Badge(text: L("拡張済み", "Extended"), color: .purple)
+            }
+            Text(model.kindLabel)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private var actions: some View {
+        HStack {
+            if model.isComplete {
+                Button {
+                    chat.loadModel(id: model.id, library: library, settings: settings)
+                    onDone()
+                } label: {
+                    Label(L("使う", "Use"), systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(chat.loadedInfo?.modelID == model.id)
+                Button(action: onContext) {
+                    Label(L("コンテキスト長…", "Context…"), systemImage: "arrow.up.left.and.arrow.down.right")
+                }
+                .buttonStyle(.bordered)
+                .disabled(library.resizingModelIDs.contains(model.id))
+            } else {
+                DownloadControls(modelID: model.id)
+            }
+            Spacer()
+            Button(role: .destructive, action: onDelete) {
+                Label(L("削除", "Delete"), systemImage: "trash")
+            }
+            .buttonStyle(.bordered)
         }
     }
 }

@@ -641,3 +641,18 @@ enum ContextResizer {
         return redirects
     }
 }
+
+/// config.json から分かる、モデルの学習時の最大の長さ。
+enum ModelConfigInfo {
+    static func maxPositions(from data: Data) -> Int? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let keys = ["max_position_embeddings", "n_positions", "max_sequence_length", "seq_length", "n_ctx"]
+        for candidate in [object, object["text_config"] as? [String: Any] ?? [:]] {
+            for key in keys {
+                if let value = candidate[key] as? Int, value > 0 { return value }
+                if let value = candidate[key] as? Double, value > 0 { return Int(value) }
+            }
+        }
+        return nil
+    }
+}

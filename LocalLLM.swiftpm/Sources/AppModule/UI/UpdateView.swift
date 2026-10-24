@@ -658,21 +658,34 @@ private struct UpdateFilePreviewView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(change.path).font(.caption.monospaced()).foregroundStyle(.secondary)
-                    UpdatePreviewContent(preview: preview)
-                }
-                .padding()
+            UpdatePreviewScroll(path: change.path, preview: preview)
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { closeButton }
+                .task { preview = await updater.preview(change) }
+        }
+    }
+
+    private var title: String { PackageScanner.lastComponent(change.path) }
+
+    private var closeButton: some ToolbarContent {
+        ToolbarItem(placement: .confirmationAction) {
+            Button(L("閉じる", "Close")) { dismiss() }
+        }
+    }
+}
+
+private struct UpdatePreviewScroll: View {
+    let path: String
+    let preview: AppUpdateController.FilePreview?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(path).font(.caption.monospaced()).foregroundStyle(.secondary)
+                UpdatePreviewContent(preview: preview)
             }
-            .navigationTitle(change.path.split(separator: "/").last.map(String.init) ?? change.path)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(L("閉じる", "Close")) { dismiss() }
-                }
-            }
-            .task { preview = await updater.preview(change) }
+            .padding()
         }
     }
 }

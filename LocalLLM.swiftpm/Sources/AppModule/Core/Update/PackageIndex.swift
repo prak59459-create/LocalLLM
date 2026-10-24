@@ -94,6 +94,30 @@ enum PackageScanner {
         return PackageIndex(files: files, placeholders: placeholders.filter { files[$0] == nil }, unreadable: unreadable)
     }
 
+    /// パスの最後の名前（"a/B.swiftpm/" → "B.swiftpm"、"" → ""）
+    static func lastComponent(_ path: String) -> String {
+        guard let last = path.split(separator: "/").last else { return "" }
+        return String(last)
+    }
+
+    /// パッケージの候補から 1 つ選ぶ: preferredNames の名前 → いちばん浅い .swiftpm → いちばん浅いもの
+    static func pickPreferred(_ candidates: [String], preferredNames: [String]) -> String? {
+        for wanted in preferredNames {
+            if let match = candidates.first(where: { lastComponent($0) == wanted }) { return match }
+        }
+        let swiftpm = candidates.filter { lastComponent($0).hasSuffix(".swiftpm") }
+        return shortest(swiftpm) ?? shortest(candidates)
+    }
+
+    private static func shortest(_ items: [String]) -> String? {
+        var best: String?
+        for item in items {
+            if let current = best, current.count <= item.count { continue }
+            best = item
+        }
+        return best
+    }
+
     /// 1 つのファイルの識別子（無ければ nil）
     static func sha(of path: String, in root: URL) -> String? {
         (try? Data(contentsOf: root.appendingPathComponent(path), options: .mappedIfSafe)).map(GitBlob.sha(of:))
@@ -107,28 +131,26 @@ struct RemotePackage: Sendable {
     var files: [String: PackageFile]
 
     var manifest: [String: String] { files.mapValues(\.sha) }
-    var name: String { prefix.isEmpty ? "" : String(prefix.dropLast()).split(separator: "/").last.map(String.init) ?? "" }
+    var name: String { PackageScanner.lastComponent(prefix) }
 
     /// ファイル一覧からパッケージを探す。preferredNames の名前のものを優先する。
     static func locate(in tree: GitHubTree, preferredNames: [String]) -> RemotePackage? {
-        let blobs = tree.entries.filter(\.isFile)
-        let folders = Set(tree.entries.filter { !$0.isFile }.map(\.path))
+        var blobs: [GitHubTreeEntry] = []
+        var folders = Set<String>()
+        for entry in tree.entries {
+            if entry.isFile { blobs.append(entry) } else { folders.insert(entry.path) }
+        }
         var prefixes: [String] = []
         for entry in blobs where entry.path == "Package.swift" || entry.path.hasSuffix("/Package.swift") {
             let prefix = String(entry.path.dropLast("Package.swift".count))
-            guard !PackageScanner.isIgnored(prefix) else { continue }
+            if PackageScanner.isIgnored(prefix) { continue }
             let sources = prefix + "Sources"
-            if folders.contains(sources) || blobs.contains(where: { $0.path.hasPrefix(sources + "/") }) {
+            let sourcesPrefix = sources + "/"
+            if folders.contains(sources) || blobs.contains(where: { $0.path.hasPrefix(sourcesPrefix) }) {
                 prefixes.append(prefix)
             }
         }
-        func name(_ prefix: String) -> String {
-            prefix.isEmpty ? "" : String(prefix.dropLast()).split(separator: "/").last.map(String.init) ?? ""
-        }
-        let chosen = preferredNames.lazy.compactMap { wanted in prefixes.first { name($0) == wanted } }.first
-            ?? prefixes.filter { $0.hasSuffix(".swiftpm/") }.min { $0.count < $1.count }
-            ?? prefixes.min { $0.count < $1.count }
-        guard let prefix = chosen else { return nil }
+        guard let prefix = PackageScanner.pickPreferred(prefixes, preferredNames: preferredNames) else { return nil }
         return make(prefix: prefix, entries: blobs)
     }
 
@@ -202,11 +224,8 @@ enum UpdateTargetResolver {
     static func findPackage(in folder: URL, preferredNames: [String]) -> URL? {
         if PackageScanner.isPackage(folder) { return folder }
         let found = packages(in: folder, depth: 4)
-        func name(_ path: String) -> String { path.split(separator: "/").last.map(String.init) ?? path }
-        let chosen = preferredNames.lazy.compactMap { wanted in found.first { name($0) == wanted } }.first
-            ?? found.filter { $0.hasSuffix(".swiftpm") }.min { $0.count < $1.count }
-            ?? found.min { $0.count < $1.count }
-        return chosen.map { folder.appendingPathComponent($0, isDirectory: true) }
+        guard let chosen = PackageScanner.pickPreferred(found, preferredNames: preferredNames) else { return nil }
+        return folder.appendingPathComponent(chosen, isDirectory: true)
     }
 }
 

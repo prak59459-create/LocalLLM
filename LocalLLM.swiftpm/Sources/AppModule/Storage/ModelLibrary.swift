@@ -28,8 +28,8 @@ enum ModelLibraryError: Error, LocalizedError {
         case .incomplete:
             return L("ダウンロードが完了していません。", "The download has not finished.")
         case .missingTokenizer:
-            return L("tokenizer.json が見つかりません。このリポジトリには対応するトークナイザが含まれていない可能性があります。",
-                     "tokenizer.json was not found. This repository may not include a compatible tokenizer.")
+            return L("トークナイザが見つかりません。tokenizer.json・tokenizer.model・vocab.json + merges.txt のどれも無く、元のモデルからも取ってこられませんでした（ネットにつないでもう一度読み込むと、取ってこられることがあります）。",
+                     "No tokenizer was found: there is no tokenizer.json, tokenizer.model or vocab.json + merges.txt, and none could be fetched from the base model (try loading again while online).")
         case .missingModelFolder:
             return L("モデルのファイルが見つかりません。削除してもう一度ダウンロードしてください。",
                      "The model files are missing. Delete the model and download it again.")
@@ -317,7 +317,7 @@ final class ModelLibrary {
     }
 
     /// 推論エンジンに渡すファイル一式を用意する。.mlpackage なら初回だけコンパイルする（数十秒〜数分）。
-    func prepareFiles(for id: String) async throws -> ModelFiles {
+    func prepareFiles(for id: String, client: HFClient? = nil) async throws -> ModelFiles {
         guard var model = model(withID: id) else { throw ModelLibraryError.missingModelFolder }
         guard model.isComplete else { throw ModelLibraryError.incomplete }
         let folder = directory(for: model)
@@ -372,11 +372,16 @@ final class ModelLibrary {
             source = .single(folder.appendingPathComponent(compiledPath))
         }
 
-        guard let tokenizerPath = model.supportFilePath(named: "tokenizer.json") else { throw ModelLibraryError.missingTokenizer }
+        let tokenizerURL = try await tokenizerURL(for: model, in: folder, client: client)
+        // 取ってきたトークナイザの付属ファイル（モデルのリポジトリに無いときに使う）
+        let fallbackFolder = folder.appendingPathComponent(Self.fallbackTokenizerFolder, isDirectory: true)
 
         func url(_ name: String) -> URL? {
-            model.supportFilePath(named: name).map { folder.appendingPathComponent(model.localPath(for: $0)) }
+            let own = model.supportFilePath(named: name).map { folder.appendingPathComponent(model.localPath(for: $0)) }
                 .flatMap { fileManager.fileExists(atPath: $0.path) ? $0 : nil }
+            if let own { return own }
+            let fetched = fallbackFolder.appendingPathComponent(name)
+            return fileManager.fileExists(atPath: fetched.path) ? fetched : nil
         }
 
         // chat_template.jinja / chat_template.json があれば tokenizer_config.json の chat_template より優先する
@@ -394,13 +399,63 @@ final class ModelLibrary {
             modelID: model.id,
             displayName: model.displayName,
             source: source,
-            tokenizerJSON: folder.appendingPathComponent(model.localPath(for: tokenizerPath)),
+            tokenizerJSON: tokenizerURL,
             tokenizerConfigJSON: url("tokenizer_config.json"),
             generationConfigJSON: url("generation_config.json"),
             configJSON: url("config.json"),
             chatTemplateOverride: templateOverride,
             stateBytes: model.stateBytes
         )
+    }
+
+    // MARK: - トークナイザ
+
+    /// ほかのリポジトリから取ってきたトークナイザを置くフォルダ（モデルのフォルダの中）
+    static let fallbackTokenizerFolder = "tokenizer-source"
+    /// ほかの形式から作った tokenizer.json
+    static let synthesizedTokenizerName = "tokenizer.synthesized.json"
+
+    /// tokenizer.json の場所。無ければほかの形式（tokenizer.model、vocab.json + merges.txt、tiktoken）から作り（作ったものは取っておく）、
+    /// それも無ければ元のモデル（base_model）や同じ系列のモデルから取ってくる。
+    private func tokenizerURL(for model: InstalledModel, in folder: URL, client: HFClient?) async throws -> URL {
+        func local(_ name: String) -> URL? {
+            model.supportFilePath(named: name).map { folder.appendingPathComponent(model.localPath(for: $0)) }
+                .flatMap { fileManager.fileExists(atPath: $0.path) ? $0 : nil }
+        }
+        if let own = local("tokenizer.json") { return own }
+        let synthesized = folder.appendingPathComponent(Self.synthesizedTokenizerName)
+        if fileManager.fileExists(atPath: synthesized.path) { return synthesized }
+        let fetched = folder.appendingPathComponent(Self.fallbackTokenizerFolder).appendingPathComponent("tokenizer.json")
+        if fileManager.fileExists(atPath: fetched.path) { return fetched }
+
+        let tiktoken = model.files.map(\.path).first { $0.hasSuffix(".tiktoken") }
+            .map { folder.appendingPathComponent(model.localPath(for: $0)) }
+        let files = TokenizerSynthesizer.Files(tokenizerJSON: nil,
+                                               tokenizerModel: local("tokenizer.model") ?? local("spiece.model") ?? local("sentencepiece.bpe.model"),
+                                               vocabJSON: local("vocab.json"), mergesText: local("merges.txt"),
+                                               tiktoken: tiktoken, addedTokensJSON: local("added_tokens.json"))
+        if files.canSynthesize {
+            let config = local("tokenizer_config.json")
+            try await Task.detached(priority: .userInitiated) {
+                guard let source = try TokenizerSynthesizer.source(for: files) else { throw ModelLibraryError.missingTokenizer }
+                let data = try TokenizerSynthesizer.tokenizerJSON(from: source,
+                                                                  tokenizerConfig: config.flatMap { try? Data(contentsOf: $0) },
+                                                                  addedTokensJSON: files.addedTokensJSON.flatMap { try? Data(contentsOf: $0) })
+                try data.write(to: synthesized, options: .atomic)
+            }.value
+            return synthesized
+        }
+
+        // どの形式も無い: 元のモデルや同じ系列のモデルから取ってくる
+        guard let client else { throw ModelLibraryError.missingTokenizer }
+        var bases: [String] = []
+        if let info = try? await client.modelInfo(repo: model.repoID) { bases = info.baseModels }
+        let candidates = TokenizerFallback.candidates(repoID: model.repoID, baseModels: bases, names: [model.displayName])
+        let destination = folder.appendingPathComponent(Self.fallbackTokenizerFolder, isDirectory: true)
+        guard await TokenizerFallback.fetch(client: client, candidates: candidates, into: destination) != nil else {
+            throw ModelLibraryError.missingTokenizer
+        }
+        return fetched
     }
 
     /// .mlpackage をコンパイルして .mlmodelc にし、元のパッケージは消す。戻り値は .mlmodelc のパス。

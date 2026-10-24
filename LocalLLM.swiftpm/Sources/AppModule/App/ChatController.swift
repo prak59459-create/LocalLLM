@@ -115,7 +115,7 @@ final class ChatController {
                 } else {
                     loadState = .loading(model.displayName)
                 }
-                let files = try await library.prepareFiles(for: id)
+                let files = try await library.prepareFiles(for: id, client: settings.makeHFClient())
                 loadState = .loading(model.displayName)
                 await engine.setContextLimit(settings.contextLimit)
                 let info = try await engine.load(files: files,

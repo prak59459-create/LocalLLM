@@ -47,10 +47,13 @@ struct RepoAnalysis: Hashable, Sendable {
     var hasTokenizer: Bool
 
     /// ダウンロードする付属ファイルの名前
-    static let supportFileNames: Set<String> = [
+    static let supportFileNames: Set<String> = Set([
         "tokenizer.json", "tokenizer_config.json", "config.json", "generation_config.json",
         "special_tokens_map.json", "chat_template.jinja", "chat_template.json", "added_tokens.json",
-    ]
+    ]).union(TokenizerSynthesizer.alternativeFileNames)
+
+    /// tokenizer.json がそのまま入っているか（無くても、ほかの形式から作れることがある）
+    var hasTokenizerJSON: Bool { supportFiles.contains { ($0.path as NSString).lastPathComponent == "tokenizer.json" } }
 
     /// コンパイル済みモデルの直下にあるファイル・フォルダ
     static let compiledModelEntries: Set<String> = [
@@ -156,7 +159,8 @@ struct RepoAnalysis: Hashable, Sendable {
         let support = files.filter {
             supportFileNames.contains(($0.path as NSString).lastPathComponent) && !modelFiles.contains($0.path)
         }
-        let hasTokenizer = support.contains { ($0.path as NSString).lastPathComponent == "tokenizer.json" }
+        // tokenizer.json か、そこから作れるファイル（tokenizer.model、vocab.json + merges.txt など）があるか
+        let hasTokenizer = TokenizerSynthesizer.canBuild(fileNames: Set(support.map { ($0.path as NSString).lastPathComponent }))
         return RepoAnalysis(variants: variants, supportFiles: support.sorted { $0.path < $1.path }, hasTokenizer: hasTokenizer)
     }
 

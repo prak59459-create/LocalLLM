@@ -51,6 +51,8 @@ jobs:
       - name: Test
         env:
           LOCALLLM_LIVE_TESTS: "1"
+          # アプリの更新の本物の GitHub とのテストで使う（ランナーの IP で共有される回数制限を避ける）
+          GITHUB_TOKEN: ${{ github.token }}
         run: swift test
 
   core-tests-macos:
@@ -68,7 +70,7 @@ jobs:
         run: ./Tools/fetch_fixtures.sh
 
       - name: Test
-        run: swift test --filter "Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|PackageVersion|Tool|JSONValue|MCP|ContextResizer|ProtoWire|HalfAndBlob|RopeTable"
+        run: swift test --filter "Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|SHA1|GitHubSource|PackageManifest|UpdateDiff|PackageScanner|Tool|JSONValue|MCP|ContextResizer|ProtoWire|HalfAndBlob|RopeTable"
 
       # コンテキスト長を変えた本物のモデルを Core ML で読み込んで、元の長さを超えた位置で推論できるか確かめる
       - name: Download models for the Core ML end-to-end test

@@ -256,19 +256,39 @@ private struct DeviceSettingsSection: View {
 }
 
 private struct UpdateLinkSection: View {
+    @Environment(AppUpdateController.self) private var updater
+
     var body: some View {
         Section {
             NavigationLink {
                 UpdateView()
             } label: {
                 LabeledContent {
-                    Text(AppUpdateController.runningVersion).monospacedDigit()
+                    UpdateLinkValue(hasUpdate: updater.availableUpdate != nil)
                 } label: {
                     Label(L("アプリの更新", "Update the App"), systemImage: "arrow.down.app")
                 }
             }
         } header: {
             Text(L("このアプリ", "This app"))
+        }
+    }
+}
+
+private struct UpdateLinkValue: View {
+    let hasUpdate: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if hasUpdate {
+                Text(L("新しい版", "New"))
+                    .font(.caption.bold())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange, in: Capsule())
+                    .foregroundStyle(.white)
+            }
+            Text(AppUpdateController.runningVersion).monospacedDigit()
         }
     }
 }

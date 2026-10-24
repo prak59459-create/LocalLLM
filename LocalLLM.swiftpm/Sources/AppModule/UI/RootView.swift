@@ -6,6 +6,7 @@ struct RootView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(ModelLibrary.self) private var library
     @Environment(ChatController.self) private var chat
+    @Environment(AppUpdateController.self) private var updater
     @Environment(\.modelContext) private var context
     @Environment(\.scenePhase) private var scenePhase
 
@@ -59,6 +60,8 @@ struct RootView: View {
         .task {
             removeEmptyConversations(except: nil)
             autoLoadIfNeeded()
+            // GitHub に新しい版があるかだけを軽く確かめる（設定の「アプリの更新」に印が付く）
+            await updater.checkInBackgroundIfNeeded()
         }
         // 何も話さなかった会話は、ほかの会話に移ったときに消す（履歴に空の会話を残さない）
         .onChange(of: selectedConversationID) { _, newID in

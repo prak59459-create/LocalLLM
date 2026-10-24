@@ -87,7 +87,7 @@ final class ContextResizeCoreMLTests: XCTestCase {
 
         let original = try MLModel(contentsOf: source, configuration: cpuConfiguration())
         let model = try MLModel(contentsOf: resized, configuration: cpuConfiguration())
-        XCTAssertEqual(model.modelDescription.stateDescriptionsByName["key_cache"]?.stateConstraint?.bufferShape.map(\.intValue),
+        XCTAssertEqual(model.modelDescription.stateDescriptionsByName["key_cache"]?.stateConstraint?.bufferShape,
                        [24, 1, 2, 4096, 64])
 
         // 短い入力: 元のモデルと同じ logits

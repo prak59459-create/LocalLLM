@@ -398,7 +398,8 @@ final class ModelLibrary {
             tokenizerConfigJSON: url("tokenizer_config.json"),
             generationConfigJSON: url("generation_config.json"),
             configJSON: url("config.json"),
-            chatTemplateOverride: templateOverride
+            chatTemplateOverride: templateOverride,
+            stateBytes: model.stateBytes
         )
     }
 

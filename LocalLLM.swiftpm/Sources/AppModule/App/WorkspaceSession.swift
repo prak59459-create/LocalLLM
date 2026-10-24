@@ -130,6 +130,8 @@ final class WorkspaceSession {
         didSet { UserDefaults.standard.set(useWebTools, forKey: "cdws.useWebTools") }
     }
 
+    /// メモリが足りなくなって止まったあとは、次の依頼でやり取りをさらに短くする
+    @ObservationIgnored private var compactHarder = false
     @ObservationIgnored private var agentTask: Task<Void, Never>?
     @ObservationIgnored private var approvalContinuation: CheckedContinuation<Bool, Never>?
     @ObservationIgnored private var saveTasks: [String: Task<Void, Never>] = [:]
@@ -518,21 +520,27 @@ final class WorkspaceSession {
         var parameters = settings.generation
         parameters.temperature = min(parameters.temperature, 0.4)
         parameters.repetitionPenalty = 1.0
-        parameters.maxNewTokens = max(parameters.maxNewTokens, 2048)
-        let javaScriptEnabled = toolProfile != .minimal
+        parameters.maxNewTokens = max(parameters.maxNewTokens, 1536)
+        let javaScriptEnabled = toolProfile == .full
         var tools = WorkspaceToolbox.definitions(profile: toolProfile, javaScript: javaScriptEnabled)
         if useWebTools {
             tools += [ConnectorStore.BuiltinTool.webSearch, .fetchPage].filter { connectors.isEnabled($0) }.map(\.definition)
         }
+        // 毎回送るものは小さく（長いコンテキストのモデルでも、ファイルの一覧などは控えめに）
+        let roomy = info.maxContext > 4096 && !compactHarder
         let notes = try? fileSystem.read("CDWS.md")
         let system = CodingAgentPrompt.system(projectName: project.name,
-                                              tree: fileSystem.tree(maxDepth: 3, maxEntries: info.maxContext > 4096 ? 150 : 60),
-                                              roadmap: roadmap.summary(maxNodes: info.maxContext > 4096 ? 40 : 15),
-                                              notes: notes, openFile: selectedPath, javaScript: javaScriptEnabled)
-        let configuration = AgentLoop.Configuration(systemPrompt: system, parameters: parameters,
+                                              tree: fileSystem.tree(maxDepth: 3, maxEntries: roomy ? 80 : 35),
+                                              roadmap: roadmap.summary(maxNodes: roomy ? 20 : 8),
+                                              notes: notes, openFile: selectedPath, javaScript: javaScriptEnabled,
+                                              usesRoadmap: toolProfile != .minimal)
+        let budget = compactHarder || info.maxContext <= 2048 ? AgentContext.Budget.tight : AgentContext.Budget()
+        compactHarder = false
+        var configuration = AgentLoop.Configuration(systemPrompt: system, parameters: parameters,
                                                     enableThinking: settings.thinkingMode.enableThinking,
                                                     tools: tools, maxRounds: 12)
-        let history = messages.suffix(40).map(\.chatMessage)
+        configuration.compact = { AgentContext.compact($0, budget: budget) }
+        let history = AgentContext.compact(messages.suffix(60).map(\.chatMessage), budget: budget)
         isAgentRunning = true
         agentStatus = L("考えています…", "Thinking…")
         notice = nil
@@ -588,20 +596,25 @@ final class WorkspaceSession {
             }
         case .prefill(let done, let total):
             agentStatus = L("読み込み \(done)/\(total)", "Reading \(done)/\(total)")
+        case .status(let text):
+            agentStatus = text
         case .text(let visible):
-            guard let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }) else { return }
-            // 画面の更新が重くならないよう、少しずつ伸びたときだけ反映する
-            if visible.count - messages[index].content.count >= 6 || visible.hasSuffix("\n") {
-                messages[index].content = visible
-            }
-            agentStatus = L("書いています…", "Writing…")
+            guard let id = streamingMessageID, let index = messages.lastIndex(where: { $0.id == id }) else { return }
+            // AgentLoop がまとめて送ってくるので、そのまま反映する
+            messages[index].content = visible
+            if agentStatus != L("書いています…", "Writing…") { agentStatus = L("書いています…", "Writing…") }
         case .assistantFinished(let content, let calls, let stats):
-            guard let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }) else { return }
+            guard let id = streamingMessageID, let index = messages.lastIndex(where: { $0.id == id }) else { return }
             messages[index].content = content
             messages[index].toolCalls = calls
             messages[index].stats = stats
             if content.isEmpty && calls.isEmpty { messages.remove(at: index) }
             streamingMessageID = nil
+            if stats.stopReason == .lowMemory {
+                compactHarder = true
+                notice = L("メモリが足りなくなりそうだったので、落ちないよう途中で止めました。もう一度送ると、やり取りをもっと短くして続けます。",
+                           "Stopped early to avoid running out of memory. Send again to continue with a shorter history.")
+            }
             saveMessages()
         case .toolStarted(let call):
             agentStatus = L("実行中: ", "Running: ") + call.summary

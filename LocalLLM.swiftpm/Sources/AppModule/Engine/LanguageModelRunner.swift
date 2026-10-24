@@ -25,6 +25,25 @@ protocol LanguageModelRunner: AnyObject {
     func append(token: Int) async throws -> NextTokenScores
     /// キャッシュを捨てる。
     func resetCache()
+    /// 毎回系列全体を入力する形式か（長いほど 1 回の計算でメモリを使う）
+    var isStateless: Bool { get }
+    /// KV キャッシュ（state）をまだ作っていないか
+    var needsNewState: Bool { get }
+    /// logits 1 つあたりのバイト数
+    var logitsElementBytes: Int { get }
+    /// 計算の前にメモリを確かめるもの
+    var gate: MemoryGate? { get set }
+}
+
+extension MLMultiArrayDataType {
+    /// 1 要素のバイト数
+    var byteCount: Int {
+        switch self {
+        case .float16: return 2
+        case .double: return 8
+        default: return 4
+        }
+    }
 }
 
 /// MLMultiArray の作成・読み出しの共通処理（最適化なしのビルドでも速いように、まとめて書き込む）。

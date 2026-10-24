@@ -196,7 +196,7 @@ struct ToolResultView: View {
         case "write_file", "edit_file", "create_file": return "square.and.pencil"
         case "delete_file", "move_file": return "folder.badge.gearshape"
         case "run_javascript": return "play.rectangle"
-        case "roadmap_add", "roadmap_update", "roadmap_list": return "point.3.connected.trianglepath.dotted"
+        case "roadmap", "roadmap_add", "roadmap_update", "roadmap_list": return "point.3.connected.trianglepath.dotted"
         default: return "wrench.and.screwdriver"
         }
     }
@@ -234,6 +234,7 @@ extension StopReason {
         case .contextFull: return L("コンテキスト上限", "Context full")
         case .cancelled: return L("停止しました", "Stopped")
         case .error: return L("エラー", "Error")
+        case .lowMemory: return L("メモリ不足で停止", "Stopped: low memory")
         }
     }
 }

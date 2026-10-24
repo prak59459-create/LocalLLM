@@ -38,6 +38,11 @@ final class PipelineLanguageModel: LanguageModelRunner {
     private let maskType: TensorSpec.DataType
     private var state: MLState?
     private var cachedTokens: [Int] = []
+    var gate: MemoryGate?
+    let isStateless = false
+    /// 出力層は最後のトークンの分しか計算しないので、logits の大きさは気にしなくてよい
+    let logitsElementBytes = 2
+    var needsNewState: Bool { state == nil }
 
     private init(descriptor: PipelineDescriptor, embeddings: MLModel?, chunks: [Chunk], lmHead: MLModel?,
                  computeUnits: MLComputeUnits) throws {
@@ -159,6 +164,7 @@ final class PipelineLanguageModel: LanguageModelRunner {
         progress?(position, tokens.count)
         while position < lastIndex {
             try Task.checkCancellation()
+            try gate?.check()
             if batchSize > 1, chunks[0].prefill != nil, position + batchSize <= maxContext {
                 let count = min(batchSize, lastIndex - position)
                 try await prefill(Array(tokens[position..<(position + count)]), at: position, state: state)

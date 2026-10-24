@@ -11,6 +11,8 @@ struct AgentLoop {
         var tools: [ToolDefinition]
         /// ツールを使う往復の上限
         var maxRounds: Int = 6
+        /// 毎回モデルに渡す前に、やり取りを短くする（コンテキストとメモリの節約）
+        var compact: (([ChatMessage]) -> [ChatMessage])? = nil
     }
 
     enum Event {
@@ -24,6 +26,8 @@ struct AgentLoop {
         case assistantFinished(content: String, calls: [ToolCall], stats: GenerationStats)
         case toolStarted(ToolCall)
         case toolFinished(ToolCall, ToolOutcome)
+        /// 途中経過のお知らせ（メモリを空けている、など）
+        case status(String)
     }
 
     /// ツールを実行する前の確認（false なら実行しない）
@@ -42,29 +46,44 @@ struct AgentLoop {
             // 最後の往復ではツールを渡さない（必ず文章で答えさせる）
             let isLastRound = round == configuration.maxRounds
             let tools = isLastRound ? [] : configuration.tools
-            let request = GenerationRequest(systemPrompt: configuration.systemPrompt, history: transcript,
+            let history = configuration.compact?(transcript) ?? transcript
+            let request = GenerationRequest(systemPrompt: configuration.systemPrompt, history: history,
                                             parameters: configuration.parameters,
                                             enableThinking: configuration.enableThinking, tools: tools)
             onEvent(.assistantStarted)
             var raw = ""
             var stats = GenerationStats()
+            // 画面の更新はまとめて行う（トークンごとに全体を読み直して描き直すと重い）
+            var shownLength = 0
+            var shownAt = Date.distantPast
             for try await event in engine.generate(request) {
                 switch event {
                 case .promptReady(let promptTokens, let dropped):
                     onEvent(.promptReady(promptTokens: promptTokens, droppedMessages: dropped))
                 case .prefill(let done, let total):
                     onEvent(.prefill(done: done, total: total))
+                case .status(let text):
+                    onEvent(.status(text))
                 case .text(let piece):
                     raw += piece
-                    onEvent(.text(tools.isEmpty ? raw : ToolCallParser.visiblePart(of: raw)))
+                    let now = Date()
+                    if raw.utf8.count - shownLength >= 48 || now.timeIntervalSince(shownAt) >= 0.12 {
+                        shownLength = raw.utf8.count
+                        shownAt = now
+                        onEvent(.text(tools.isEmpty ? raw : ToolCallParser.visiblePart(of: raw)))
+                    }
                 case .finished(let finalStats):
                     stats = finalStats
                 }
             }
+            if raw.utf8.count != shownLength {
+                onEvent(.text(tools.isEmpty ? raw : ToolCallParser.visiblePart(of: raw)))
+            }
             let parsed = tools.isEmpty ? ToolCallParser.Result(content: raw, calls: [])
                                        : ToolCallParser.parse(raw, knownTools: knownTools)
             onEvent(.assistantFinished(content: parsed.calls.isEmpty ? raw : parsed.content, calls: parsed.calls, stats: stats))
-            guard !parsed.calls.isEmpty, stats.stopReason != .cancelled else { return }
+            // 止めたとき・メモリが足りなくなったときは、ツールを実行せずに終わる
+            guard !parsed.calls.isEmpty, stats.stopReason != .cancelled, stats.stopReason != .lowMemory else { return }
 
             transcript.append(ChatMessage(role: .assistant, content: parsed.content, toolCalls: parsed.calls))
             for call in parsed.calls {

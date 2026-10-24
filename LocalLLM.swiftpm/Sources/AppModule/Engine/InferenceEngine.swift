@@ -19,6 +19,8 @@ enum GenerationEvent: Sendable {
     case prefill(done: Int, total: Int)
     /// 新しく確定した文字列
     case text(String)
+    /// 画面に出す途中経過（メモリを空けている、など）
+    case status(String)
     /// 終了（統計付き）
     case finished(GenerationStats)
 }
@@ -51,6 +53,14 @@ actor InferenceEngine {
     private var currentTask: Task<Void, Never>?
     private var prefillChunkSize = 128
     private var contextLimit = 0
+    /// 計算の前にメモリを確かめるもの（読み込んだモデルと共有する）
+    private let gate = MemoryGate()
+    /// 読み直しに使う、今のモデルのファイルと計算ユニット
+    private var reloadSource: (files: ModelFiles, units: ComputeUnitsOption)?
+    /// 読み込んだ直後のメモリ使用量（あとで増えすぎていないかを見る）
+    private var baselineFootprint: Int64?
+    /// 次の生成の前にモデルを読み直してメモリを空ける
+    private var needsReload = false
     /// 読み込みのたびに増やす。読み込み中に別の読み込み・解放が来たら、古いほうの結果は捨てる。
     private var loadGeneration = 0
 
@@ -79,15 +89,14 @@ actor InferenceEngine {
         var stopStrings = renderer.endOfTurnTokens
         if let eos = tokenizer.eosToken, !stopStrings.contains(eos) { stopStrings.append(eos) }
 
-        let model: LanguageModelRunner
-        switch files.source {
-        case .single(let url):
-            model = try await CoreMLLanguageModel.load(compiledModelURL: url, computeUnits: computeUnits.resolved(isPipeline: false))
-        case .pipeline(let pipeline):
-            model = try await PipelineLanguageModel.load(files: pipeline, computeUnits: computeUnits.resolved(isPipeline: true))
-        }
+        let model = try await Self.makeRunner(files: files, computeUnits: computeUnits)
         // 待っている間に別の読み込みや解放が始まっていたら、この結果は使わない
         guard generation == loadGeneration else { throw CancellationError() }
+        gate.vocabSize = tokenizer.vocabSize
+        gate.bytesPerLogit = model.logitsElementBytes
+        model.gate = gate
+        reloadSource = (files, computeUnits)
+        needsReload = false
 
         let info = LoadedModelInfo(
             modelID: files.modelID,
@@ -101,7 +110,51 @@ actor InferenceEngine {
         )
         loaded = Loaded(info: info, model: model, tokenizer: tokenizer, renderer: renderer,
                         stopTokenIDs: stopIDs, stopStrings: stopStrings.filter { !$0.isEmpty })
+        baselineFootprint = DeviceMemory.footprintBytes
         return info
+    }
+
+    private static func makeRunner(files: ModelFiles, computeUnits: ComputeUnitsOption) async throws -> LanguageModelRunner {
+        switch files.source {
+        case .single(let url):
+            return try await CoreMLLanguageModel.load(compiledModelURL: url, computeUnits: computeUnits.resolved(isPipeline: false))
+        case .pipeline(let pipeline):
+            return try await PipelineLanguageModel.load(files: pipeline, computeUnits: computeUnits.resolved(isPipeline: true))
+        }
+    }
+
+    /// iOS からメモリ不足の警告が来た。しばらく控えめに計算し、生成していなければ KV キャッシュを捨てて空ける。
+    func noteMemoryWarning() {
+        gate.noteWarning()
+        if currentTask == nil { loaded?.model.resetCache() }
+    }
+
+    /// Core ML の中に溜まったメモリを空けるため、モデルだけを読み直す（トークナイザなどはそのまま）
+    private func reloadRunner() async throws {
+        guard let source = reloadSource else { return }
+        var kept: (info: LoadedModelInfo, tokenizer: HFTokenizer, renderer: ChatTemplateRenderer, ids: Set<Int>, strings: [String])?
+        do {
+            if let current = loaded {
+                kept = (current.info, current.tokenizer, current.renderer, current.stopTokenIDs, current.stopStrings)
+            }
+        }
+        loaded = nil   // 先に古いモデルを手放す
+        guard let kept else { return }
+        let model = try await Self.makeRunner(files: source.files, computeUnits: source.units)
+        model.gate = gate
+        loaded = Loaded(info: kept.info, model: model, tokenizer: kept.tokenizer, renderer: kept.renderer,
+                        stopTokenIDs: kept.ids, stopStrings: kept.strings)
+        baselineFootprint = DeviceMemory.footprintBytes
+        needsReload = false
+    }
+
+    /// メモリ不足で止めたあと: まだ危なければ KV キャッシュを捨て、読み込んだときより大きく増えていれば次に読み直す
+    private func recoverFromLowMemory() {
+        if DeviceMemory.budget?.isLow ?? false { loaded?.model.resetCache() }
+        if let base = baselineFootprint, let now = DeviceMemory.footprintBytes,
+           now - base > max(300 << 20, base / 3) {
+            needsReload = true
+        }
     }
 
     /// モデルを解放する。
@@ -109,6 +162,8 @@ actor InferenceEngine {
         loadGeneration += 1
         await cancelCurrentGeneration()
         loaded = nil
+        reloadSource = nil
+        needsReload = false
     }
 
     /// 会話の途中経過（KV キャッシュ）を捨てる。生成中なら止めてから。
@@ -176,6 +231,15 @@ actor InferenceEngine {
             continuation.finish()
             return
         }
+        if needsReload {
+            continuation.yield(.status(L("メモリを空けるため、モデルを読み直しています…", "Reloading the model to free memory…")))
+            do {
+                try await reloadRunner()
+            } catch {
+                continuation.finish(throwing: error)
+                return
+            }
+        }
         guard let loaded else {
             continuation.finish(throwing: EngineError.modelNotLoaded)
             return
@@ -183,7 +247,15 @@ actor InferenceEngine {
         let chunkSize = prefillChunkSize
         do {
             let parameters = request.parameters
-            let maxContext = contextLimit > 0 ? min(loaded.model.maxContext, max(contextLimit, 256)) : loaded.model.maxContext
+            var maxContext = contextLimit > 0 ? min(loaded.model.maxContext, max(contextLimit, 256)) : loaded.model.maxContext
+            // 毎回系列全体を入力するモデルは、長いほど 1 回でメモリを使うので、今の空きで扱える長さまでにする
+            if loaded.model.isStateless, let limit = gate.statelessLimit() {
+                maxContext = max(64, min(maxContext, limit))
+            }
+            // KV キャッシュをこれから作るなら、その分の空きがあるか
+            if loaded.model.needsNewState, let bytes = reloadSource?.files.stateBytes, bytes > 0, !gate.canAllocate(bytes) {
+                throw EngineError.stateTooLarge(needed: bytes, available: DeviceMemory.availableBytes)
+            }
             // 生成用に残しておく枠（コンテキストの半分まで）。
             let reserve = max(16, min(parameters.maxNewTokens, maxContext / 2))
             let prompt = try PromptAssembler.assemble(
@@ -244,9 +316,14 @@ actor InferenceEngine {
                 if history.count >= maxContext { reason = .contextFull; break }
                 if stats.generatedTokens >= parameters.maxNewTokens { reason = .maxTokens; break }
                 do {
+                    // 落ちる前に止める（毎トークン、残りのメモリを確かめる）
+                    try gate.check()
                     scores = try await loaded.model.append(token: next)
                 } catch is CancellationError {
                     reason = .cancelled
+                    break
+                } catch EngineError.lowMemory {
+                    reason = .lowMemory
                     break
                 }
             }
@@ -261,6 +338,13 @@ actor InferenceEngine {
             }
             if Task.isCancelled { reason = .cancelled }
             stats.stopReason = reason
+            if reason == .lowMemory { recoverFromLowMemory() }
+            continuation.yield(.finished(stats))
+            continuation.finish()
+        } catch EngineError.lowMemory {
+            // プロンプトを読んでいる途中で足りなくなった
+            stats.stopReason = .lowMemory
+            recoverFromLowMemory()
             continuation.yield(.finished(stats))
             continuation.finish()
         } catch is CancellationError {
@@ -292,4 +376,6 @@ struct ModelFiles: Sendable {
     var configJSON: URL?
     /// chat_template.jinja / chat_template.json があればその中身（tokenizer_config より優先）
     var chatTemplateOverride: String?
+    /// KV キャッシュ（state）の大きさの見積もり（バイト）
+    var stateBytes: Int64? = nil
 }

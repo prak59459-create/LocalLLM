@@ -1,10 +1,7 @@
 import Foundation
-#if canImport(FoundationNetworking)
-import FoundationNetworking
-#endif
 
 /// Package.swift に書かれたアプリの版（displayVersion と bundleVersion）。
-struct PackageVersion: Codable, Equatable, Sendable, CustomStringConvertible {
+struct PackageVersion: Codable, Equatable, Hashable, Sendable, CustomStringConvertible {
     var display: String
     var bundle: Int
 
@@ -12,18 +9,17 @@ struct PackageVersion: Codable, Equatable, Sendable, CustomStringConvertible {
 
     /// Package.swift の文字列から読む
     static func parse(packageSwift text: String) -> PackageVersion? {
-        guard let display = value(of: "displayVersion", in: text) else { return nil }
-        let bundle = value(of: "bundleVersion", in: text).flatMap { Int($0) } ?? 1
+        guard let display = PackageManifest.stringValue(of: "displayVersion", in: text) else { return nil }
+        let bundle = PackageManifest.stringValue(of: "bundleVersion", in: text).flatMap { Int($0) } ?? 1
         return PackageVersion(display: display, bundle: bundle)
     }
 
-    private static func value(of key: String, in text: String) -> String? {
-        guard let keyRange = text.range(of: key + ":") else { return nil }
-        let rest = text[keyRange.upperBound...]
-        guard let open = rest.firstIndex(of: "\"") else { return nil }
-        let afterOpen = rest.index(after: open)
-        guard let close = rest[afterOpen...].firstIndex(of: "\"") else { return nil }
-        return String(rest[afterOpen..<close])
+    /// "0.3 (3)" のような表示から読む
+    static func parse(description text: String) -> PackageVersion? {
+        let parts = text.split(separator: " ")
+        guard let display = parts.first.map(String.init), !display.isEmpty else { return nil }
+        let bundle = parts.dropFirst().first.map { $0.filter(\.isNumber) }.flatMap { Int($0) } ?? 1
+        return PackageVersion(display: display, bundle: bundle)
     }
 
     /// "1.2.10" と "1.2.9" のような版の比べ方（数字ごとに比べる）
@@ -72,36 +68,21 @@ struct PackageVersion: Codable, Equatable, Sendable, CustomStringConvertible {
 
     /// Package.swift の版を書き換えた文字列
     func apply(to text: String) -> String {
-        var result = Self.replace("displayVersion", with: display, in: text)
-        result = Self.replace("bundleVersion", with: String(bundle), in: result)
+        var result = PackageManifest.replacing("displayVersion", withExpression: "\"\(display)\"", in: text)
+        result = PackageManifest.replacing("bundleVersion", withExpression: "\"\(bundle)\"", in: result)
         return result
     }
-
-    private static func replace(_ key: String, with value: String, in text: String) -> String {
-        guard let keyRange = text.range(of: key + ":"),
-              let open = text[keyRange.upperBound...].firstIndex(of: "\"") else { return text }
-        let afterOpen = text.index(after: open)
-        guard let close = text[afterOpen...].firstIndex(of: "\"") else { return text }
-        return text.replacingCharacters(in: afterOpen..<close, with: value)
-    }
 }
 
-/// 更新で行うこと。
-struct UpdatePlan: Codable, Sendable {
-    var added: [String]
-    var changed: [String]
-    var removed: [String]
-    var unchangedCount: Int
-    var previousVersion: PackageVersion?
-    var newVersion: PackageVersion
-
-    var isEmpty: Bool { added.isEmpty && changed.isEmpty && removed.isEmpty }
-}
-
-enum AppUpdateError: Error, LocalizedError {
+enum AppUpdateError: Error, LocalizedError, Equatable {
     case packageNotFound
     case notAPackage(String)
     case download(Int)
+    case unsafePath(String)
+    case localFilesChanged([String])
+    case missingDownload(String)
+    case verificationFailed([String])
+    case nothingToRestore
 
     var errorDescription: String? {
         switch self {
@@ -109,184 +90,283 @@ enum AppUpdateError: Error, LocalizedError {
             return L("新しいソースの中に、アプリのパッケージ（Package.swift と Sources/ のあるフォルダ）が見つかりません。",
                      "No app package (a folder with Package.swift and Sources/) was found in the new source.")
         case .notAPackage(let name):
-            return L("「\(name)」は Swift Playgrounds のアプリ（Package.swift のある .swiftpm）ではないようです。",
-                     "\"\(name)\" does not look like a Swift Playgrounds app (.swiftpm with a Package.swift).")
+            return L("「\(name)」は Swift Playgrounds のアプリ（Package.swift と Sources のある .swiftpm）ではないようです。",
+                     "\"\(name)\" does not look like a Swift Playgrounds app (.swiftpm with Package.swift and Sources).")
         case .download(let status):
             return L("ダウンロードに失敗しました（HTTP \(status)）。リポジトリ名・ブランチ・トークンを確かめてください。",
                      "Download failed (HTTP \(status)). Check the repository, branch and token.")
+        case .unsafePath(let path):
+            return L("パッケージの外を指すファイル名なので更新できません: \(path)", "Refusing a path outside the package: \(path)")
+        case .localFilesChanged(let paths):
+            return L("確認したあとに、この iPad のファイルが変わりました（\(paths.prefix(3).joined(separator: ", "))）。もう一度「更新を確認」してください。",
+                     "Files on this iPad changed after the check (\(paths.prefix(3).joined(separator: ", "))). Check for updates again.")
+        case .missingDownload(let path):
+            return L("\(path) のダウンロードが見つかりません。もう一度「更新を確認」してください。",
+                     "The download for \(path) is missing. Check for updates again.")
+        case .verificationFailed(let paths):
+            return L("書いたファイルが GitHub の内容と一致しなかったので、元に戻しました（\(paths.prefix(3).joined(separator: ", "))）。",
+                     "Written files did not match GitHub, so the update was rolled back (\(paths.prefix(3).joined(separator: ", "))).")
+        case .nothingToRestore:
+            return L("取り消せる更新がありません。", "There is no update to undo.")
         }
     }
 }
 
-/// Swift Playgrounds のアプリ（.swiftpm）を、新しいソースで上書きする。
+/// 取ってきたファイルの置き場所（git の識別子ごとに 1 つ。同じ中身は 2 回ダウンロードしない）。
+struct UpdateObjectStore: Sendable {
+    var root: URL
+
+    func url(for sha: String) -> URL {
+        root.appendingPathComponent(String(sha.prefix(2)), isDirectory: true).appendingPathComponent(sha)
+    }
+
+    /// 置いてあって、中身が識別子と合っているか
+    func contains(_ sha: String) -> Bool {
+        guard let data = try? Data(contentsOf: url(for: sha), options: .mappedIfSafe) else { return false }
+        return GitBlob.sha(of: data) == sha
+    }
+
+    func data(for sha: String) -> Data? {
+        guard let data = try? Data(contentsOf: url(for: sha)), GitBlob.sha(of: data) == sha else { return nil }
+        return data
+    }
+
+    /// 中身を確かめてから置く
+    func store(_ data: Data, sha: String) throws {
+        guard GitBlob.sha(of: data) == sha else { throw GitHubAPIError.integrity(sha) }
+        let destination = url(for: sha)
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: destination, options: .atomic)
+    }
+
+    func removeAll() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+/// 更新 1 回の記録（取り消すのにも使う）。
+struct UpdateRecord: Codable, Identifiable, Hashable, Sendable {
+    var id: UUID
+    var date: Date
+    /// "GitHub owner/name (main)" やファイル名
+    var sourceLabel: String
+    var repository: String?
+    var branch: String?
+    var commit: GitHubCommit?
+    var targetName: String
+    var previousVersion: PackageVersion?
+    var newVersion: PackageVersion
+    /// 書いたファイル（元から無かったものは created にも入る）
+    var written: [String]
+    var created: [String]
+    var deleted: [String]
+    /// 更新したあとのパッケージの中身が、新しいソースのどの内容と同じか（次の更新で「この iPad でだけ変えたファイル」を見分ける）
+    var manifest: [String: String]
+    /// 前回書いた GitHub の Package.swift（この iPad の設定を残すのに使う）
+    var remotePackageSwift: String?
+    var restored: Bool = false
+
+    var changedFileCount: Int { Set(written + deleted).subtracting(["Package.swift"]).count }
+}
+
+/// 更新の履歴（新しい順）。それぞれの更新で書き換える前のファイルを残しておき、新しい方から順に取り消せる。
+struct UpdateHistory: Sendable {
+    var folder: URL
+    var limit = 10
+
+    private var historyURL: URL { folder.appendingPathComponent("history.json") }
+    func backupFolder(for id: UUID) -> URL { folder.appendingPathComponent("backups/\(id.uuidString)", isDirectory: true) }
+
+    func load() -> [UpdateRecord] {
+        guard let data = try? Data(contentsOf: historyURL) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([UpdateRecord].self, from: data)) ?? []
+    }
+
+    func save(_ records: [UpdateRecord]) throws {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(records).write(to: historyURL, options: .atomic)
+    }
+
+    /// 記録を先頭に足し、古いもの（とそのバックアップ）を消す
+    func add(_ record: UpdateRecord) throws {
+        var records = load().filter { $0.id != record.id }
+        records.insert(record, at: 0)
+        for old in records.dropFirst(limit) {
+            try? FileManager.default.removeItem(at: backupFolder(for: old.id))
+        }
+        try save(Array(records.prefix(limit)))
+    }
+
+    func markRestored(_ id: UUID) throws {
+        var records = load()
+        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
+        records[index].restored = true
+        try save(records)
+        try? FileManager.default.removeItem(at: backupFolder(for: id))
+    }
+
+    /// 今取り消せる更新（取り消していないもののうち一番新しいもの）
+    static func restorable(in records: [UpdateRecord], target: String) -> UpdateRecord? {
+        records.first { !$0.restored && $0.targetName == target }
+    }
+
+    /// 今のパッケージが、どの新しいソースの内容から来ているか（一番新しい、取り消していない更新）
+    static func base(in records: [UpdateRecord], target: String) -> UpdateRecord? {
+        restorable(in: records, target: target)
+    }
+}
+
+/// 更新の中身（書くファイルと消すファイル）。
+struct UpdateRequest: Sendable {
+    /// 書くファイル: 相対パス → 中身の識別子（UpdateObjectStore に置いてあるもの）
+    var writes: [String: String]
+    var deletes: [String]
+    /// 確認したときの、この iPad のファイルの識別子（nil = 無かった）。書く前に変わっていないか確かめる。
+    var expectedLocal: [String: String?]
+    /// 新しいソースの Package.swift（分かっていれば。次の更新でこの iPad の設定を残すのに使う）
+    var remotePackageSwift: String?
+    /// Package.swift を新しいソースのものにする（false なら今の Package.swift の版だけ書き換える）
+    var takeRemotePackageSwift: Bool
+    /// 前回の更新で書いた新しいソースの Package.swift
+    var basePackageSwift: String?
+    var newVersion: PackageVersion
+    /// 更新したあとのパッケージの中身（記録用）
+    var manifest: [String: String]
+    var sourceLabel: String
+    var repository: String?
+    var branch: String?
+    var commit: GitHubCommit?
+}
+
+/// 更新を書き込む・取り消す。途中で失敗したら、書き換える前に戻す。
 enum AppUpdater {
-    /// コピーしないもの（Playgrounds の設定や、ほかの環境のもの）
-    static let ignoredNames: Set<String> = [".git", ".swiftpm", ".build", "xcuserdata", ".DS_Store", "__MACOSX", ".github"]
-    /// 新しいソースに無ければ消す範囲（これ以外のファイルは消さない）
-    static let managedFolders = ["Sources/"]
-
-    /// フォルダの中から、アプリのパッケージのフォルダを探す（preferredName を優先）
-    static func packageRoot(in folder: URL, preferredName: String = "LocalLLM.swiftpm") -> URL? {
+    /// 更新を書き込む。書き換える前のファイルは history のバックアップに残す。
+    static func apply(_ request: UpdateRequest, target: URL, objects: UpdateObjectStore, history: UpdateHistory,
+                      id: UUID = UUID(), date: Date = Date()) throws -> UpdateRecord {
         let fileManager = FileManager.default
-        func isPackage(_ url: URL) -> Bool {
-            fileManager.fileExists(atPath: url.appendingPathComponent("Package.swift").path)
-                && fileManager.fileExists(atPath: url.appendingPathComponent("Sources").path)
-        }
-        if isPackage(folder) { return folder }
-        var candidates: [URL] = []
-        var queue: [(URL, Int)] = [(folder, 0)]
-        while !queue.isEmpty {
-            let (current, depth) = queue.removeFirst()
-            guard depth < 4, let items = try? fileManager.contentsOfDirectory(at: current, includingPropertiesForKeys: [.isDirectoryKey]) else { continue }
-            for item in items where !ignoredNames.contains(item.lastPathComponent) {
-                guard (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
-                if isPackage(item) { candidates.append(item) } else { queue.append((item, depth + 1)) }
-            }
-        }
-        return candidates.first { $0.lastPathComponent == preferredName }
-            ?? candidates.first { $0.pathExtension == "swiftpm" }
-            ?? candidates.first
-    }
-
-    /// パッケージの中のファイル（相対パス → URL）
-    static func files(in root: URL) -> [String: URL] {
-        var result: [String: URL] = [:]
-        let fileManager = FileManager.default
-        func visit(_ folder: URL, prefix: String) {
-            guard let items = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
-            for item in items where !ignoredNames.contains(item.lastPathComponent) {
-                let path = prefix + item.lastPathComponent
-                if (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
-                    visit(item, prefix: path + "/")
-                } else {
-                    result[path] = item
-                }
-            }
-        }
-        visit(root, prefix: "")
-        return result
-    }
-
-    /// 何を足して、何を変えて、何を消すかを調べる（まだ書き込まない）
-    static func plan(source: URL, target: URL) throws -> UpdatePlan {
-        let targetPackage = target.appendingPathComponent("Package.swift")
-        guard FileManager.default.fileExists(atPath: targetPackage.path) else {
+        let packageURL = target.appendingPathComponent("Package.swift")
+        guard PackageScanner.isPackage(target), fileManager.fileExists(atPath: packageURL.path) else {
             throw AppUpdateError.notAPackage(target.lastPathComponent)
         }
-        let sourceFiles = files(in: source)
-        let targetFiles = files(in: target)
-        guard sourceFiles["Package.swift"] != nil else { throw AppUpdateError.packageNotFound }
+        let allPaths = Array(request.writes.keys) + request.deletes
+        if let bad = allPaths.first(where: { !PackageScanner.isSafeRelativePath($0) || PackageScanner.isIgnored($0) }) {
+            throw AppUpdateError.unsafePath(bad)
+        }
+        // 確認したあとに、この iPad で変わったファイルがあれば止める
+        let changedSinceCheck = request.expectedLocal.compactMap { path, expected -> String? in
+            PackageScanner.sha(of: path, in: target) == expected ? nil : path
+        }
+        if !changedSinceCheck.isEmpty { throw AppUpdateError.localFilesChanged(changedSinceCheck.sorted()) }
+        // 書くファイルが全部そろっているか
+        var contents: [String: Data] = [:]
+        for (path, sha) in request.writes where path != "Package.swift" {
+            guard let data = objects.data(for: sha) else { throw AppUpdateError.missingDownload(path) }
+            contents[path] = data
+        }
 
-        let current = (try? String(contentsOf: targetPackage, encoding: .utf8)).flatMap(PackageVersion.parse(packageSwift:))
-        let incoming = sourceFiles["Package.swift"].flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-            .flatMap(PackageVersion.parse(packageSwift:))
-        let next = PackageVersion.next(current: current, incoming: incoming)
+        let localPackageSwift = try String(contentsOf: packageURL, encoding: .utf8)
+        let newPackageSwift: String
+        if request.takeRemotePackageSwift, let remote = request.remotePackageSwift {
+            newPackageSwift = PackageManifest.merge(local: localPackageSwift, remote: remote, base: request.basePackageSwift,
+                                                    version: request.newVersion)
+        } else {
+            newPackageSwift = request.newVersion.apply(to: localPackageSwift)
+        }
 
-        var added: [String] = [], changed: [String] = [], unchanged = 0
-        for (path, url) in sourceFiles {
-            guard let existing = targetFiles[path] else {
-                added.append(path)
+        // バックアップ
+        let backup = history.backupFolder(for: id)
+        try? fileManager.removeItem(at: backup)
+        let backupFiles = backup.appendingPathComponent("files", isDirectory: true)
+        try fileManager.createDirectory(at: backupFiles, withIntermediateDirectories: true)
+        let touched = Set(allPaths + ["Package.swift"])
+        var created: [String] = []
+        for path in touched.sorted() {
+            let original = target.appendingPathComponent(path)
+            guard fileManager.fileExists(atPath: original.path) else {
+                if request.writes[path] != nil { created.append(path) }
                 continue
             }
-            if path == "Package.swift" {
-                // 版は必ず変わるので、いつも書き直す
-                changed.append(path)
-                continue
-            }
-            if (try? Data(contentsOf: url)) == (try? Data(contentsOf: existing)) {
-                unchanged += 1
-            } else {
-                changed.append(path)
-            }
+            let copy = backupFiles.appendingPathComponent(path)
+            try fileManager.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fileManager.copyItem(at: original, to: copy)
         }
-        let removed = targetFiles.keys.filter { path in
-            sourceFiles[path] == nil && managedFolders.contains { path.hasPrefix($0) }
-        }
-        return UpdatePlan(added: added.sorted(), changed: changed.sorted(), removed: removed.sorted(),
-                          unchangedCount: unchanged, previousVersion: current, newVersion: next)
-    }
+        let record = UpdateRecord(id: id, date: date, sourceLabel: request.sourceLabel, repository: request.repository,
+                                  branch: request.branch, commit: request.commit, targetName: target.lastPathComponent,
+                                  previousVersion: PackageVersion.parse(packageSwift: localPackageSwift),
+                                  newVersion: request.newVersion,
+                                  written: Array(Set(request.writes.keys).union(["Package.swift"])).sorted(),
+                                  created: created, deleted: request.deletes.sorted(), manifest: request.manifest,
+                                  remotePackageSwift: request.remotePackageSwift ?? request.basePackageSwift)
 
-    /// 更新を書き込む。backup を渡すと、変える前のファイルをそこに残す（restore で戻せる）。
-    static func apply(_ plan: UpdatePlan, source: URL, target: URL, backup: URL?) throws {
-        let fileManager = FileManager.default
-        if let backup {
+        // 書き込む（失敗したら元に戻す）
+        do {
+            for (path, data) in contents.sorted(by: { $0.key < $1.key }) {
+                let destination = target.appendingPathComponent(path)
+                try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: destination, options: .atomic)
+            }
+            try Data(newPackageSwift.utf8).write(to: packageURL, options: .atomic)
+            for path in request.deletes {
+                let url = target.appendingPathComponent(path)
+                if fileManager.fileExists(atPath: url.path) { try fileManager.removeItem(at: url) }
+            }
+            removeEmptyFolders(in: target.appendingPathComponent("Sources"))
+
+            // 書いたものが GitHub の中身と同じか確かめる
+            let mismatched = contents.keys.filter { path in
+                PackageScanner.sha(of: path, in: target) != request.writes[path]
+            } + request.deletes.filter { fileManager.fileExists(atPath: target.appendingPathComponent($0).path) }
+            if !mismatched.isEmpty { throw AppUpdateError.verificationFailed(mismatched.sorted()) }
+        } catch {
+            rollBack(record, target: target, backupFiles: backupFiles)
             try? fileManager.removeItem(at: backup)
-            try fileManager.createDirectory(at: backup.appendingPathComponent("files"), withIntermediateDirectories: true)
-            for path in plan.changed + plan.removed {
-                let original = target.appendingPathComponent(path)
-                let copy = backup.appendingPathComponent("files").appendingPathComponent(path)
-                try fileManager.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try? fileManager.copyItem(at: original, to: copy)
-            }
-            try JSONEncoder().encode(plan).write(to: backup.appendingPathComponent("plan.json"))
+            throw error
         }
-        for path in plan.added + plan.changed {
-            let from = source.appendingPathComponent(path)
-            let to = target.appendingPathComponent(path)
-            try fileManager.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
-            var data = try Data(contentsOf: from)
-            if path == "Package.swift", let text = String(data: data, encoding: .utf8) {
-                data = Data(plan.newVersion.apply(to: text).utf8)
-            }
-            try data.write(to: to, options: .atomic)
-        }
-        for path in plan.removed {
-            try? fileManager.removeItem(at: target.appendingPathComponent(path))
-        }
-        removeEmptyFolders(in: target.appendingPathComponent("Sources"))
+        try history.add(record)
+        return record
     }
 
-    /// 前回の更新を取り消す
-    static func restore(from backup: URL, target: URL) throws {
+    /// 更新を取り消す（バックアップから戻して、新しく足したファイルを消す）
+    static func restore(_ record: UpdateRecord, target: URL, history: UpdateHistory) throws {
+        let backupFiles = history.backupFolder(for: record.id).appendingPathComponent("files", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: backupFiles.path) else { throw AppUpdateError.nothingToRestore }
+        try restoreFiles(record, target: target, backupFiles: backupFiles)
+        try history.markRestored(record.id)
+    }
+
+    private static func rollBack(_ record: UpdateRecord, target: URL, backupFiles: URL) {
+        try? restoreFiles(record, target: target, backupFiles: backupFiles)
+    }
+
+    private static func restoreFiles(_ record: UpdateRecord, target: URL, backupFiles: URL) throws {
         let fileManager = FileManager.default
-        let plan = try JSONDecoder().decode(UpdatePlan.self, from: Data(contentsOf: backup.appendingPathComponent("plan.json")))
-        for path in plan.added {
+        for path in record.created where PackageScanner.isSafeRelativePath(path) {
             try? fileManager.removeItem(at: target.appendingPathComponent(path))
         }
-        for path in plan.changed + plan.removed {
-            let copy = backup.appendingPathComponent("files").appendingPathComponent(path)
+        for path in Set(record.written + record.deleted).sorted() where PackageScanner.isSafeRelativePath(path) {
+            let copy = backupFiles.appendingPathComponent(path)
             guard fileManager.fileExists(atPath: copy.path) else { continue }
-            let to = target.appendingPathComponent(path)
-            try fileManager.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? fileManager.removeItem(at: to)
-            try fileManager.copyItem(at: copy, to: to)
+            let destination = target.appendingPathComponent(path)
+            try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(contentsOf: copy).write(to: destination, options: .atomic)
         }
         removeEmptyFolders(in: target.appendingPathComponent("Sources"))
     }
 
-    private static func removeEmptyFolders(in folder: URL) {
+    static func removeEmptyFolders(in folder: URL) {
         let fileManager = FileManager.default
         guard let items = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
         for item in items where (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
             removeEmptyFolders(in: item)
-            if (try? fileManager.contentsOfDirectory(atPath: item.path))?.isEmpty == true {
+            let rest = (try? fileManager.contentsOfDirectory(atPath: item.path)) ?? ["?"]
+            if rest.allSatisfy({ $0 == ".DS_Store" }) {
                 try? fileManager.removeItem(at: item)
             }
         }
-    }
-
-    /// GitHub のリポジトリを ZIP で取ってくる URL（トークンがあれば API 経由で、非公開のリポジトリも取れる）
-    static func githubArchiveRequest(repository: String, ref: String, token: String?) -> URLRequest? {
-        let trimmed = repository.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "https://github.com/", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let parts = trimmed.split(separator: "/")
-        guard parts.count >= 2 else { return nil }
-        let owner = parts[0], repo = parts[1].replacingOccurrences(of: ".git", with: "")
-        let branch = ref.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "main" : ref.trimmingCharacters(in: .whitespacesAndNewlines)
-        var request: URLRequest
-        if let token, !token.isEmpty {
-            guard let url = URL(string: "https://api.github.com/repos/\(owner)/\(repo)/zipball/\(branch)") else { return nil }
-            request = URLRequest(url: url)
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        } else {
-            let encoded = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
-            guard let url = URL(string: "https://codeload.github.com/\(owner)/\(repo)/zip/refs/heads/\(encoded)") else { return nil }
-            request = URLRequest(url: url)
-        }
-        request.setValue("LocalLLM-Updater", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 120
-        return request
     }
 }

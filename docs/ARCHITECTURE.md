@@ -28,7 +28,7 @@
 | `Core/Hub` | Hugging Face API、リポジトリ解析、分割モデル（ANEMLL）、ZIP、Core ML モデルの入出力判定、再開可能ダウンロード | ✅ |
 | `Core/Tools` | JSON、ツールの呼び出しの読み取り、Web 検索・ページ取得、MCP クライアント | ✅ |
 | `Core/Workspace` | CDWS: フォルダの中だけを触るファイル操作、差分、変更履歴、ロードマップ、ひな形、エージェントのツール、色付け | ✅ |
-| `Core/Update` | アプリの更新（版の上げ方、上書きの計画、バックアップと取り消し） | ✅ |
+| `Core/Update` | アプリの更新（GitHub と 1 ファイルずつ比べる差分更新、Package.swift の設定を残す書き換え、履歴と取り消し） | ✅ |
 | `Core/Util` | 多言語化、バイト数表示など | ✅ |
 | `Engine` | Core ML 推論（ステートフル／ステートレス／分割モデルのパイプライン） | ❌（iOS のみ） |
 | `Storage` | SwiftData の会話履歴、インストール済みモデルの管理 | ❌ |
@@ -431,8 +431,10 @@ enum ByteFormat { static func string(_ bytes: Int64) -> String }   // 例: "1.9 
 - `ConnectorStore`: 組み込みツール（web_search / fetch_page / current_time）と MCP サーバー（Streamable HTTP）の設定とツールの実行。
 - `WorkspaceStore` / `WorkspaceSession`: CDWS のプロジェクト一覧（外のフォルダはブックマーク）と、開いたプロジェクトの状態
   （ファイルの木、エディタのバッファと自動保存、`.cdws/roadmap.json`・`history.json`・`agent.json`、プレビュー、エージェント）。
-- `AppUpdateController`: 選んだ `.swiftpm`（ブックマーク）を GitHub の ZIP などで上書きする。`NSFileCoordinator` を通して書き、
-  変える前のファイルは `Application Support/AppUpdateBackup` に残す。
+- `AppUpdateController`: 選んだ `.swiftpm`（フォルダを選んだときは、その中のパッケージを選んでもらい「フォルダのブックマーク＋相対パス」で覚える）と
+  GitHub（または ZIP・.swiftpm）を比べ、変わったファイルだけを書き換える。iCloud にまだ落ちていないファイルは先にダウンロードし、
+  書き込みは `NSFileCoordinator` を通す。履歴とバックアップは `Application Support/AppUpdate/History`、ダウンロードは `Caches/AppUpdate/objects`。
+  起動時には最新のコミットだけを ETag 付きで問い合わせ（変わっていなければ回数制限に数えられない）、新しい版があれば設定に印を付ける。
 
 ## Core/Tools
 
@@ -495,15 +497,34 @@ enum ContextResizer {
 ## Core/Update
 
 ```swift
-struct PackageVersion { var display: String; var bundle: Int
-    static func next(current:incoming:) -> PackageVersion   // bundle は毎回 +1。display は新しいソースの方が大きければそれ、そうでなければ最後の数字を +1
+enum SHA1 / GitBlob                       // git の識別子（sha1("blob <size>\0" + 中身)）。GitHub のファイル一覧の sha と比べられる
+struct GitHubClient {                     // commit(ref:) / package(commit:preferredNames:) / file(path:commit:expectedSHA:) / compare / branches / rateLimit
+}                                          // ファイルはトークンがなければ raw.githubusercontent.com（回数制限に数えない）、あれば contents API
+enum PackageScanner                       // .swiftpm のファイルと識別子（.swiftpm/・.git などは無視。iCloud の ".x.icloud" を見分ける）
+struct RemotePackage                      // GitHub の tree からパッケージ（Package.swift と Sources/ のあるフォルダ）を探す
+enum UpdateDiffer {
+    static func diff(local:remote:base:manifestEquivalent:) -> UpdateDiff
+    // added / modified / removed（Sources/ の中だけ）/ localEdit / localDeleted。
+    // base（前回の更新で書いた内容）と比べて、この iPad でだけ変えたファイル・GitHub と重なった変更を見分ける
+    static func manifest(after:remote:base:applied:) -> [String: String]   // 見送った変更は次の確認でもまた出る
 }
+enum PackageManifest                      // Package.swift の値。版と、この iPad の設定（bundleIdentifier・teamIdentifier・appIcon・accentColor）を
+                                          // 無視して比べ、書き換えるときはこの iPad の値を残す
+enum UpdateEngine {
+    static func checkGitHub(client:ref:target:objects:base:progress:) async throws -> UpdateCheckResult  // 変わったファイルだけを取ってくる
+    static func checkFolder(_:label:target:objects:base:) throws -> UpdateCheckResult
+}
+struct UpdateObjectStore                  // 取ってきたファイルを識別子ごとに置く（中身を確かめてから使う）
 enum AppUpdater {
-    static func packageRoot(in:preferredName:) -> URL?      // ZIP の中から Package.swift と Sources/ のあるフォルダを探す
-    static func plan(source:target:) throws -> UpdatePlan    // 追加・変更・削除（削除は Sources/ の中だけ。.swiftpm/ や .git は触らない）
-    static func apply(_:source:target:backup:) throws; static func restore(from:target:) throws
+    static func apply(_ request:target:objects:history:) throws -> UpdateRecord
+    // 確認のあとでこの iPad のファイルが変わっていないか確かめ → バックアップ → 選んだファイルだけ書く → 書いた中身を確かめる。失敗したら元に戻す
+    static func restore(_ record:target:history:) throws  // 新しい更新から順に取り消す
 }
+struct PackageVersion                     // bundle は毎回 +1。display は新しいソースの方が大きければそれ、そうでなければ最後の数字を +1
 ```
+
+- Linux の CI で、本物の GitHub（このリポジトリの main）とわざと古くしたコピーを比べ、変わったファイルだけを取ってきて更新し、
+  もう一度確かめると全部同じになることを確かめている
 
 ---
 

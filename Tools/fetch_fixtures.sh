@@ -80,3 +80,31 @@ for repo in "${ANEMLL_REPOS[@]}"; do
   curl -sSL -o "$OUT/trees/$name" "https://huggingface.co/$repo/resolve/main/meta.yaml"
   echo "meta fixture: $name"
 done
+
+# コンテキスト長の変更（ContextResizer）のテスト用: コンパイル済みモデルの小さいファイル
+COMPILED=(
+  "finnvoorhees/coreml-Qwen2.5-0.5B-Instruct-4bit|Qwen2.5-0.5B-Instruct-4bit.mlmodelc"
+  "finnvoorhees/coreml-Llama-3.2-1B-Instruct-4bit|Llama-3.2-1B-Instruct-4bit.mlmodelc"
+  "anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4|qwen_FFN_PF_lut6_chunk_01of01.mlmodelc"
+)
+for entry in "${COMPILED[@]}"; do
+  repo="${entry%%|*}"; path="${entry#*|}"
+  dir="$OUT/compiled/${repo//\//__}"
+  mkdir -p "$dir"
+  for f in model.mil coremldata.bin metadata.json; do
+    if [ -s "$dir/$f" ]; then continue; fi
+    curl -sSL -o "$dir/$f" "https://huggingface.co/$repo/resolve/main/$path/$f"
+  done
+  echo "compiled fixture: $repo"
+done
+
+# ANEMLL の RoPE の表（重みファイルの一部だけを Range で取る）: 開始位置, 終了位置
+ANEMLL_WEIGHTS="https://huggingface.co/anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4/resolve/main/qwen_FFN_PF_lut6_chunk_01of01.mlmodelc/weights/weight.bin"
+dir="$OUT/compiled/anemll__anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4/weight-parts"
+mkdir -p "$dir"
+for range in "0 63" "291329088 291591295" "291591296 291853503"; do
+  set -- $range
+  if [ -s "$dir/$1.bin" ]; then continue; fi
+  curl -sSL -r "$1-$2" -o "$dir/$1.bin" "$ANEMLL_WEIGHTS"
+done
+echo "anemll weight parts: $(ls "$dir" | tr '\n' ' ')"

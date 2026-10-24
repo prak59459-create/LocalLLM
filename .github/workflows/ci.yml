@@ -56,7 +56,7 @@ jobs:
   core-tests-macos:
     name: Core tests (macOS, Accelerate)
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -64,8 +64,32 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
 
       # Accelerate (vDSP) と Compression を使う経路は Apple のプラットフォームでしか動かないので、ここで確かめる
+      - name: Fetch fixtures
+        run: ./Tools/fetch_fixtures.sh
+
       - name: Test
-        run: swift test --filter "Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|PackageVersion|Tool|JSONValue|MCP"
+        run: swift test --filter "Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|PackageVersion|Tool|JSONValue|MCP|ContextResizer|ProtoWire|HalfAndBlob|RopeTable"
+
+      # コンテキスト長を変えた本物のモデルを Core ML で読み込んで、元の長さを超えた位置で推論できるか確かめる
+      - name: Download models for the Core ML end-to-end test
+        run: |
+          set -e
+          fetch() {
+            local repo="$1" path="$2" out="$3"
+            for f in model.mil coremldata.bin metadata.json analytics/coremldata.bin weights/weight.bin; do
+              mkdir -p "$out/$(dirname "$f")"
+              curl -sSfL --retry 3 -o "$out/$f" "https://huggingface.co/$repo/resolve/main/$path/$f"
+            done
+          }
+          mkdir -p "$RUNNER_TEMP/models"
+          fetch finnvoorhees/coreml-Qwen2.5-0.5B-Instruct-4bit Qwen2.5-0.5B-Instruct-4bit.mlmodelc "$RUNNER_TEMP/models/qwen.mlmodelc"
+          fetch anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4 qwen_FFN_PF_lut6_chunk_01of01.mlmodelc "$RUNNER_TEMP/models/anemll.mlmodelc"
+          du -sh "$RUNNER_TEMP/models"/*
+
+      - name: Core ML end-to-end test (context resize)
+        env:
+          LOCALLLM_COREML_MODELS: ${{ runner.temp }}/models
+        run: swift test --filter ContextResizeCoreMLTests
 
   app-typecheck-ios:
     name: App typecheck (iOS SDK)

@@ -70,18 +70,24 @@ struct RepoAnalysis: Hashable, Sendable {
     ///   - files: リポジトリのファイル一覧
     ///   - metaFiles: ANEMLL の meta.yaml（パス → 中身）。分割モデルの組み立てに使う。
     ///   - repoName: リポジトリ名（直下に置かれたモデルの名前に使う）
-    static func analyze(files: [HFFileEntry], metaFiles: [String: String] = [:], repoName: String = "model") -> RepoAnalysis {
+    static func analyze(files originalFiles: [HFFileEntry], metaFiles: [String: String] = [:], repoName: String = "model") -> RepoAnalysis {
+        // 0. 何個かに分けて置かれたファイル（weight.bin.part1 … や model.zip.001 …）は、つなげたあとの 1 つとして調べる
+        let (files, splitGroups) = SplitParts.joinedEntries(originalFiles)
+
         // 1. 拡張子で分かるモデルのフォルダ
         var groups: [String: [HFFileEntry]] = [:]
         var kinds: [String: ModelVariant.Kind] = [:]
         var renames: [String: String] = [:]
         var loose: [HFFileEntry] = []
+        /// ZIP に入ったモデル（X.mlmodelc.zip → X.mlmodelc）。分割モデルの部品になることがある
+        var zipRoots: [String: HFFileEntry] = [:]
         for file in files {
             if let root = modelRoot(of: file.path) {
                 groups[root, default: []].append(file)
                 kinds[root] = root.hasSuffix(".mlmodelc") ? .compiled : .package
             } else {
                 loose.append(file)
+                if let root = ModelArchiveExpander.modelRoot(forArchive: file.path) { zipRoots[root] = file }
             }
         }
         // 2. 拡張子は無いが、中身からモデルと分かるフォルダ（coremldata.bin + model.mil、Manifest.json + Data/）
@@ -97,7 +103,7 @@ struct RepoAnalysis: Hashable, Sendable {
             let parent = root.isEmpty ? "" : (root as NSString).deletingLastPathComponent
             renames[root] = (parent.isEmpty ? "" : parent + "/") + name + suffix
         }
-        let rootPaths = Array(groups.keys)
+        let rootPaths = Array(Set(groups.keys).union(zipRoots.keys))
 
         // 3. 分割モデル（meta.yaml、無ければファイル名から推測）
         var pipelines: [ModelVariant] = []
@@ -117,7 +123,8 @@ struct RepoAnalysis: Hashable, Sendable {
                 descriptor = PipelineDescriptor.guess(folder: folder, roots: rootPaths)
             }
             guard let descriptor else { continue }
-            var members = descriptor.parts.flatMap { groups[$0] ?? [] }
+            // ZIP の部品は、ダウンロードしたあとに展開する
+            var members = descriptor.parts.flatMap { groups[$0] ?? zipRoots[$0].map { [$0] } ?? [] }
             if let metaPath, let meta = files.first(where: { $0.path == metaPath }) { members.append(meta) }
             let name = (folder.isEmpty ? repoName : (folder as NSString).lastPathComponent)
             let label = descriptor.isMonolithic ? L("一体型", "monolithic") : L("\(descriptor.chunks.count) チャンク", "\(descriptor.chunks.count) chunks")
@@ -144,21 +151,31 @@ struct RepoAnalysis: Hashable, Sendable {
                                         renames: renames[root].map { [root: $0] }))
         }
 
-        // 5. ZIP に入ったモデル
-        let archives = loose.filter { isModelArchive($0.path) }.map { file in
+        // 5. ZIP に入ったモデル（分割モデルの部品として使ったものは除く）
+        let usedZips = Set(usedRoots.compactMap { zipRoots[$0]?.path })
+        let archives = loose.filter { isModelArchive($0.path) && !usedZips.contains($0.path) }.map { file in
             ModelVariant(path: file.path, kind: .archive, files: [file], totalBytes: file.size,
                          displayName: ((file.path as NSString).lastPathComponent as NSString).deletingPathExtension)
         }
 
         let order: [ModelVariant.Kind: Int] = [.pipeline: 0, .compiled: 1, .package: 2, .archive: 3]
-        let variants = (pipelines + singles + archives).sorted { lhs, rhs in
+        // つなげたファイルは、ダウンロードするときは元の部品に戻す
+        let byPath = Dictionary(originalFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+        func expand(_ entries: [HFFileEntry]) -> [HFFileEntry] {
+            entries.flatMap { entry in splitGroups[entry.path].map { $0.compactMap { byPath[$0] } } ?? [entry] }
+        }
+        let variants = (pipelines + singles + archives).map { variant -> ModelVariant in
+            var copy = variant
+            copy.files = expand(variant.files)
+            return copy
+        }.sorted { lhs, rhs in
             if lhs.kind != rhs.kind { return order[lhs.kind, default: 9] < order[rhs.kind, default: 9] }
             return lhs.path < rhs.path
         }
         let modelFiles = Set(groups.values.flatMap { $0.map(\.path) })
-        let support = files.filter {
+        let support = expand(files.filter {
             supportFileNames.contains(($0.path as NSString).lastPathComponent) && !modelFiles.contains($0.path)
-        }
+        })
         // tokenizer.json か、そこから作れるファイル（tokenizer.model、vocab.json + merges.txt など）があるか
         let hasTokenizer = TokenizerSynthesizer.canBuild(fileNames: Set(support.map { ($0.path as NSString).lastPathComponent }))
         return RepoAnalysis(variants: variants, supportFiles: support.sorted { $0.path < $1.path }, hasTokenizer: hasTokenizer)

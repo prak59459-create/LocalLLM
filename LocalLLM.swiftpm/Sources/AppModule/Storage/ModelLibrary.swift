@@ -211,14 +211,16 @@ final class ModelLibrary {
         endBackgroundTask(for: id)
         updateIdleTimer()
         guard let model = model(withID: id) else { return }
-        if model.kind == .archive {
-            // ZIP を展開して、中のモデルを調べ直す（時間がかかるので別のスレッドで）
+        let needsJoin = !SplitParts.group(model.files.map(\.path)).isEmpty
+        let hasZippedParts = model.kind == .pipeline && model.files.contains { ModelArchiveExpander.modelRoot(forArchive: $0.path) != nil }
+        if needsJoin || hasZippedParts || model.kind == .archive {
+            // 分割されたファイルをつなげ、ZIP を展開して、中のモデルを調べ直す（時間がかかるので別のスレッドで）
             downloads[id] = DownloadState(phase: .downloading, progress: downloads[id]?.progress)
             let folder = directory(for: model)
             tasks[id] = Task { [self] in
                 do {
                     let adopted = try await Task.detached(priority: .userInitiated) {
-                        try Self.expandArchive(of: model, in: folder)
+                        try Self.postProcess(model, in: folder)
                     }.value
                     tasks[id] = nil
                     completeDownload(adopted)
@@ -229,6 +231,32 @@ final class ModelLibrary {
             return
         }
         completeDownload(model)
+    }
+
+    /// ダウンロードしたあとの片付け: 分けて置かれたファイルを 1 つにつなげ、ZIP の部品を展開する
+    nonisolated private static func postProcess(_ original: InstalledModel, in folder: URL) throws -> InstalledModel {
+        var model = original
+        let groups = SplitParts.group(model.files.map(\.path))
+        for (base, parts) in groups {
+            try SplitParts.join(parts.map { folder.appendingPathComponent(model.localPath(for: $0)) },
+                                into: folder.appendingPathComponent(model.localPath(for: base)))
+        }
+        if !groups.isEmpty { model.files = SplitParts.joinedEntries(model.files).files }
+        if model.kind == .archive { return try expandArchive(of: model, in: folder) }
+        if model.kind == .pipeline {
+            let parts = Set(model.pipeline?.parts ?? [])
+            var remaining: [HFFileEntry] = []
+            for file in model.files {
+                if let root = ModelArchiveExpander.modelRoot(forArchive: file.path), parts.contains(root) {
+                    try ModelArchiveExpander.expand(folder.appendingPathComponent(model.localPath(for: file.path)),
+                                                    root: model.localPath(for: root), in: folder, inflate: ZipArchive.systemInflater)
+                } else {
+                    remaining.append(file)
+                }
+            }
+            model.files = remaining
+        }
+        return model
     }
 
     private func completeDownload(_ original: InstalledModel) {

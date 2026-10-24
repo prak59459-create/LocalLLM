@@ -473,6 +473,25 @@ enum CodingAgentPrompt { static func system(...), implement(_:), brainstorm(from
 enum SyntaxHighlighter { static func tokens(in:language:) -> [HighlightToken] }   // UTF-16 の位置
 ```
 
+## Core/Hub: コンテキスト長の変更（ContextResizer）
+
+```swift
+enum ContextResizer {
+    static func analyze(mil: String) throws -> Analysis   // state の形からコンテキスト長と軸、固定長か、RoPE の表
+    static func rewriteMIL(_:analysis:newContext:ropeRedirects:) throws -> (text: String, count: Int)
+    static func rewriteDescriptionFile(_:analysis:newContext:) throws -> Data   // coremldata.bin（protobuf）
+    static func rewriteMetadata(_:analysis:newContext:) throws -> Data          // metadata.json
+    static func resize(modelDirectory:to:backup:) throws -> Analysis           // .mlmodelc を書き換える（元は backup に残す）
+    static func restore(modelDirectory:backup:) throws
+}
+```
+
+- 重みの行（BLOBFILE）は変えない。形のリストは、KV キャッシュの「コンテキストの軸より後ろの次元」（head_dim など）と並びがそろうものだけを変える
+  （hidden size がコンテキスト長と同じモデルでも、重みや hidden の形は変わらない）。固定長（ANEMLL）はマスクとアテンションの形も変える
+- 重みの中の RoPE の表（gather で位置ごとに引く const）は、`RopeTable` で周波数を推定して長い表を作り、`weights/context_rope.bin`（`MILBlob` の形式）に書く。
+  32k を超えるときは、表を引く位置の cast を int32 にする
+- macOS の CI で、本物のモデル（Qwen2.5 0.5B、ANEMLL Qwen3 0.6B）を書き換えて Core ML で読み込み、元の長さを超えた位置で推論できることを確かめている
+
 ## Core/Update
 
 ```swift

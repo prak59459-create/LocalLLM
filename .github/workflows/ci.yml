@@ -70,7 +70,7 @@ jobs:
         run: ./Tools/fetch_fixtures.sh
 
       - name: Test
-        run: swift test --filter "Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|SHA1|GitHubSource|PackageManifest|UpdateDiff|PackageScanner|AgentContext|MemoryBudget|SlimTool|SplitParts|TokenizerSynthesizer|Tool|JSONValue|MCP|ContextResizer|ProtoWire|HalfAndBlob|RopeTable"
+        run: swift test --filter "Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|SHA1|GitHubSource|PackageManifest|UpdateDiff|PackageScanner|AgentContext|MemoryBudget|MemoryTrend|MemoryRecovery|SlimTool|SplitParts|TokenizerSynthesizer|Tool|JSONValue|MCP|ContextResizer|ProtoWire|HalfAndBlob|RopeTable"
 
       # コンテキスト長を変えた本物のモデルを Core ML で読み込んで、元の長さを超えた位置で推論できるか確かめる
       - name: Download models for the Core ML end-to-end test

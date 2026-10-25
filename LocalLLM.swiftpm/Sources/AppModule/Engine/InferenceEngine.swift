@@ -61,6 +61,8 @@ actor InferenceEngine {
     private var baselineFootprint: Int64?
     /// 次の生成の前にモデルを読み直してメモリを空ける
     private var needsReload = false
+    /// メモリが足りなくなったときに縮めた、コンテキストの上限（別のモデルを読み込むと元に戻す）
+    private var memoryContextCap: Int?
     /// 読み込みのたびに増やす。読み込み中に別の読み込み・解放が来たら、古いほうの結果は捨てる。
     private var loadGeneration = 0
 
@@ -97,6 +99,7 @@ actor InferenceEngine {
         model.gate = gate
         reloadSource = (files, computeUnits)
         needsReload = false
+        memoryContextCap = nil
 
         let info = LoadedModelInfo(
             modelID: files.modelID,
@@ -164,6 +167,7 @@ actor InferenceEngine {
         loaded = nil
         reloadSource = nil
         needsReload = false
+        memoryContextCap = nil
     }
 
     /// 会話の途中経過（KV キャッシュ）を捨てる。生成中なら止めてから。
@@ -240,122 +244,191 @@ actor InferenceEngine {
                 return
             }
         }
-        guard let loaded else {
+        // トークナイザなどはモデルを読み直しても変わらない。モデル本体は読み直すことがあるので、ここでは持たない
+        // （古いモデルを持ったまま読み直すと、2 つ分のメモリを使ってしまう）
+        guard case let (tokenizer, renderer, stopTokenIDs, stopStrings, modelMax)? = loadedSetup() else {
             continuation.finish(throwing: EngineError.modelNotLoaded)
             return
         }
+        let parameters = request.parameters
         let chunkSize = prefillChunkSize
+        var maxContext = contextLimit > 0 ? min(modelMax, max(contextLimit, 256)) : modelMax
+        // 前にメモリが足りなくなった長さより長くはしない
+        if let cap = memoryContextCap { maxContext = min(maxContext, cap) }
+
+        var sampler = TokenSampler(parameters: parameters)
+        let detokenizer = StreamingDetokenizer(tokenizer: tokenizer, skipSpecialTokens: true)
+        var stopMatcher = StopSequenceMatcher(stopSequences: stopStrings)
+        /// ここまでに生成したトークン（読み直したあとも、この続きから生成する）
+        var generated: [Int] = []
+        var reason: StopReason = .maxTokens
+        var stoppedByString = false
+        var retries = 0
+        var needsRecovery = false
+        var decodeSeconds = 0.0
+
         do {
-            let parameters = request.parameters
-            var maxContext = contextLimit > 0 ? min(loaded.model.maxContext, max(contextLimit, 256)) : loaded.model.maxContext
-            // 毎回系列全体を入力するモデルは、長いほど 1 回でメモリを使うので、今の空きで扱える長さまでにする
-            if loaded.model.isStateless, let limit = gate.statelessLimit() {
-                maxContext = max(64, min(maxContext, limit))
-            }
-            // KV キャッシュをこれから作るなら、その分の空きがあるか
-            if loaded.model.needsNewState, let bytes = reloadSource?.files.stateBytes, bytes > 0, !gate.canAllocate(bytes) {
-                throw EngineError.stateTooLarge(needed: bytes, available: DeviceMemory.availableBytes)
-            }
-            // 生成用に残しておく枠（コンテキストの半分まで）。
-            let reserve = max(16, min(parameters.maxNewTokens, maxContext / 2))
-            let prompt = try PromptAssembler.assemble(
-                systemPrompt: request.systemPrompt,
-                history: request.history,
-                renderer: loaded.renderer,
-                tokenizer: loaded.tokenizer,
-                contextLength: maxContext,
-                reserveTokens: reserve,
-                enableThinking: request.enableThinking,
-                tools: request.tools
-            )
-            stats.promptTokens = prompt.tokens.count
-            continuation.yield(.promptReady(promptTokens: prompt.tokens.count, droppedMessages: prompt.droppedMessageCount))
-
-            // プロンプトの読み込み
-            let prefillStart = Date()
-            let (firstScores, reused) = try await loaded.model.evaluate(tokens: prompt.tokens, chunkSize: chunkSize) { done, total in
-                continuation.yield(.prefill(done: done, total: total))
-            }
-            stats.reusedPromptTokens = reused
-            stats.prefillSeconds = Date().timeIntervalSince(prefillStart)
-
-            // 1 トークンずつ生成
-            var scores = firstScores
-            var sampler = TokenSampler(parameters: parameters)
-            let detokenizer = StreamingDetokenizer(tokenizer: loaded.tokenizer, skipSpecialTokens: true)
-            var stopMatcher = StopSequenceMatcher(stopSequences: loaded.stopStrings)
-            var history = prompt.tokens
-            let decodeStart = Date()
-            var reason: StopReason = .maxTokens
-            var stoppedByString = false
-
-            generation: while stats.generatedTokens < parameters.maxNewTokens {
-                if Task.isCancelled { reason = .cancelled; break }
-                let next: Int
-                switch scores {
-                case .logits(var logits):
-                    next = sampler.sample(logits: &logits, previousTokens: history)
-                case .token(let token):
-                    // 出力層が選んだトークン（温度などは効かない形式）
-                    next = token
+            attempt: while true {
+                // 前の回のモデルへの参照が消えてから、メモリを空ける（モデルを読み直すこともある）
+                if needsRecovery {
+                    needsRecovery = false
+                    try await freeMemoryForRetry()
                 }
-                if loaded.stopTokenIDs.contains(next) { reason = .endOfTurn; break }
-                history.append(next)
-                stats.generatedTokens += 1
-
-                let piece = detokenizer.append(next)
-                if !piece.isEmpty {
-                    let (emit, stopped) = stopMatcher.feed(piece)
-                    if !emit.isEmpty { continuation.yield(.text(emit)) }
-                    if stopped {
-                        reason = .endOfTurn
-                        stoppedByString = true
-                        break generation
-                    }
+                guard let model = loaded?.model else { throw EngineError.modelNotLoaded }
+                var limit = maxContext
+                // 毎回系列全体を入力するモデルは、長いほど 1 回でメモリを使うので、今の空きで扱える長さまでにする
+                if model.isStateless, let stateless = gate.statelessLimit() {
+                    limit = max(64, min(limit, stateless))
                 }
-                if history.count >= maxContext { reason = .contextFull; break }
-                if stats.generatedTokens >= parameters.maxNewTokens { reason = .maxTokens; break }
+                // KV キャッシュをこれから作るなら、その分の空きがあるか
+                if model.needsNewState, let bytes = reloadSource?.files.stateBytes, bytes > 0, !gate.canAllocate(bytes) {
+                    throw EngineError.stateTooLarge(needed: bytes, available: DeviceMemory.availableBytes)
+                }
+                // 生成用に残しておく枠（コンテキストの半分まで。読み直すときは、もう生成した分も入るように）
+                var reserve = max(16, min(parameters.maxNewTokens, limit / 2))
+                if !generated.isEmpty { reserve = max(reserve, min(generated.count + 64, limit * 3 / 4)) }
+                let prompt = try PromptAssembler.assemble(
+                    systemPrompt: request.systemPrompt,
+                    history: request.history,
+                    renderer: renderer,
+                    tokenizer: tokenizer,
+                    contextLength: limit,
+                    reserveTokens: reserve,
+                    enableThinking: request.enableThinking,
+                    tools: request.tools
+                )
+                stats.promptTokens = prompt.tokens.count
+                continuation.yield(.promptReady(promptTokens: prompt.tokens.count, droppedMessages: prompt.droppedMessageCount))
+
+                var history = prompt.tokens + generated
+                let progress = PrefillProgress()
                 do {
-                    // 落ちる前に止める（毎トークン、残りのメモリを確かめる）
-                    try gate.check()
-                    scores = try await loaded.model.append(token: next)
-                } catch is CancellationError {
-                    reason = .cancelled
-                    break
-                } catch EngineError.lowMemory {
-                    reason = .lowMemory
-                    break
+                    // プロンプト（と、読み直すときは生成済みの分）を読み込む
+                    gate.begin()
+                    let prefillStart = Date()
+                    let (firstScores, reused) = try await model.evaluate(tokens: history, chunkSize: chunkSize) { done, total in
+                        progress.done = done
+                        continuation.yield(.prefill(done: done, total: total))
+                    }
+                    if retries == 0 { stats.reusedPromptTokens = reused }
+                    stats.prefillSeconds += Date().timeIntervalSince(prefillStart)
+                    progress.done = history.count
+
+                    // 1 トークンずつ生成
+                    var scores = firstScores
+                    let decodeStart = Date()
+                    defer { decodeSeconds += Date().timeIntervalSince(decodeStart) }
+                    generation: while generated.count < parameters.maxNewTokens {
+                        if Task.isCancelled { reason = .cancelled; break }
+                        let next: Int
+                        switch scores {
+                        case .logits(var logits):
+                            next = sampler.sample(logits: &logits, previousTokens: history)
+                        case .token(let token):
+                            // 出力層が選んだトークン（温度などは効かない形式）
+                            next = token
+                        }
+                        if stopTokenIDs.contains(next) { reason = .endOfTurn; break }
+                        history.append(next)
+                        generated.append(next)
+                        stats.generatedTokens = generated.count
+
+                        let piece = detokenizer.append(next)
+                        if !piece.isEmpty {
+                            let (emit, stopped) = stopMatcher.feed(piece)
+                            if !emit.isEmpty { continuation.yield(.text(emit)) }
+                            if stopped {
+                                reason = .endOfTurn
+                                stoppedByString = true
+                                break generation
+                            }
+                        }
+                        if history.count >= limit { reason = .contextFull; break }
+                        if generated.count >= parameters.maxNewTokens { reason = .maxTokens; break }
+                        progress.done = history.count
+                        do {
+                            // 落ちる前に止める（毎トークン、残りのメモリと減り方を確かめる）
+                            try gate.check()
+                            scores = try await model.append(token: next)
+                        } catch is CancellationError {
+                            reason = .cancelled
+                            break
+                        }
+                    }
+                    break attempt
+                } catch EngineError.lowMemory(let available) {
+                    // 足りなくなった: メモリを空けて、短くして読み直す（ここまでに書いた分はそのまま続ける）
+                    guard retries < MemoryRecovery.maxRetries, !Task.isCancelled else {
+                        throw EngineError.lowMemory(available: available)
+                    }
+                    retries += 1
+                    continuation.yield(.status(L("メモリが足りなくなりそうなので、空けてから古いやり取りを省いて読み直しています…",
+                                                 "Running low on memory — freeing it and re-reading with less history…")))
+                    if let shrunk = MemoryRecovery.shrunkContext(current: limit, reached: progress.done) {
+                        maxContext = shrunk
+                        memoryContextCap = min(memoryContextCap ?? modelMax, shrunk)
+                    }
+                    needsRecovery = true
+                    continue attempt
                 }
             }
-            stats.decodeSeconds = Date().timeIntervalSince(decodeStart)
-
-            // 残りを出し切る（停止文字列の一部かもしれないと保留していた分も含む）。
-            // 停止文字列そのもので止まった場合は、それ以降は表示しない。
-            if !stoppedByString {
-                var (emit, stopped) = stopMatcher.feed(detokenizer.flush())
-                if !stopped { emit += stopMatcher.flush() }
-                if !emit.isEmpty { continuation.yield(.text(emit)) }
-            }
-            if Task.isCancelled { reason = .cancelled }
-            stats.stopReason = reason
-            if reason == .lowMemory { recoverFromLowMemory() }
-            continuation.yield(.finished(stats))
-            continuation.finish()
         } catch EngineError.lowMemory {
-            // プロンプトを読んでいる途中で足りなくなった
-            stats.stopReason = .lowMemory
+            // 読み直しても足りなかった
+            reason = .lowMemory
             recoverFromLowMemory()
-            continuation.yield(.finished(stats))
-            continuation.finish()
         } catch is CancellationError {
-            stats.stopReason = .cancelled
-            continuation.yield(.finished(stats))
-            continuation.finish()
+            reason = .cancelled
         } catch {
             continuation.finish(throwing: error)
+            return
+        }
+        stats.decodeSeconds = decodeSeconds
+
+        // 残りを出し切る（停止文字列の一部かもしれないと保留していた分も含む）。
+        // 停止文字列そのもので止まった場合は、それ以降は表示しない。
+        if !stoppedByString {
+            var (emit, stopped) = stopMatcher.feed(detokenizer.flush())
+            if !stopped { emit += stopMatcher.flush() }
+            if !emit.isEmpty { continuation.yield(.text(emit)) }
+        }
+        if Task.isCancelled { reason = .cancelled }
+        stats.stopReason = reason
+        // 最後まで書けて、メモリにも余裕があれば、縮めていた上限を少し戻す
+        if reason != .lowMemory, reason != .cancelled, let cap = memoryContextCap,
+           let budget = DeviceMemory.budget, budget.available > budget.low * 2 {
+            memoryContextCap = MemoryRecovery.relaxedCap(cap, modelMax: modelMax)
+        }
+        continuation.yield(.finished(stats))
+        continuation.finish()
+    }
+
+    /// 読み込んだモデルの、生成に使う部品（モデル本体は含めない）
+    private func loadedSetup() -> (HFTokenizer, ChatTemplateRenderer, Set<Int>, [String], Int)? {
+        guard let loaded else { return nil }
+        return (loaded.tokenizer, loaded.renderer, loaded.stopTokenIDs, loaded.stopStrings, loaded.model.maxContext)
+    }
+
+    /// メモリ不足で止まったあと、続けるためにメモリを空ける: KV キャッシュを捨て、
+    /// まだ足りないか、読み込んだときより大きく増えていれば、モデルも読み直す（Core ML の中に溜まった分が空く）
+    private func freeMemoryForRetry() async throws {
+        loaded?.model.resetCache()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let grown: Bool
+        if let base = baselineFootprint, let now = DeviceMemory.footprintBytes {
+            grown = now - base > max(200 << 20, base / 4)
+        } else {
+            grown = false
+        }
+        if grown || (DeviceMemory.budget?.isLow ?? false) {
+            try await reloadRunner()
         }
     }
 
+}
+
+/// プロンプトをどこまで読めたか（足りなくなったとき、どこまで短くするかに使う）
+private final class PrefillProgress: @unchecked Sendable {
+    var done = 0
 }
 
 /// 読み込みに必要なファイルの場所。

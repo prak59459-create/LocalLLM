@@ -196,6 +196,17 @@ final class PipelineLanguageModel: LanguageModelRunner {
 
     /// batchSize 個にそろえて（足りなければ 0 で埋めて）まとめて読み込む。出力は使わない。
     private func prefill(_ tokens: [Int], at position: Int, state: MLState) async throws {
+        try await InferenceQueue.run { try self.prefillNow(tokens, at: position, state: state) }
+    }
+
+    /// 1 トークンを計算する。needScores なら次のトークンのスコアを返す。
+    private func infer(token: Int, at position: Int, state: MLState, needScores: Bool) async throws -> NextTokenScores? {
+        try await InferenceQueue.run { try self.inferNow(token: token, at: position, state: state, needScores: needScores) }
+    }
+
+    // InferenceQueue の中で動かす（予測ごとに一時的な出力が解放される）
+
+    private func prefillNow(_ tokens: [Int], at position: Int, state: MLState) throws {
         var padded = tokens
         padded.append(contentsOf: repeatElement(0, count: batchSize - tokens.count))
         let ids = try CoreMLTensors.int32Array(padded, shape: [1, batchSize])
@@ -204,31 +215,32 @@ final class PipelineLanguageModel: LanguageModelRunner {
                                                 dataType: maskType)
         let current = try CoreMLTensors.int32Array([position], shape: [1])
         let rotate = (descriptor.slidingWindow.map { position >= $0 }) ?? false
-        var hidden = try await embed(ids)
+        var hidden = try embedNow(ids)
         for chunk in chunks {
             guard let base = chunk.prefill else { throw EngineError.unsupportedModel("prefill") }
             let model = rotate ? (chunk.prefillRotate ?? base) : base
             let input = try inputs(for: model, hidden: hidden, ids: ids, positions: positions, mask: mask,
                                    current: current, position: position)
-            let output = try await model.prediction(from: input, using: state, options: MLPredictionOptions())
-            if let next = output.featureValue(for: "output_hidden_states")?.multiArrayValue { hidden = next }
+            try autoreleasepool {
+                let output = try model.prediction(from: input, using: state, options: MLPredictionOptions())
+                if let next = output.featureValue(for: "output_hidden_states")?.multiArrayValue { hidden = next }
+            }
         }
     }
 
-    /// 1 トークンを計算する。needScores なら次のトークンのスコアを返す。
-    private func infer(token: Int, at position: Int, state: MLState, needScores: Bool) async throws -> NextTokenScores? {
+    private func inferNow(token: Int, at position: Int, state: MLState, needScores: Bool) throws -> NextTokenScores? {
         let ids = try CoreMLTensors.int32Array([token], shape: [1, 1])
         let positions = try CoreMLTensors.int32Array([position], shape: [1])
         let mask = try CoreMLTensors.causalMask(rows: 1, columns: maxContext, firstRowPosition: position, dataType: maskType)
         let current = try CoreMLTensors.int32Array([position], shape: [1])
         let rotate = (descriptor.slidingWindow.map { position >= $0 }) ?? false
-        var hidden = try await embed(ids)
+        var hidden = try embedNow(ids)
         var lastOutput: MLFeatureProvider?
         for chunk in chunks {
             let model = rotate ? (chunk.inferRotate ?? chunk.infer) : chunk.infer
             let input = try inputs(for: model, hidden: hidden, ids: ids, positions: positions, mask: mask,
                                    current: current, position: position)
-            let output = try await model.prediction(from: input, using: state, options: MLPredictionOptions())
+            let output = try model.prediction(from: input, using: state, options: MLPredictionOptions())
             lastOutput = output
             if let next = output.featureValue(for: "output_hidden_states")?.multiArrayValue { hidden = next }
         }
@@ -236,17 +248,17 @@ final class PipelineLanguageModel: LanguageModelRunner {
         if let lmHead {
             guard let hidden else { throw EngineError.missingOutput("output_hidden_states") }
             let input = try MLDictionaryFeatureProvider(dictionary: ["hidden_states": MLFeatureValue(multiArray: hidden)])
-            lastOutput = try await lmHead.prediction(from: input, options: MLPredictionOptions())
+            lastOutput = try lmHead.prediction(from: input, options: MLPredictionOptions())
         }
         guard let lastOutput else { throw EngineError.missingOutput("logits") }
         return try scores(from: lastOutput)
     }
 
     /// 埋め込み（一体型なら nil）
-    private func embed(_ ids: MLMultiArray) async throws -> MLMultiArray? {
+    private func embedNow(_ ids: MLMultiArray) throws -> MLMultiArray? {
         guard let embeddings else { return nil }
         let input = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: ids)])
-        let output = try await embeddings.prediction(from: input, options: MLPredictionOptions())
+        let output = try embeddings.prediction(from: input, options: MLPredictionOptions())
         if let hidden = output.featureValue(for: "hidden_states")?.multiArrayValue { return hidden }
         for name in output.featureNames {
             if let value = output.featureValue(for: name)?.multiArrayValue { return value }

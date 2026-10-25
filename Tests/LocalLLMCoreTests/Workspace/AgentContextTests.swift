@@ -89,3 +89,58 @@ final class MemoryBudgetTests: XCTestCase {
         XCTAssertEqual(MemoryBudget(available: 10 * mb, appLimit: 3000 * mb).statelessTokenLimit(vocabSize: 151_936, bytesPerLogit: 2), 0)
     }
 }
+
+final class MemoryTrendTests: XCTestCase {
+    private let mb: Int64 = 1 << 20
+
+    func testWarmUpDropsAreIgnored() {
+        var trend = MemoryTrend()
+        // KV キャッシュを作る最初の 1 回で大きく減っても、数えない
+        trend.record(available: 2000 * mb)
+        trend.record(available: 1200 * mb)
+        XCTAssertEqual(trend.largestDrop, 0)
+        trend.record(available: 1150 * mb)
+        XCTAssertEqual(trend.largestDrop, 50 * mb)
+        // 増えたときは数えない
+        trend.record(available: 1300 * mb)
+        XCTAssertEqual(trend.largestDrop, 50 * mb)
+    }
+
+    func testStopsBeforeTheNextStepWouldRunOut() {
+        var trend = MemoryTrend()
+        for available in [1500, 1400, 1100, 800] { trend.record(available: Int64(available) * mb) }
+        XCTAssertEqual(trend.largestDrop, 300 * mb)
+        let limit: Int64 = 4000 * mb
+        // 次の 1 回で 450MB（300MB の 1.5 倍）減ると見込む。critical は 250MB
+        XCTAssertTrue(trend.isSafe(MemoryBudget(available: 800 * mb, appLimit: limit)))
+        XCTAssertFalse(trend.isSafe(MemoryBudget(available: 650 * mb, appLimit: limit)))
+    }
+
+    func testExpectedDropIsCapped() {
+        var trend = MemoryTrend()
+        for available in [3000, 2900, 1000] { trend.record(available: Int64(available) * mb) }
+        // 一度だけの大きな減りは、アプリの上限の 1/8 まで（の 1.5 倍）しか見込まない
+        XCTAssertEqual(trend.expectedDrop(appLimit: 3200 * mb), 600 * mb)
+        trend.reset()
+        XCTAssertEqual(trend.largestDrop, 0)
+        XCTAssertTrue(trend.isSafe(MemoryBudget(available: 300 * mb, appLimit: 3200 * mb)))
+    }
+}
+
+final class MemoryRecoveryTests: XCTestCase {
+    func testShrinksToWhatWasReached() {
+        // 2700 トークン読んだところで足りなくなった → 1620 にする
+        XCTAssertEqual(MemoryRecovery.shrunkContext(current: 4096, reached: 2700), 1620)
+        // ほとんど読めていなければ、今の長さから縮める
+        XCTAssertEqual(MemoryRecovery.shrunkContext(current: 2048, reached: 40), 1228)
+        // 最小より短くはしない
+        XCTAssertEqual(MemoryRecovery.shrunkContext(current: 400, reached: 300), 256)
+        XCTAssertNil(MemoryRecovery.shrunkContext(current: 256, reached: 200))
+    }
+
+    func testCapRelaxesBackToTheModelMaximum() {
+        XCTAssertEqual(MemoryRecovery.relaxedCap(1600, modelMax: 4096), 2000)
+        XCTAssertEqual(MemoryRecovery.relaxedCap(200, modelMax: 4096), 264)
+        XCTAssertNil(MemoryRecovery.relaxedCap(3500, modelMax: 4096))
+    }
+}

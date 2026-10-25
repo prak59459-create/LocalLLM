@@ -46,6 +46,37 @@ extension MLMultiArrayDataType {
     }
 }
 
+/// Core ML の予測を、専用の 1 本のスレッドで 1 つずつ動かす。
+///
+/// 予測ごとに autoreleasepool で包むので、出力（プロンプトを読むときの logits [n, 語彙数] など数十 MB の配列）が
+/// 次の予測までに必ず解放される。async の中で直接呼ぶと、こうした一時的なものがプロンプトを読み終わるまで
+/// たまり続け、長いプロンプトの途中でメモリが尽きることがある。
+enum InferenceQueue {
+    private static let queue = DispatchQueue(label: "LocalLLM.inference", qos: .userInitiated, autoreleaseFrequency: .workItem)
+
+    static func run<T>(_ work: @escaping () throws -> T) async throws -> T {
+        let job = UncheckedSendable(work)
+        let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UncheckedSendable<T>, Error>) in
+            queue.async {
+                autoreleasepool {
+                    do {
+                        continuation.resume(returning: UncheckedSendable(try job.value()))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+        return result.value
+    }
+}
+
+/// スレッドをまたいで渡すための入れ物（InferenceEngine が 1 つずつ順番に使うので、同時には触らない）
+struct UncheckedSendable<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
 /// MLMultiArray の作成・読み出しの共通処理（最適化なしのビルドでも速いように、まとめて書き込む）。
 enum CoreMLTensors {
     static func int32Array(_ values: [Int], shape: [Int]) throws -> MLMultiArray {

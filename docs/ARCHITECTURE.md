@@ -425,9 +425,17 @@ enum ByteFormat { static func string(_ bytes: Int64) -> String }   // 例: "1.9 
 - `MemoryBudget`（Core/Generation）: 残り（`os_proc_available_memory`）とアプリの上限から、危ない線（`critical`）・少ない線（`low`）、
   プロンプトを流し込む 1 回の大きさ（logits [n, 語彙] が収まる n）、毎回全体を入力するモデルで扱える長さを計算する。
 - `MemoryGate`（Engine/DeviceMemory）: prefill のチャンクごと・生成の 1 トークンごとに残りを確かめ、危なければ `EngineError.lowMemory`。
-  エンジンはそれを `StopReason.lowMemory` として普通に終わらせる（iOS に強制終了されない）。メモリ警告のあとはしばらく控えめにし、
-  生成していなければ KV キャッシュを捨てる。読み込んだときより大きく増えていたら、次の生成の前にモデルだけ読み直して空ける。
-  KV キャッシュを作る前に、その大きさ（`stateBytes`）が空きに収まるかも確かめる。
+  `MemoryTrend`（Core）で 1 回ごとの減り方を覚えておき、「次の 1 回で危ない線を割りそう」なときも先に止める
+  （最初の 2 回は KV キャッシュの作成などで大きく減るので数えない）。
+- `InferenceQueue`（Engine/LanguageModelRunner）: Core ML の予測はすべて専用の 1 本のスレッドで同期的に動かし、
+  1 回ごとに `autoreleasepool` で包む。async の予測を続けて呼ぶと、logits などの一時的な出力がプロンプトを読み終わるまで溜まるため。
+- 自動の立て直し（`InferenceEngine.runGeneration`）: `lowMemory` で止まったら、KV キャッシュを捨て、まだ足りないか
+  読み込んだときより大きく増えていればモデルも読み直し（古いモデルへの参照を手放してから）、`MemoryRecovery.shrunkContext`
+  （読めたところの 3/5、最小 256）まで縮めてプロンプトを組み立て直し、生成済みのトークンを足して続きから生成する（最大 2 回）。
+  縮めた長さは `memoryContextCap` として次の生成にも使い、余裕のある状態で最後まで書けたら少しずつ戻す。
+  2 回やり直しても足りなければ `StopReason.lowMemory` として普通に終わらせる（iOS に強制終了されない）。
+- メモリ警告のあとはしばらく控えめにし、生成していなければ KV キャッシュを捨てる。読み込んだときより大きく増えていたら、
+  次の生成の前にモデルだけ読み直して空ける。KV キャッシュを作る前に、その大きさ（`stateBytes`）が空きに収まるかも確かめる。
 - CDWS: `AgentContext.compact` で、直近の依頼だけ・古いツールの結果は 1 行・書いたファイルの中身（引数）は省いて渡す。
   メモリ不足で止まったあとは `Budget.tight` でさらに短くする。
 

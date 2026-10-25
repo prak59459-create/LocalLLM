@@ -202,6 +202,16 @@ final class CoreMLLanguageModel: LanguageModelRunner {
 
     private func predictStateful(chunk: [Int], pastLength: Int, state: MLState, idsName: String, maskName: String,
                                  logitsName: String, maskType: TensorSpec.DataType) async throws -> [Float] {
+        let model = self.model
+        return try await InferenceQueue.run {
+            try Self.predictStatefulNow(model: model, chunk: chunk, pastLength: pastLength, state: state, idsName: idsName,
+                                        maskName: maskName, logitsName: logitsName, maskType: maskType)
+        }
+    }
+
+    /// 1 回の予測（InferenceQueue の中で動かす。大きな出力はここを抜けるときに解放される）
+    private static func predictStatefulNow(model: MLModel, chunk: [Int], pastLength: Int, state: MLState, idsName: String,
+                                           maskName: String, logitsName: String, maskType: TensorSpec.DataType) throws -> [Float] {
         let n = chunk.count
         let ids = try CoreMLTensors.int32Array(chunk, shape: [1, n])
         let mask = try CoreMLTensors.causalMask(rows: n, columns: pastLength + n, firstRowPosition: pastLength,
@@ -210,7 +220,7 @@ final class CoreMLLanguageModel: LanguageModelRunner {
             idsName: MLFeatureValue(multiArray: ids),
             maskName: MLFeatureValue(multiArray: mask),
         ])
-        let output = try await model.prediction(from: input, using: state, options: MLPredictionOptions())
+        let output = try model.prediction(from: input, using: state, options: MLPredictionOptions())
         guard let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
             throw EngineError.missingOutput(logitsName)
         }
@@ -238,17 +248,21 @@ final class CoreMLLanguageModel: LanguageModelRunner {
             features[maskName] = MLFeatureValue(multiArray: mask)
         }
         let input = try MLDictionaryFeatureProvider(dictionary: features)
-        let output = try await model.prediction(from: input, options: MLPredictionOptions())
-        guard let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
-            throw EngineError.missingOutput(logitsName)
+        let model = self.model
+        let position = tokens.count - 1
+        return try await InferenceQueue.run {
+            let output = try model.prediction(from: input, options: MLPredictionOptions())
+            guard let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
+                throw EngineError.missingOutput(logitsName)
+            }
+            return try Self.row(of: logits, position: position)
         }
-        return try row(of: logits, position: tokens.count - 1)
     }
 
     // MARK: - 補助
 
     /// logits から指定位置の 1 行（語彙数ぶん）を Float 配列として取り出す。
-    private func row(of logits: MLMultiArray, position: Int) throws -> [Float] {
+    private static func row(of logits: MLMultiArray, position: Int) throws -> [Float] {
         let layout = try CoreMLTensors.rowLayout(of: logits, position: position)
         var result = [Float](repeating: 0, count: layout.count)
         CoreMLTensors.copyRow(of: logits, elementOffset: layout.offset, count: layout.count, stride: layout.stride,

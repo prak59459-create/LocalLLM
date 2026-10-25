@@ -75,6 +75,9 @@ final class MemoryGate {
     /// iOS からメモリ不足の警告を受けた（しばらくは控えめに計算する）
     private(set) var warnedAt: Date?
 
+    /// 1 回ごとの減り方（次の 1 回で尽きないかの見積もり）
+    private var trend = MemoryTrend()
+
     func noteWarning() { warnedAt = Date() }
 
     private var recentlyWarned: Bool {
@@ -82,10 +85,15 @@ final class MemoryGate {
         return Date().timeIntervalSince(warnedAt) < 90
     }
 
-    /// 計算の前に呼ぶ。残りが危ないところまで減っていたら EngineError.lowMemory を投げる。
+    /// プロンプトを読み始める前に呼ぶ（減り方の記録をやり直す）
+    func begin() { trend.reset() }
+
+    /// 計算の前に呼ぶ。残りが危ないところまで減っていたら、または次の 1 回で危なくなりそうなら、
+    /// EngineError.lowMemory を投げる。
     func check() throws {
         guard let budget = DeviceMemory.budget else { return }
-        if budget.isCritical || (recentlyWarned && budget.isLow) {
+        trend.record(available: budget.available)
+        if budget.isCritical || (recentlyWarned && budget.isLow) || !trend.isSafe(budget) {
             throw EngineError.lowMemory(available: budget.available)
         }
     }

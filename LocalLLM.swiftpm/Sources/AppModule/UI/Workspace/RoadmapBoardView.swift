@@ -26,7 +26,7 @@ struct RoadmapBoardView: View {
             board(size: geometry.size)
         }
         .clipped()
-        .background(Color(uiColor: .systemGroupedBackground))
+        .background(CDWSDotGrid())
         .overlay(alignment: .topLeading) { boardToolbar }
         .overlay(alignment: .bottomLeading) { RoadmapLegend().padding(12) }
         .overlay(alignment: .top) { connectHint }

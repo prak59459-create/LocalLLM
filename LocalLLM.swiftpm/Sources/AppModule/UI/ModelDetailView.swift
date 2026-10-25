@@ -85,13 +85,18 @@ struct ModelDetailView: View {
     @ViewBuilder
     private func warnings(_ analysis: RepoAnalysis) -> some View {
         let needsToken = (info?.gated ?? false) && settings.huggingFaceToken.isEmpty
-        if !analysis.hasTokenizer || needsToken {
+        if !analysis.hasTokenizerJSON || needsToken {
             Section {
                 if !analysis.hasTokenizer {
-                    Label(L("tokenizer.json が含まれていません。このままでは使えません。",
-                            "tokenizer.json is not included, so this repository cannot be used as is."),
-                          systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
+                    Label(L("トークナイザが入っていません。読み込むときに、元のモデル（base_model）か同じ系列のモデルから自動で取ってきます。",
+                            "No tokenizer is included. It will be fetched from the base model or the same model family when loading."),
+                          systemImage: "arrow.down.circle")
+                        .foregroundStyle(.blue)
+                } else if !analysis.hasTokenizerJSON {
+                    Label(L("tokenizer.json はありませんが、tokenizer.model などから端末で作って使います。",
+                            "There is no tokenizer.json, but one will be built on the device from tokenizer.model or similar files."),
+                          systemImage: "wand.and.stars")
+                        .foregroundStyle(.blue)
                 }
                 if needsToken {
                     Label(L("このモデルは利用規約への同意が必要です。設定で Hugging Face のトークンを入力してください。",
@@ -314,7 +319,8 @@ private struct VariantRow: View {
     /// ZIP は中に tokenizer.json が入っていることがあるので、付属ファイルが無くてもダウンロードできる
     private var canDownload: Bool {
         if variant.kind == .archive { return true }
-        return analysis.hasTokenizer && metadata?.interface.isSupported != false
+        // トークナイザが無くても、読み込むときに作るか取ってくる
+        return metadata?.interface.isSupported != false
     }
 
     @ViewBuilder

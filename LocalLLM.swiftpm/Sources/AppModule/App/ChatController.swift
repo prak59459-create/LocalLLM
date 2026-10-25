@@ -68,9 +68,12 @@ final class ChatController {
             forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.notice = L("メモリが不足しています。アプリが終了されるおそれがあるので、小さいモデルに切り替えるか、他のアプリを閉じてください。",
-                                 "Memory is running low. The app may be terminated; switch to a smaller model or close other apps.")
-                self?.refreshMemory()
+                guard let self else { return }
+                // 生成は控えめに続け、危なくなったら自分で止める（KV キャッシュも空ける）
+                await self.engine.noteMemoryWarning()
+                self.notice = L("メモリが少なくなっています。落ちないよう計算を小さく区切り、足りなくなったら途中で止めます。",
+                                "Memory is getting low. Work is split into smaller steps and will stop early instead of crashing.")
+                self.refreshMemory()
             }
         }
     }
@@ -112,7 +115,7 @@ final class ChatController {
                 } else {
                     loadState = .loading(model.displayName)
                 }
-                let files = try await library.prepareFiles(for: id)
+                let files = try await library.prepareFiles(for: id, client: settings.makeHFClient())
                 loadState = .loading(model.displayName)
                 await engine.setContextLimit(settings.contextLimit)
                 let info = try await engine.load(files: files,
@@ -318,12 +321,18 @@ final class ChatController {
                         reply?.toolCalls = calls
                         reply?.stats = stats
                         self.lastStats = stats
+                        if stats.stopReason == .lowMemory {
+                            self.notice = L("メモリが足りなくなりそうだったので、アプリが落ちないよう途中で止めました。続けるときは「続けて」と送ってください。",
+                                            "Stopped early to keep the app from running out of memory. Send \"continue\" to go on.")
+                        }
                         if calls.isEmpty, content.isEmpty, let reply {
                             // 何も書かなかった返答は残さない
                             conversation.messages.removeAll { $0.id == reply.id }
                             context.delete(reply)
                         }
                         try? context.save()
+                    case .status(let text):
+                        self.notice = text
                     case .toolStarted(let call):
                         self.progress?.phase = .usingTool(call.name)
                     case .toolFinished(let call, let outcome):

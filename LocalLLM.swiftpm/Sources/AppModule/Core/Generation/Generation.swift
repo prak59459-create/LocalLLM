@@ -463,6 +463,8 @@ enum StopTokenResolver {
 /// 生成を止めた理由
 enum StopReason: String, Codable, Sendable {
     case endOfTurn, maxTokens, contextFull, cancelled, error
+    /// メモリが足りなくなりそうなので、落ちる前に止めた
+    case lowMemory
 }
 
 /// 生成の統計（画面に表示する）

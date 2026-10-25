@@ -57,43 +57,74 @@ struct ModelsView: View {
     }
 }
 
-/// おすすめ一覧。
+/// おすすめ一覧（会話・コーディング・推論・軽量に分けて）。
 private struct RecommendedModelsList: View {
-    @Environment(ModelLibrary.self) private var library
-
     var body: some View {
         List {
+            ForEach(RecommendedModel.Category.allCases) { category in
+                RecommendedCategorySection(category: category)
+            }
             Section {
-                ForEach(RecommendedModels.all) { model in
-                    NavigationLink(value: model.repoID) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(model.title).font(.headline)
-                                if model.isExperimental {
-                                    Badge(text: L("試験的", "Experimental"), color: .orange)
-                                }
-                                if library.models.contains(where: { $0.repoID == model.repoID && $0.isComplete }) {
-                                    Badge(text: L("入手済み", "Installed"), color: .green)
-                                }
-                            }
-                            HStack(spacing: 10) {
-                                Text(ByteFormat.string(model.approximateBytes))
-                                Text(model.japanese.label)
-                            }
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            Text(model.note)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
+                EmptyView()
             } footer: {
-                Text(L("どれも Hugging Face で公開されている Core ML 形式（iOS 18 のステートフルモデル）です。RAM が少ない iPad では小さいモデルから試してください。",
-                       "All are Core ML models (iOS 18 stateful format) published on Hugging Face. On iPads with less RAM, start with a small one."))
+                Text(L("どれも Hugging Face で公開されている Core ML 形式（iOS 18 のステートフルモデル、または Neural Engine 向けの分割モデル）です。RAM が少ない iPad では小さいモデルから試してください。",
+                       "All are Core ML models published on Hugging Face (iOS 18 stateful models or split models for the Neural Engine). On iPads with less RAM, start with a small one."))
             }
         }
+    }
+}
+
+private struct RecommendedCategorySection: View {
+    let category: RecommendedModel.Category
+
+    var body: some View {
+        Section {
+            ForEach(RecommendedModels.models(in: category)) { model in
+                NavigationLink(value: model.repoID) {
+                    RecommendedModelRow(model: model)
+                }
+            }
+        } header: {
+            Label(category.title, systemImage: category.symbolName)
+        } footer: {
+            Text(category.subtitle)
+        }
+    }
+}
+
+private struct RecommendedModelRow: View {
+    @Environment(ModelLibrary.self) private var library
+    let model: RecommendedModel
+
+    private var isInstalled: Bool {
+        library.models.contains { $0.repoID == model.repoID && $0.isComplete }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(model.title).font(.headline)
+                if model.isExperimental {
+                    Badge(text: L("試験的", "Experimental"), color: .orange)
+                }
+                if model.isSplitModel {
+                    Badge(text: "ANE", color: .purple)
+                }
+                if isInstalled {
+                    Badge(text: L("入手済み", "Installed"), color: .green)
+                }
+            }
+            HStack(spacing: 10) {
+                Text(ByteFormat.string(model.approximateBytes))
+                Text(model.japanese.label)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            Text(model.note)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
     }
 }
 

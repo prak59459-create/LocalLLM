@@ -146,14 +146,20 @@ struct CDWSPaneSwitcher: View {
     var body: some View {
         HStack(spacing: 4) {
             ForEach(WorkspacePane.allCases) { pane in
-                CDWSPaneButton(pane: pane, isSelected: pane == selection, namespace: namespace) {
-                    withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) { selection = pane }
-                }
+                button(for: pane)
             }
         }
         .padding(4)
         .background(CDWSTheme.panel, in: Capsule())
         .overlay(Capsule().strokeBorder(CDWSTheme.stroke))
+    }
+
+    private func button(for pane: WorkspacePane) -> CDWSPaneButton {
+        CDWSPaneButton(pane: pane, isSelected: pane == selection, namespace: namespace, action: { select(pane) })
+    }
+
+    private func select(_ pane: WorkspacePane) {
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) { selection = pane }
     }
 }
 

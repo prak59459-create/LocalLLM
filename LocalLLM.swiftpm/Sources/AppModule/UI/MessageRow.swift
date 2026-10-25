@@ -12,38 +12,54 @@ struct MessageRow: View {
     var body: some View {
         switch message.role {
         case .user:
-            VStack(alignment: .trailing, spacing: 4) {
-                HStack {
-                    Spacer(minLength: 48)
-                    Text(message.content)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 18))
-                        .contextMenu { menuItems }
-                }
-                let sources = message.sources
-                if !sources.isEmpty {
-                    SourcesCaption(sources: sources)
-                }
-            }
+            userBubble
         case .tool:
             ToolResultView(message: message)
                 .contextMenu { menuItems }
         case .assistant, .system:
-            AssistantMessageView(message: message, isStreaming: isStreaming)
-                .contextMenu { menuItems }
-                .overlay(alignment: .bottomTrailing) {
-                    if isLast && !isStreaming && message.role == .assistant {
-                        Button(action: onRegenerate) {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.footnote)
-                                .padding(6)
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel(L("作り直す", "Regenerate"))
-                    }
-                }
+            assistantRow
+        }
+    }
+
+    private var userBubble: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            HStack {
+                Spacer(minLength: 48)
+                Text(message.content)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 18))
+                    .contextMenu { menuItems }
+            }
+            sourcesCaption
+        }
+    }
+
+    @ViewBuilder
+    private var sourcesCaption: some View {
+        let sources = message.sources
+        if !sources.isEmpty {
+            SourcesCaption(sources: sources)
+        }
+    }
+
+    private var assistantRow: some View {
+        AssistantMessageView(message: message, isStreaming: isStreaming)
+            .contextMenu { menuItems }
+            .overlay(alignment: .bottomTrailing) { regenerateButton }
+    }
+
+    @ViewBuilder
+    private var regenerateButton: some View {
+        if isLast && !isStreaming && message.role == .assistant {
+            Button(action: onRegenerate) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.footnote)
+                    .padding(6)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(L("作り直す", "Regenerate"))
         }
     }
 

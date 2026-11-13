@@ -130,3 +130,11 @@ for entry in "${GGUF_HEADERS[@]}"; do
   code=$(curl -sSL -r 0-16777215 -w "%{http_code}" -o "$target" "https://huggingface.co/$repo/resolve/main/$file" || true)
   if [ "$code" != "206" ] && [ "$code" != "200" ]; then rm -f "$target"; echo "gguf header missing: $repo ($code)"; else echo "gguf header: $repo"; fi
 done
+
+# 画像生成（Stable Diffusion）の CLIP トークナイザの語彙
+mkdir -p "$OUT/clip"
+for f in vocab.json merges.txt; do
+  if [ -s "$OUT/clip/$f" ]; then continue; fi
+  curl -sSL -o "$OUT/clip/$f" "https://huggingface.co/apple/coreml-stable-diffusion-v1-5-palettized/resolve/main/split_einsum_v2/compiled/$f"
+done
+echo "clip fixture: $(ls "$OUT/clip" | tr '\n' ' ')"

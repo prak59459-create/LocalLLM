@@ -11,10 +11,15 @@ struct LocalLLMApp: App {
     @State private var connectors = ConnectorStore()
     @State private var workspaces = WorkspaceStore()
     @State private var updater = AppUpdateController()
+    @State private var imageStudio = ImageStudio()
+    @State private var imageModels = ImageModelStore()
 
     var body: some Scene {
         WindowGroup {
             RootView()
+                .modifier(ImageStudioPresenter())
+                .environment(imageStudio)
+                .environment(imageModels)
                 .environment(settings)
                 .environment(library)
                 .environment(chat)

@@ -144,8 +144,8 @@ struct WelcomeView: View {
             Text(L("iPad の中だけで動く AI チャット", "AI chat that runs entirely on your iPad"))
                 .font(.title2.bold())
                 .multilineTextAlignment(.center)
-            Text(L("Hugging Face から Core ML のモデルをダウンロードして、オフラインで会話できます。",
-                   "Download Core ML models from Hugging Face and chat offline."))
+            Text(L("Hugging Face から Core ML や GGUF のモデルをダウンロードして、オフラインで会話できます。",
+                   "Download Core ML or GGUF models from Hugging Face and chat offline."))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
@@ -176,16 +176,43 @@ struct WelcomeView: View {
                     Label(L("LLM をゼロから学習", "Train an LLM from scratch"), systemImage: "hammer")
                 }
             }
-            Button(action: onShowWorkspace) {
-                Label(L("AI と一緒にコードを書く（CDWS）", "Code together with the AI (CDWS)"),
-                      systemImage: "chevron.left.forwardslash.chevron.right")
+            HStack(spacing: 12) {
+                Button(action: onShowWorkspace) {
+                    Label(L("AI と一緒にコードを書く（CDWS）", "Code together with the AI (CDWS)"),
+                          systemImage: "chevron.left.forwardslash.chevron.right")
+                }
+                ImageStudioButton(title: L("画像を作る", "Generate images"))
             }
-            .buttonStyle(.bordered)
-            .font(.callout)
             .buttonStyle(.bordered)
             .font(.callout)
         }
         .padding(32)
         .frame(maxWidth: 520)
+    }
+}
+
+/// 画像生成の画面を開くボタン（どこに置いても同じ画面が開く）。
+struct ImageStudioButton: View {
+    @Environment(ImageStudio.self) private var studio
+    var title: String = L("画像生成", "Images")
+
+    var body: some View {
+        Button {
+            studio.isPresented = true
+        } label: {
+            Label(title, systemImage: "photo.on.rectangle.angled")
+        }
+    }
+}
+
+/// 画像生成の画面を全画面で出す。
+struct ImageStudioPresenter: ViewModifier {
+    @Environment(ImageStudio.self) private var studio
+
+    func body(content: Content) -> some View {
+        @Bindable var studio = studio
+        content.fullScreenCover(isPresented: $studio.isPresented) {
+            ImageStudioView()
+        }
     }
 }

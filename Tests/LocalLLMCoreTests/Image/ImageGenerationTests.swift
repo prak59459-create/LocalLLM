@@ -94,3 +94,36 @@ final class CLIPTextTokenizerTests: XCTestCase {
         XCTAssertEqual(encoded.last, 49407)
     }
 }
+
+final class ImageRepoLayoutTests: XCTestCase {
+    private func entry(_ path: String, _ size: Int64 = 10) -> HFFileEntry { HFFileEntry(path: path, size: size, lfsSHA256: nil) }
+
+    func testPicksTheNeuralEngineBuildAndSkipsExtras() throws {
+        var entries: [HFFileEntry] = [entry("README.md"), entry("model_split_einsum_v2_compiled.zip", 1_000_000)]
+        for folder in ["original/compiled", "split_einsum_v2/compiled"] {
+            for model in ["TextEncoder", "Unet", "VAEDecoder", "VAEEncoder", "SafetyChecker"] {
+                entries.append(entry("\(folder)/\(model).mlmodelc/coremldata.bin"))
+                entries.append(entry("\(folder)/\(model).mlmodelc/weights/weight.bin", 500))
+            }
+            entries.append(entry("\(folder)/vocab.json"))
+            entries.append(entry("\(folder)/merges.txt"))
+        }
+        let layout = try XCTUnwrap(ImageRepoLayout.find(in: entries))
+        XCTAssertEqual(layout.folder, "split_einsum_v2/compiled")
+        XCTAssertEqual(layout.files.count, 8)
+        XCTAssertFalse(layout.files.contains { $0.path.contains("SafetyChecker") || $0.path.contains("VAEEncoder") })
+        XCTAssertEqual(layout.totalBytes, 3 * 510 + 20)
+        XCTAssertEqual(layout.localPath(for: entry("split_einsum_v2/compiled/Unet.mlmodelc/weights/weight.bin")), "Unet.mlmodelc/weights/weight.bin")
+    }
+
+    func testOtherFoldersAndMissingParts() {
+        let root = ["TextEncoder", "Unet", "VAEDecoder"].map { entry("\($0).mlmodelc/coremldata.bin") } + [entry("vocab.json"), entry("merges.txt")]
+        XCTAssertEqual(ImageRepoLayout.find(in: root)?.folder, "")
+        let custom = ["TextEncoder", "Unet", "VAEDecoder"].map { entry("my/build/\($0).mlmodelc/coremldata.bin") }
+            + [entry("my/build/vocab.json"), entry("my/build/merges.txt")]
+        XCTAssertEqual(ImageRepoLayout.find(in: custom)?.folder, "my/build")
+        // UNet が無ければ使えない
+        XCTAssertNil(ImageRepoLayout.find(in: root.filter { !$0.path.hasPrefix("Unet") }))
+        XCTAssertNil(ImageRepoLayout.find(in: [entry("model.gguf")]))
+    }
+}

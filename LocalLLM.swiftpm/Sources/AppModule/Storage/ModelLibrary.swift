@@ -282,9 +282,9 @@ final class ModelLibrary {
     // MARK: - GGUF
 
     /// ファイルから取り込んだモデルの、リポジトリ名の代わり
-    static let localRepoID = "local"
+    nonisolated static let localRepoID = "local"
     /// GGUF を変換したあとの重みのファイル名
-    static let ggufStoreName = "model." + GGUFWeightStore.fileExtension
+    nonisolated static let ggufStoreName = "model." + GGUFWeightStore.fileExtension
 
     /// ダウンロード（または取り込み）した GGUF を、このアプリ用の形に変換する
     private func startGGUFConversion(_ model: InstalledModel) {

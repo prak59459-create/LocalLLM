@@ -202,6 +202,11 @@ enum TokenizerSynthesizer {
         guard model.modelType == 2 else {
             throw TokenizerError.unsupported(L("SentencePiece の Unigram 形式（BPE のみ対応）", "SentencePiece Unigram models (only BPE is supported)"))
         }
+        return sentencePieceJSON(model, addBos: config["add_bos_token"] as? Bool ?? true)
+    }
+
+    /// SentencePiece（BPE）のピースの一覧から tokenizer.json を作る（GGUF に入った語彙からも使う）
+    static func sentencePieceJSON(_ model: SentencePieceModel, addBos: Bool) -> [String: Any] {
         var vocab: [String: Int] = [:]
         vocab.reserveCapacity(model.pieces.count)
         for (id, piece) in model.pieces.enumerated() where vocab[piece.text] == nil { vocab[piece.text] = id }
@@ -256,7 +261,6 @@ enum TokenizerSynthesizer {
                 "vocab": vocab, "merges": merges.map { [$0.left, $0.right] },
             ] as [String: Any],
         ]
-        let addBos = config["add_bos_token"] as? Bool ?? true
         if addBos, let bos = model.bosID, bos < model.pieces.count {
             let token = model.pieces[bos].text
             root["post_processor"] = [
@@ -316,7 +320,7 @@ enum TokenizerSynthesizer {
         ]
     }
 
-    private static func splitThenByteLevel(_ pattern: String) -> [String: Any] {
+    static func splitThenByteLevel(_ pattern: String) -> [String: Any] {
         [
             "type": "Sequence",
             "pretokenizers": [

@@ -123,6 +123,8 @@ actor InferenceEngine {
             return try await CoreMLLanguageModel.load(compiledModelURL: url, computeUnits: computeUnits.resolved(isPipeline: false))
         case .pipeline(let pipeline):
             return try await PipelineLanguageModel.load(files: pipeline, computeUnits: computeUnits.resolved(isPipeline: true))
+        case .gguf(let files):
+            return try await GGUFLanguageModel.load(files: files)
         }
     }
 
@@ -438,6 +440,8 @@ struct ModelFiles: Sendable {
         case single(URL)
         /// 分割モデル（ANEMLL）
         case pipeline(PipelineFiles)
+        /// GGUF から変換したモデル（CPU で動かす）
+        case gguf(GGUFModelFiles)
     }
 
     var modelID: String

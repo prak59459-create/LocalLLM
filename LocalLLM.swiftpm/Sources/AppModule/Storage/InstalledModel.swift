@@ -29,6 +29,10 @@ struct InstalledModel: Codable, Identifiable, Hashable, Sendable {
     var renames: [String: String]?
     /// コンテキスト長を変える前の、元の最大コンテキスト長（変えていなければ nil）
     var originalContext: Int?
+    /// GGUF（kind == .gguf）の情報（構造・パラメータ数・量子化など）
+    var gguf: GGUFSummary?
+    /// GGUF を変換したあとの重みファイル（モデルのフォルダからの相対パス）。変換が済むまでは nil
+    var ggufStorePath: String?
 
     /// 端末上でのパス（リポジトリ内のパスから）
     func localPath(for repoPath: String) -> String {
@@ -42,6 +46,9 @@ struct InstalledModel: Codable, Identifiable, Hashable, Sendable {
         case .pipeline: return pipeline?.isMonolithic == true ? L("分割形式（一体型）", "Split format (monolithic)")
                                                               : L("分割モデル（\(pipeline?.chunks.count ?? 0) チャンク）", "Split (\(pipeline?.chunks.count ?? 0) chunks)")
         case .archive: return "ZIP"
+        case .gguf:
+            guard let gguf else { return "GGUF" }
+            return "GGUF · \(gguf.architecture) · \(gguf.parameterLabel) · \(gguf.quantization)"
         }
     }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// モデル画面（おすすめ / 検索 / インストール済み）。シートで表示する。
 struct ModelsView: View {
@@ -67,8 +68,8 @@ private struct RecommendedModelsList: View {
             Section {
                 EmptyView()
             } footer: {
-                Text(L("どれも Hugging Face で公開されている Core ML 形式（iOS 18 のステートフルモデル、または Neural Engine 向けの分割モデル）です。RAM が少ない iPad では小さいモデルから試してください。",
-                       "All are Core ML models published on Hugging Face (iOS 18 stateful models or split models for the Neural Engine). On iPads with less RAM, start with a small one."))
+                Text(L("どれも Hugging Face で公開されているモデルです。Core ML 形式（iOS 18 のステートフルモデル、Neural Engine 向けの分割モデル）と、GGUF（llama.cpp 形式）に対応しています。RAM が少ない iPad では小さいモデルから試してください。",
+                       "All are published on Hugging Face. Core ML models (iOS 18 stateful models, split models for the Neural Engine) and GGUF (llama.cpp format) are supported. On iPads with less RAM, start with a small one."))
             }
         }
     }
@@ -109,6 +110,9 @@ private struct RecommendedModelRow: View {
                 }
                 if model.isSplitModel {
                     Badge(text: "ANE", color: .purple)
+                }
+                if model.isGGUF {
+                    Badge(text: "GGUF", color: .teal)
                 }
                 if isInstalled {
                     Badge(text: L("入手済み", "Installed"), color: .green)
@@ -334,6 +338,8 @@ struct InstalledModelsList: View {
 
     @State private var deleting: InstalledModel?
     @State private var contextModelID: ContextTarget?
+    @State private var isImporting = false
+    @State private var importError: String?
 
     struct ContextTarget: Identifiable {
         var id: String
@@ -350,6 +356,8 @@ struct InstalledModelsList: View {
                 InstalledModelRow(model: model, onDone: onDone, onDelete: { deleting = model },
                                   onContext: { contextModelID = ContextTarget(id: model.id) })
             }
+
+            GGUFImportSection(isImporting: $isImporting, error: importError)
 
             Section {
                 LabeledContent(L("モデルの合計", "Total models"), value: ByteFormat.string(library.totalBytesOnDisk))
@@ -374,6 +382,46 @@ struct InstalledModelsList: View {
         }
         .sheet(item: $contextModelID) { target in
             ContextSettingsView(modelID: target.id)
+        }
+        .fileImporter(isPresented: $isImporting, allowedContentTypes: GGUFImportSection.contentTypes) { result in
+            importGGUF(result)
+        }
+    }
+
+    private func importGGUF(_ result: Result<URL, Error>) {
+        importError = nil
+        do {
+            try library.importGGUF(from: try result.get())
+        } catch {
+            if (error as? CocoaError)?.code != .userCancelled { importError = error.localizedDescription }
+        }
+    }
+}
+
+/// 「ファイル」アプリなどにある GGUF を取り込むボタン。
+private struct GGUFImportSection: View {
+    @Binding var isImporting: Bool
+    let error: String?
+
+    static var contentTypes: [UTType] {
+        [UTType(filenameExtension: "gguf") ?? .data, .data]
+    }
+
+    var body: some View {
+        Section {
+            Button {
+                isImporting = true
+            } label: {
+                Label(L("GGUF ファイルを取り込む…", "Import a GGUF file…"), systemImage: "square.and.arrow.down")
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+        } footer: {
+            Text(L("「ファイル」アプリに置いた .gguf（llama.cpp 形式）を取り込んで、このアプリ用に変換します。変換が終わると元のコピーは消します（変換中は、ファイルの約 2 倍の空き容量が要ります）。",
+                   "Imports a .gguf (llama.cpp) file from the Files app and converts it for this app. The copy is removed after conversion (about twice the file size is needed while converting)."))
         }
     }
 }
@@ -486,6 +534,8 @@ struct DownloadStatusView: View {
                 Label(message, systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
+            case .converting(let fraction):
+                ConvertingProgressView(fraction: fraction)
             }
         }
     }
@@ -498,14 +548,41 @@ struct DownloadStatusView: View {
     }
 }
 
+/// ダウンロードしたモデルを、このアプリ用の形に変換している間の表示。
+private struct ConvertingProgressView: View {
+    let fraction: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ProgressView(value: min(max(fraction, 0), 1))
+            Text(L("このアプリ用に変換しています… \(Int(fraction * 100))%（閉じずにお待ちください）",
+                   "Converting for this app… \(Int(fraction * 100))% (keep the app open)"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
 /// 一時停止・再開ボタン。
 struct DownloadControls: View {
     @Environment(AppSettings.self) private var settings
     @Environment(ModelLibrary.self) private var library
     let modelID: String
 
+    private var isConverting: Bool {
+        if case .converting = library.downloads[modelID]?.phase { return true }
+        return false
+    }
+
     var body: some View {
-        if library.downloads[modelID]?.phase == .downloading {
+        if isConverting {
+            Button {
+                library.pauseDownload(id: modelID)
+            } label: {
+                Label(L("中断", "Stop"), systemImage: "stop.fill")
+            }
+            .buttonStyle(.bordered)
+        } else if library.downloads[modelID]?.phase == .downloading {
             Button {
                 library.pauseDownload(id: modelID)
             } label: {

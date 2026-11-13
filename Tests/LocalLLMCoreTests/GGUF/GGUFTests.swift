@@ -205,12 +205,20 @@ final class GGUFModelTests: XCTestCase {
             }
             print("DIFF \(name) worst top-logit difference \(worst) (std \(std))")
             var generated: [Int] = []
+            let decodeStart = Date()
             for _ in 0..<8 {
                 let next = try XCTUnwrap(logits.indices.max { logits[$0] < logits[$1] })
                 generated.append(next)
                 logits = try model.evaluate([next])
             }
+            let decodeSeconds = Date().timeIntervalSince(decodeStart)
             XCTAssertEqual(generated, try XCTUnwrap(json["greedy"] as? [Int]), name)
+            // 速さの目安（CI のログで見る）: 1 トークンずつの生成と、64 トークンまとめての読み込み
+            let prompt = (0..<64).map { 100 + $0 }
+            let prefillStart = Date()
+            _ = try model.evaluate(prompt)
+            let prefillSeconds = Date().timeIntervalSince(prefillStart)
+            print(String(format: "SPEED %@: decode %.1f tok/s, prefill %.1f tok/s", name, 8 / decodeSeconds, 64 / prefillSeconds))
         }
     }
 }

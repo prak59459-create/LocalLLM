@@ -7,6 +7,7 @@ struct ModelVariant: Codable, Hashable, Identifiable, Sendable {
         case package    // .mlpackage
         case pipeline   // いくつかのモデルをつないで動かす分割モデル（ANEMLL 形式）
         case archive    // ZIP に入ったモデル（ダウンロード後に展開する）
+        case gguf       // llama.cpp の GGUF（ダウンロード後に、このアプリ用の形に変換する）
     }
 
     var id: String { path }
@@ -158,7 +159,15 @@ struct RepoAnalysis: Hashable, Sendable {
                          displayName: ((file.path as NSString).lastPathComponent as NSString).deletingPathExtension)
         }
 
-        let order: [ModelVariant.Kind: Int] = [.pipeline: 0, .compiled: 1, .package: 2, .archive: 3]
+        // 6. GGUF（1 ファイルで 1 つのモデル。量子化の違うファイルが並んでいることが多い）
+        let ggufs = loose.filter { GGUFNaming.isStandaloneModel($0.path) }
+            .sorted { (GGUFNaming.rank(of: $0.path), $0.size, $0.path) < (GGUFNaming.rank(of: $1.path), $1.size, $1.path) }
+            .map { file in
+                ModelVariant(path: file.path, kind: .gguf, files: [file], totalBytes: file.size,
+                             displayName: ((file.path as NSString).lastPathComponent as NSString).deletingPathExtension)
+            }
+
+        let order: [ModelVariant.Kind: Int] = [.pipeline: 0, .compiled: 1, .package: 2, .archive: 3, .gguf: 4]
         // つなげたファイルは、ダウンロードするときは元の部品に戻す
         let byPath = Dictionary(originalFiles.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         func expand(_ entries: [HFFileEntry]) -> [HFFileEntry] {
@@ -171,7 +180,7 @@ struct RepoAnalysis: Hashable, Sendable {
         }.sorted { lhs, rhs in
             if lhs.kind != rhs.kind { return order[lhs.kind, default: 9] < order[rhs.kind, default: 9] }
             return lhs.path < rhs.path
-        }
+        } + ggufs
         let modelFiles = Set(groups.values.flatMap { $0.map(\.path) })
         let support = expand(files.filter {
             supportFileNames.contains(($0.path as NSString).lastPathComponent) && !modelFiles.contains($0.path)
@@ -216,6 +225,9 @@ struct RepoAnalysis: Hashable, Sendable {
         }.sorted { $0.0 < $1.0 }
     }
 
+    /// GGUF のモデルがあるか
+    var hasGGUF: Bool { variants.contains { $0.kind == .gguf } }
+
     static func isModelArchive(_ path: String) -> Bool {
         let lower = path.lowercased()
         guard lower.hasSuffix(".zip") else { return false }
@@ -224,6 +236,8 @@ struct RepoAnalysis: Hashable, Sendable {
 
     /// 選んだモデルのダウンロード対象（モデルのファイル + そのモデルに近い付属ファイル）
     func filesToDownload(for variant: ModelVariant) -> [HFFileEntry] {
+        // GGUF はトークナイザもテンプレートもファイルの中に入っている
+        if variant.kind == .gguf { return variant.files }
         let variantParent = (variant.path as NSString).deletingLastPathComponent
         var chosen: [String: HFFileEntry] = [:]
         for file in supportFiles {

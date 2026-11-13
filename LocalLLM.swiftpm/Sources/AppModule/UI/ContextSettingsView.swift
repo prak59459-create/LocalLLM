@@ -21,7 +21,9 @@ struct ContextSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                if let model {
+                if let model, model.kind == .gguf {
+                    GGUFContextSection(model: model)
+                } else if let model {
                     ContextSummarySection(model: model, analysis: analysis, trainedContext: trainedContext)
                     if let analysis {
                         ContextChoiceSection(model: model, analysis: analysis, trainedContext: trainedContext, target: $target)
@@ -88,6 +90,8 @@ struct ContextSettingsView: View {
     }
 
     private func inspect() async {
+        // GGUF は KV キャッシュの大きさを変えるだけなので、調べるものが無い
+        if model?.kind == .gguf { return }
         do {
             let result = try await library.contextAnalysis(for: modelID)
             analysis = result
@@ -275,6 +279,88 @@ private struct ContextChoiceRow: View {
             Text(estimate.fit.label)
                 .font(.caption)
                 .foregroundStyle(fitColor)
+        }
+    }
+}
+
+/// GGUF のモデルのコンテキスト長（KV キャッシュを用意するトークン数）を選ぶ。ファイルは書き換えない。
+private struct GGUFContextSection: View {
+    @Environment(ModelLibrary.self) private var library
+    @Environment(ChatController.self) private var chat
+    @Environment(AppSettings.self) private var settings
+
+    let model: InstalledModel
+    @State private var message: String?
+
+    private var trained: Int { model.gguf?.contextLength ?? 4096 }
+    private var current: Int { model.maxContext ?? model.gguf?.defaultContext ?? 4096 }
+
+    private var choices: [Int] {
+        var values = [1024, 2048, 4096, 8192, 16384, 32768].filter { $0 <= trained }
+        if !values.contains(current) { values.append(current) }
+        if values.isEmpty { values = [trained] }
+        return values.sorted()
+    }
+
+    var body: some View {
+        Section {
+            LabeledContent(L("今のコンテキスト長", "Current context"), value: L("\(current.formatted()) トークン", "\(current.formatted()) tokens"))
+            LabeledContent(L("学習時の長さ", "Trained length"), value: L("\(trained.formatted()) トークン", "\(trained.formatted()) tokens"))
+        } header: {
+            Text(model.displayName)
+        }
+        Section {
+            ForEach(choices, id: \.self) { value in
+                Button {
+                    apply(value)
+                } label: {
+                    GGUFContextChoiceRow(value: value, isCurrent: value == current, bytesPerToken: model.gguf?.kvBytesPerToken ?? 0)
+                }
+            }
+            if let message {
+                Text(message).font(.callout)
+            }
+        } header: {
+            Text(L("長さを選ぶ", "Choose a length"))
+        } footer: {
+            Text(L("GGUF のモデルは、ファイルを書き換えずに長さを変えられます。長くするほど、会話が長くなったときに使うメモリ（KV キャッシュ）が増えます。",
+                   "GGUF models can change the length without rewriting files. Longer contexts use more memory (KV cache) as the conversation grows."))
+        }
+    }
+
+    private func apply(_ value: Int) {
+        guard value != current else { return }
+        do {
+            try library.setGGUFContext(id: model.id, to: value)
+            message = L("✅ \(value.formatted()) トークンになりました。", "✅ The context is now \(value.formatted()) tokens.")
+            // 読み込み中なら、新しい長さで読み込み直す
+            if chat.loadedInfo?.modelID == model.id {
+                chat.loadModel(id: model.id, library: library, settings: settings)
+            }
+        } catch {
+            message = "⚠️ " + error.localizedDescription
+        }
+    }
+}
+
+private struct GGUFContextChoiceRow: View {
+    let value: Int
+    let isCurrent: Bool
+    let bytesPerToken: Int
+
+    var body: some View {
+        HStack {
+            Text(L("\(value.formatted()) トークン", "\(value.formatted()) tokens"))
+            Spacer()
+            if bytesPerToken > 0 {
+                Text(L("KV キャッシュ 最大 \(ByteFormat.string(Int64(bytesPerToken) * Int64(value)))",
+                       "KV cache up to \(ByteFormat.string(Int64(bytesPerToken) * Int64(value)))"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if isCurrent {
+                Image(systemName: "checkmark").foregroundStyle(.tint)
+            }
         }
     }
 }

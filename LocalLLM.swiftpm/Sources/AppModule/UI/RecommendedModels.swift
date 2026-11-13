@@ -23,6 +23,7 @@ struct RecommendedModel: Identifiable, Hashable {
         case coding
         case reasoning
         case tiny
+        case gguf
 
         var id: String { rawValue }
 
@@ -32,6 +33,7 @@ struct RecommendedModel: Identifiable, Hashable {
             case .coding: return L("コーディング専用", "Coding")
             case .reasoning: return L("賢さ・推論専門", "Reasoning")
             case .tiny: return L("とても軽い（動作確認・古い iPad）", "Very light (testing · older iPads)")
+            case .gguf: return L("GGUF（llama.cpp 形式）", "GGUF (llama.cpp format)")
             }
         }
 
@@ -43,6 +45,8 @@ struct RecommendedModel: Identifiable, Hashable {
             case .reasoning: return L("考えてから答える（<think>）。難しい質問・数学・論理に強いが、答えるまで時間がかかる。",
                                       "Think before answering (<think>). Stronger at hard questions, math and logic, but slower to answer.")
             case .tiny: return L("メモリの少ない iPad でも動く。賢さは控えめ。", "Run even on iPads with little memory. Not very smart.")
+            case .gguf: return L("Ollama や LM Studio で使われている形式。ダウンロード後にこのアプリ用に変換して、CPU で動かします（Core ML 版より遅め）。検索で「GGUF」を選ぶと、ほかのモデルも探せます。",
+                                 "The format used by Ollama and LM Studio. Converted for this app after download and run on the CPU (slower than the Core ML versions). Choose \"GGUF\" in Search to find more.")
             }
         }
 
@@ -52,6 +56,7 @@ struct RecommendedModel: Identifiable, Hashable {
             case .coding: return "chevron.left.forwardslash.chevron.right"
             case .reasoning: return "brain.head.profile"
             case .tiny: return "hare.fill"
+            case .gguf: return "shippingbox.fill"
             }
         }
     }
@@ -66,6 +71,8 @@ struct RecommendedModel: Identifiable, Hashable {
     var category: Category = .general
     /// Neural Engine 向けの分割モデル（ANEMLL）
     var isSplitModel = false
+    /// GGUF（llama.cpp 形式）
+    var isGGUF = false
 }
 
 enum RecommendedModels {
@@ -74,7 +81,54 @@ enum RecommendedModels {
     }
 
     // 言語の切り替えに追従するよう、毎回作り直す（computed）。
-    static var all: [RecommendedModel] { general + coding + reasoning + tiny }
+    static var all: [RecommendedModel] { general + coding + reasoning + tiny + gguf }
+
+    /// GGUF のおすすめ（大きさは Q4_K_M のファイル）
+    private static var gguf: [RecommendedModel] {[
+        RecommendedModel(
+            repoID: "Qwen/Qwen2.5-0.5B-Instruct-GGUF", title: "Qwen2.5 0.5B Instruct (GGUF)",
+            approximateBytes: 491_000_000, japanese: .fair, isExperimental: false,
+            note: L("GGUF を試す最初の 1 つに。Q4_K_M を選んでください。", "A good first GGUF. Pick the Q4_K_M file."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
+            repoID: "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF", title: "Qwen2.5 Coder 0.5B (GGUF)",
+            approximateBytes: 491_000_000, japanese: .fair, isExperimental: false,
+            note: L("軽いコーディング用モデルの GGUF 版。", "The GGUF build of the light coding model."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
+            repoID: "unsloth/Qwen3-0.6B-GGUF", title: "Qwen3 0.6B (GGUF)",
+            approximateBytes: 397_000_000, japanese: .fair, isExperimental: false,
+            note: L("思考モードに対応した小さな Qwen3。", "A small Qwen3 with thinking mode."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
+            repoID: "unsloth/gemma-3-1b-it-GGUF", title: "Gemma 3 1B (GGUF)",
+            approximateBytes: 806_000_000, japanese: .fair, isExperimental: false,
+            note: L("Google の多言語モデル。", "Google's multilingual model."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
+            repoID: "bartowski/Llama-3.2-1B-Instruct-GGUF", title: "Llama 3.2 1B Instruct (GGUF)",
+            approximateBytes: 808_000_000, japanese: .weak, isExperimental: false,
+            note: L("英語が得意。", "Strong in English."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
+            repoID: "Qwen/Qwen2.5-1.5B-Instruct-GGUF", title: "Qwen2.5 1.5B Instruct (GGUF)",
+            approximateBytes: 1_117_000_000, japanese: .good, isExperimental: true,
+            note: L("試験的。0.5B より賢いが、CPU で動かすので遅め（変換後は約 1.6GB）。",
+                    "Experimental. Smarter than 0.5B but slow on the CPU (about 1.6 GB after conversion)."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
+            repoID: "bartowski/SmolLM2-135M-Instruct-GGUF", title: "SmolLM2 135M (GGUF)",
+            approximateBytes: 105_000_000, japanese: .none, isExperimental: false,
+            note: L("一番小さい GGUF。動作確認に。", "The smallest GGUF, good for testing."),
+            category: .gguf, isGGUF: true
+        ),
+    ]}
 
     private static var general: [RecommendedModel] {[
         RecommendedModel(

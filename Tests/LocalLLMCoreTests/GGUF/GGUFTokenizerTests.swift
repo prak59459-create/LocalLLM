@@ -81,3 +81,78 @@ final class GGUFTokenizerTests: XCTestCase {
         }
     }
 }
+
+/// GGUF のリポジトリの見分け方・ファイル名の読み方・先頭部分からの情報。
+final class GGUFRepositoryTests: XCTestCase {
+    func testFileNames() {
+        XCTAssertEqual(GGUFNaming.quantization(of: "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"), "Q4_K_M")
+        XCTAssertEqual(GGUFNaming.quantization(of: "qwen2.5-0.5b-instruct-q8_0.gguf"), "Q8_0")
+        XCTAssertEqual(GGUFNaming.quantization(of: "tinyllama-1.1b-chat-v1.0.Q5_K_S.gguf"), "Q5_K_S")
+        XCTAssertEqual(GGUFNaming.quantization(of: "SmolLM2-135M-Instruct-IQ3_XS.gguf"), "IQ3_XS")
+        XCTAssertEqual(GGUFNaming.quantization(of: "dir/SmolLM2-135M-Instruct-f16.gguf"), "F16")
+        XCTAssertNil(GGUFNaming.quantization(of: "model.gguf"))
+        XCTAssertTrue(GGUFNaming.isStandaloneModel("a/Model-Q4_K_M.gguf"))
+        XCTAssertFalse(GGUFNaming.isStandaloneModel("mmproj-model-f16.gguf"))
+        XCTAssertFalse(GGUFNaming.isStandaloneModel("Model-Q4_K_M-00001-of-00003.gguf"))
+        XCTAssertFalse(GGUFNaming.isStandaloneModel("Model.imatrix"))
+        XCTAssertTrue(GGUFNaming.isReadable(quantization: "Q4_K_M"))
+        XCTAssertFalse(GGUFNaming.isReadable(quantization: "IQ1_S"))
+        XCTAssertLessThan(GGUFNaming.rank(of: "m-Q4_K_M.gguf"), GGUFNaming.rank(of: "m-Q8_0.gguf"))
+    }
+
+    func testRepositoryWithGGUFFiles() {
+        func entry(_ path: String, _ size: Int64) -> HFFileEntry { HFFileEntry(path: path, size: size, lfsSHA256: nil) }
+        let analysis = RepoAnalysis.analyze(files: [
+            entry("README.md", 10), entry("config.json", 20),
+            entry("Model-Q8_0.gguf", 800), entry("Model-Q4_K_M.gguf", 400), entry("Model-Q2_K.gguf", 200),
+            entry("Model-f16-00001-of-00002.gguf", 900), entry("mmproj-Model-f16.gguf", 50),
+        ], repoName: "Model-GGUF")
+        XCTAssertTrue(analysis.hasGGUF)
+        XCTAssertEqual(analysis.variants.map(\.path), ["Model-Q4_K_M.gguf", "Model-Q8_0.gguf", "Model-Q2_K.gguf"])
+        XCTAssertTrue(analysis.variants.allSatisfy { $0.kind == .gguf })
+        // GGUF はトークナイザが中に入っているので、付属ファイルは取らない
+        XCTAssertEqual(analysis.filesToDownload(for: analysis.variants[0]).map(\.path), ["Model-Q4_K_M.gguf"])
+    }
+
+    func testSummaryOfTinyModel() throws {
+        let file = try GGUFFile.open(GGUFFixtures.root.appendingPathComponent("tiny-qwen2.gguf"))
+        let summary = GGUFSummary(file: file)
+        XCTAssertTrue(summary.isSupported)
+        XCTAssertEqual(summary.architecture, "qwen2")
+        XCTAssertEqual(summary.contextLength, 64)
+        XCTAssertEqual(summary.defaultContext, 256)
+        XCTAssertGreaterThan(summary.storeBytes, Int64(summary.parameterCount))
+        XCTAssertGreaterThan(summary.memoryBytes(context: 64), summary.storeBytes)
+        // 変換後のファイルの大きさは、見積もりどおり
+        let destination = GGUFFixtures.temporaryFile("summary.llw")
+        defer { try? FileManager.default.removeItem(at: destination) }
+        try GGUFConverter.convert(gguf: GGUFFixtures.root.appendingPathComponent("tiny-qwen2.gguf"), to: destination)
+        let size = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: destination.path)[.size] as? NSNumber).int64Value
+        XCTAssertLessThanOrEqual(size, summary.storeBytes)
+        XCTAssertGreaterThan(size, summary.storeBytes - 16384)
+    }
+
+    func testUnsupportedArchitectureIsExplained() throws {
+        // 構造の名前を書き換えた GGUF は、動かせない理由が付く
+        var data = try Data(contentsOf: GGUFFixtures.root.appendingPathComponent("tiny-llama.gguf"))
+        let needle = Data("llama.block_count".utf8)
+        let range = try XCTUnwrap(data.range(of: needle))
+        data.replaceSubrange(range, with: Data("llamb.block_count".utf8))
+        let summary = GGUFSummary(file: try GGUFFile.parse(data))
+        XCTAssertFalse(summary.isSupported)
+        XCTAssertNotNil(summary.unsupportedReason)
+    }
+
+    /// Hugging Face から、GGUF の先頭部分だけを取ってきて読む（ネットにつながる環境だけ）
+    func testLiveHeaderFetch() async throws {
+        guard ProcessInfo.processInfo.environment["LOCALLLM_LIVE_TESTS"] == "1" else { throw XCTSkip("live tests are off") }
+        let client = HFClient()
+        let file = try await client.fetchGGUFHeader(repo: "bartowski/SmolLM2-135M-Instruct-GGUF", path: "SmolLM2-135M-Instruct-Q4_K_M.gguf")
+        let summary = GGUFSummary(file: file)
+        XCTAssertTrue(summary.isSupported, summary.unsupportedReason ?? "")
+        XCTAssertEqual(summary.architecture, "llama")
+        XCTAssertEqual(summary.layerCount, 30)
+        XCTAssertTrue(summary.hasChatTemplate)
+        XCTAssertEqual(summary.parameterLabel, "135M")
+    }
+}

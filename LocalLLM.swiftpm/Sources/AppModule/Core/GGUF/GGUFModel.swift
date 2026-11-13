@@ -188,9 +188,11 @@ final class GGUFModel {
     // MARK: - 計算
 
     /// tokens を今の系列の後ろに足して計算し、最後のトークンの次の logits を返す。
-    /// - Parameter progress: 何トークン読めたか（このあとの計算を止めたいときは false を返す）
+    /// - Parameters:
+    ///   - batch: 1 回にまとめて計算するトークン数
+    ///   - progress: 何トークン読めたか（ここでエラーを投げると、そこで止まる。読めた分は KV キャッシュに残る）
     @discardableResult
-    func evaluate(_ tokens: [Int], progress: ((Int) throws -> Void)? = nil) throws -> [Float] {
+    func evaluate(_ tokens: [Int], batch: Int = GGUFModel.maxBatch, progress: ((Int) throws -> Void)? = nil) throws -> [Float] {
         guard !tokens.isEmpty else { throw GGUFError.invalid("no tokens") }
         guard length + tokens.count <= maxContext else {
             throw GGUFError.invalid(L("コンテキストの上限（\(maxContext) トークン）を超えました", "context limit of \(maxContext) tokens exceeded"))
@@ -199,7 +201,7 @@ final class GGUFModel {
         var offset = 0
         var logits: [Float] = []
         while offset < tokens.count {
-            let count = min(Self.maxBatch, tokens.count - offset)
+            let count = min(max(1, batch), tokens.count - offset)
             let isLast = offset + count == tokens.count
             let batch = Array(tokens[offset..<(offset + count)])
             let result = forward(batch, wantsLogits: isLast)

@@ -53,6 +53,8 @@ final class ChatController {
 
     @ObservationIgnored let engine = InferenceEngine()
     @ObservationIgnored private var generationTask: Task<Void, Never>?
+    /// 今動いている生成（止めたあとに届く、古い生成からの知らせが新しい生成の表示を壊さないように）
+    @ObservationIgnored private var generationRunID: UUID?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var memoryTimer: Timer?
     @ObservationIgnored private var lastSaveDate = Date.distantPast
@@ -68,9 +70,12 @@ final class ChatController {
             forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.notice = L("メモリが不足しています。アプリが終了されるおそれがあるので、小さいモデルに切り替えるか、他のアプリを閉じてください。",
-                                 "Memory is running low. The app may be terminated; switch to a smaller model or close other apps.")
-                self?.refreshMemory()
+                guard let self else { return }
+                // 生成は控えめに続け、危なくなったら自分で止める（KV キャッシュも空ける）
+                await self.engine.noteMemoryWarning()
+                self.notice = L("メモリが少なくなっています。落ちないよう計算を小さく区切り、足りなくなったら途中で止めます。",
+                                "Memory is getting low. Work is split into smaller steps and will stop early instead of crashing.")
+                self.refreshMemory()
             }
         }
     }
@@ -112,7 +117,7 @@ final class ChatController {
                 } else {
                     loadState = .loading(model.displayName)
                 }
-                let files = try await library.prepareFiles(for: id)
+                let files = try await library.prepareFiles(for: id, client: settings.makeHFClient())
                 loadState = .loading(model.displayName)
                 await engine.setContextLimit(settings.contextLimit)
                 let info = try await engine.load(files: files,
@@ -243,9 +248,14 @@ final class ChatController {
     }
 
     /// 生成を止める。
+    /// 生成を止める。計算やツールの返事を待たずに、すぐ次の操作ができる状態に戻す。
     func stopGenerating() {
         generationTask?.cancel()
         generationTask = nil
+        guard generationRunID != nil else { return }
+        generationRunID = nil
+        progress = nil
+        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     private func generateReply(in conversation: Conversation, context: ModelContext, settings: AppSettings,
@@ -279,6 +289,8 @@ final class ChatController {
         UIApplication.shared.isIdleTimerDisabled = true
 
         let loop = AgentLoop(engine: engine)
+        let runID = UUID()
+        generationRunID = runID
         generationTask = Task {
             var reply: StoredMessage?
             var lastDisplay = Date.distantPast
@@ -287,6 +299,13 @@ final class ChatController {
                     guard let connectors else { return ToolOutcome(text: "no connectors", isError: true) }
                     return await connectors.execute(call)
                 }, onEvent: { event in
+                    guard self.generationRunID == runID else {
+                        // 止めたあとに届いた分: 書きかけの返答だけ残して、画面の状態には触らない
+                        if case .assistantFinished(let content, let calls, let stats) = event {
+                            self.keep(reply, content: content, calls: calls, stats: stats, in: conversation, context: context)
+                        }
+                        return
+                    }
                     switch event {
                     case .assistantStarted:
                         let message = self.appendMessage(role: .assistant, to: conversation, context: context, modelName: info.displayName)
@@ -314,16 +333,14 @@ final class ChatController {
                             self.saveIfNeeded(context)
                         }
                     case .assistantFinished(let content, let calls, let stats):
-                        reply?.content = content
-                        reply?.toolCalls = calls
-                        reply?.stats = stats
                         self.lastStats = stats
-                        if calls.isEmpty, content.isEmpty, let reply {
-                            // 何も書かなかった返答は残さない
-                            conversation.messages.removeAll { $0.id == reply.id }
-                            context.delete(reply)
+                        if stats.stopReason == .lowMemory {
+                            self.notice = L("メモリが足りなくなりそうだったので、アプリが落ちないよう途中で止めました。続けるときは「続けて」と送ってください。",
+                                            "Stopped early to keep the app from running out of memory. Send \"continue\" to go on.")
                         }
-                        try? context.save()
+                        self.keep(reply, content: content, calls: calls, stats: stats, in: conversation, context: context)
+                    case .status(let text):
+                        self.notice = text
                     case .toolStarted(let call):
                         self.progress?.phase = .usingTool(call.name)
                     case .toolFinished(let call, let outcome):
@@ -346,11 +363,28 @@ final class ChatController {
             }
             conversation.updatedAt = Date()
             try? context.save()
+            refreshMemory()
+            // 止めたあとに終わった古い生成は、もう片づけてある（新しい生成の表示を消さない）
+            guard generationRunID == runID else { return }
+            generationRunID = nil
             progress = nil
             generationTask = nil
             UIApplication.shared.isIdleTimerDisabled = false
-            refreshMemory()
         }
+    }
+
+    /// 返答の最終的な中身を保存する（何も書かなかった返答は残さない）
+    private func keep(_ reply: StoredMessage?, content: String, calls: [ToolCall], stats: GenerationStats,
+                      in conversation: Conversation, context: ModelContext) {
+        guard let reply else { return }
+        reply.content = content
+        reply.toolCalls = calls
+        reply.stats = stats
+        if calls.isEmpty, content.isEmpty {
+            conversation.messages.removeAll { $0.id == reply.id }
+            context.delete(reply)
+        }
+        try? context.save()
     }
 
     private func appendMessage(role: ChatMessage.Role, to conversation: Conversation, context: ModelContext,

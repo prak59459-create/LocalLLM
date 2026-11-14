@@ -420,6 +420,25 @@ enum ByteFormat { static func string(_ bytes: Int64) -> String }   // 例: "1.9 
 - `InferenceEngine`（actor）: モデルとトークナイザの読み込み、生成ループ（`AsyncThrowingStream` でイベントを返す）、統計。
   `GenerationRequest.tools` があればテンプレートに `tools` を渡す（対応していないテンプレートには説明文で代用）。
 
+### メモリを使い切らない（落ちる前に止める）
+
+- `MemoryBudget`（Core/Generation）: 残り（`os_proc_available_memory`）とアプリの上限から、危ない線（`critical`）・少ない線（`low`）、
+  プロンプトを流し込む 1 回の大きさ（logits [n, 語彙] が収まる n）、毎回全体を入力するモデルで扱える長さを計算する。
+- `MemoryGate`（Engine/DeviceMemory）: prefill のチャンクごと・生成の 1 トークンごとに残りを確かめ、危なければ `EngineError.lowMemory`。
+  `MemoryTrend`（Core）で 1 回ごとの減り方を覚えておき、「次の 1 回で危ない線を割りそう」なときも先に止める
+  （最初の 2 回は KV キャッシュの作成などで大きく減るので数えない）。
+- `InferenceQueue`（Engine/LanguageModelRunner）: Core ML の予測はすべて専用の 1 本のスレッドで同期的に動かし、
+  1 回ごとに `autoreleasepool` で包む。async の予測を続けて呼ぶと、logits などの一時的な出力がプロンプトを読み終わるまで溜まるため。
+- 自動の立て直し（`InferenceEngine.runGeneration`）: `lowMemory` で止まったら、KV キャッシュを捨て、まだ足りないか
+  読み込んだときより大きく増えていればモデルも読み直し（古いモデルへの参照を手放してから）、`MemoryRecovery.shrunkContext`
+  （読めたところの 3/5、最小 256）まで縮めてプロンプトを組み立て直し、生成済みのトークンを足して続きから生成する（最大 2 回）。
+  縮めた長さは `memoryContextCap` として次の生成にも使い、余裕のある状態で最後まで書けたら少しずつ戻す。
+  2 回やり直しても足りなければ `StopReason.lowMemory` として普通に終わらせる（iOS に強制終了されない）。
+- メモリ警告のあとはしばらく控えめにし、生成していなければ KV キャッシュを捨てる。読み込んだときより大きく増えていたら、
+  次の生成の前にモデルだけ読み直して空ける。KV キャッシュを作る前に、その大きさ（`stateBytes`）が空きに収まるかも確かめる。
+- CDWS: `AgentContext.compact` で、直近の依頼だけ・古いツールの結果は 1 行・書いたファイルの中身（引数）は省いて渡す。
+  メモリ不足で止まったあとは `Budget.tight` でさらに短くする。
+
 ## Storage / App / UI（iOS 専用）
 
 - SwiftData: `Conversation`（タイトル、作成・更新日時、使ったモデル ID）と `StoredMessage`（役割、本文、順番、統計）。
@@ -474,6 +493,20 @@ struct WorkspaceToolExecutor { func execute(_:roadmap:) -> WorkspaceToolResult; 
 enum CodingAgentPrompt { static func system(...), implement(_:), brainstorm(from:count:), planRoadmap(goal:) }
 enum SyntaxHighlighter { static func tokens(in:language:) -> [HighlightToken] }   // UTF-16 の位置
 ```
+
+## Core/Tokenizer: tokenizer.json の無いモデル（TokenizerSynthesizer）
+
+- `tokenizer.model`（SentencePiece の BPE）・`vocab.json` + `merges.txt`（バイト単位の BPE）・tiktoken 形式から、
+  `transformers` の変換と同じ規則で tokenizer.json を作る（結合規則はピースを 2 つに分けて両方が語彙にあるもの、並びはスコア・順位）。
+  作ったものは `tokenizer.synthesized.json` としてモデルのフォルダに取っておく。
+- どれも無ければ `TokenizerFallback` が base_model や名前から系列を推測して、公開リポジトリから tokenizer.json などを
+  `tokenizer-source/` に取ってくる。
+- テストで、作ったトークナイザが元の tokenizer.json と同じトークン列になることを確かめている（TinyLlama・Gemma 2・Qwen2.5・Llama 3.2）
+
+## Core/Hub: 分けて置かれたモデル（SplitParts・ModelArchiveExpander）
+
+- `weight.bin.part1`…・`model.zip.001`…・`-00001-of-00003`・`.partaa`… を 1 つのファイルとして調べ、ダウンロード後につなげる。
+- 部品ごとの `X.mlmodelc.zip` は分割モデルの部品として扱い、ダウンロード後にその場で展開する（中にフォルダがあっても無くてもよい）。
 
 ## Core/Hub: コンテキスト長の変更（ContextResizer）
 
@@ -682,3 +715,55 @@ enum KnowledgePromptBuilder {
     static func contextBlock(results: [KnowledgeSearchResult], maxCharacters: Int) -> String
 }
 ```
+
+## Core/GGUF（llama.cpp 形式のモデルを動かす）
+
+llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推論を純 Swift で実装している。
+
+- `GGUFFile`: メタデータと重みの一覧（v2 / v3）。ファイルの先頭部分だけでも読める（足りなければ `GGUFError.truncated`）。
+  `HFClient.fetchGGUFHeader` は、Range 付きで先頭 4MB から取り、足りなければ倍にして取り直す。
+- `GGUFQuant`: 量子化された重みを Float に戻す（llama.cpp の `dequantize_row_*` と同じ計算）。
+  F32 / F16 / BF16、Q4_0〜Q8_0、Q2_K〜Q6_K、IQ4_NL / IQ4_XS、IQ2_XXS / XS / S、IQ3_XXS / S。
+  IQ2 / IQ3 の表は `Tools/gguf/make_quant_tables.py` が gguf パッケージから作る（`GGUFQuantTables`）。
+- `GGUFModelConfig`: メタデータから構造を決める。系列は llama / qwen2 / qwen3 / gemma / gemma2 / gemma3 / phi3。
+  違いは、RoPE の組の取り方（隣どうし / 前半と後半）、q・k のバイアス、ヘッドごとの q・k の正規化、
+  注意・FFN の出力の正規化、埋め込みの倍率、tanh での上限（soft-capping）、直近だけを見る層（sliding window）とその RoPE の底、
+  q・k・v や gate・up が 1 つの行列にまとまっているか。
+- `GGUFConverter` → `GGUFWeightStore`（.llw）: 重みを「1 行ごとに倍率を持つ 8 ビット整数」にして保存する（1 パラメータ 1 バイト）。
+  4 ビットのブロックを毎トークンほどくより速く、Float32 のまま置くより 4 倍小さい。ファイルは mmap で読むので、
+  アプリのメモリ使用量（iOS が強制終了を決める量）にはほとんど数えられない。正規化の重みやバイアスは Float32 のまま。
+  変換は行のまとまりごとに並列に行う。
+- `GGUFKernels`: 線形層は、行のまとまり（CPU のキャッシュに収まる大きさ）ごとに整数を Float に直して BLAS（sgemv / sgemm）に渡し、
+  結果に行ごとの倍率を掛ける。行の範囲をスレッドに分けて並列に計算する。Linux のテストでは素朴なループ。
+- `GGUFModel`: 順伝播と KV キャッシュ。プロンプトは 64 トークンずつまとめて計算し、最後のトークンだけ出力層を通す。
+  KV キャッシュは [kvHead][位置][headSize] の並びで、使った位置のページだけが実メモリになる。巻き戻しは長さを変えるだけ。
+- `GGUFTokenizer`: GGUF の語彙・スコア / 結合規則・トークンの種類・チャットテンプレートから、tokenizer.json などを作る。
+  SentencePiece（"llama"）とバイト単位の BPE（"gpt2"。前処理は qwen2・llama-bpe・smollm・tekken などの系統ごと）。
+- `GGUFSummary` / `GGUFNaming`: 画面に出す情報（構造・パラメータ数・変換後の大きさ・動かせない理由）と、ファイル名からの量子化の読み取り。
+
+確かめ方（`Tests/LocalLLMCoreTests/GGUF`、正解は `Tests/GGUFFixtures`）:
+
+- 量子化の復元は、形式ごとに乱数のブロックを gguf パッケージ（Python）と突き合わせる。
+- 7 系列それぞれの小さな乱数モデルで、各位置の logits が llama.cpp と一致する（SiLU の系列は 1e-3、GELU の系列は 1e-2 以内。
+  llama.cpp は GELU を半精度の表で計算するため）。まとめて読み込んだとき・巻き戻したときも同じ。
+- 本物のモデル（SmolLM2 135M の Q4_K_M / Q8_0）で、llama.cpp と同じ続きを貪欲に生成する。CI の macOS では速さも出力する。
+- トークナイザは、9 つの実在モデルの GGUF（先頭 16MB）から作ったものを、元の tokenizer.json と突き合わせる。
+
+アプリ側: `ModelLibrary` がダウンロード（または「ファイル」からの取り込み）のあとに変換し、元の GGUF を消す。
+`GGUFLanguageModel`（Engine）が `LanguageModelRunner` として生成ループにつなぐ（共通の先頭部分の再利用・取り消し・メモリの確認）。
+
+## Core/Image と画像生成
+
+- `CLIPTextTokenizer`: モデルに付いてくる vocab.json と merges.txt から、Hugging Face の CLIP のトークナイザと同じ設定を組み立てる。
+- `DPMSolverScheduler`: DPM-Solver++（2M）。diffusers の DPMSolverMultistepScheduler と、時刻の並びも各ステップの結果も一致する。
+- `ImageRepoLayout`: リポジトリから、TextEncoder / Unet / VAEDecoder の .mlmodelc と語彙のファイルを選ぶ（Neural Engine 向けの split_einsum を優先）。
+- `ImageGenerator`（Engine）: テキストエンコーダ → UNet（否定とプロンプトを 1 回で計算し、強さを掛けて合成）→ VAE デコーダ。
+  3 つのモデルは同時に読み込まず、使い終わったら手放す。入力の型（Float16 / Float32）と形はモデルの記述から決める。
+- `ImageModelStore` / `ImageStudio`: モデルのダウンロード、生成の状態、作った画像の保存（Documents/Images と index.json）。
+
+## Core/Voice と音声
+
+- `SpeechText`: 読み上げ用の整形（<think>・コードブロック・Markdown の記号・URL を省く）と、言語の判定。
+- `VoiceController`（App）: SFSpeechRecognizer（端末内で認識できる言語は端末内だけで）と AVSpeechSynthesizer。
+  声だけの会話では、話し終わって 1.8 秒黙ると区切って送り、返答を読み上げたあと、また聞き取る。
+

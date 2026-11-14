@@ -9,6 +9,8 @@ struct DownloadState: Sendable {
         case downloading
         case paused
         case failed(String)
+        /// ダウンロードしたあと、このアプリ用の形に変換している（0〜1）
+        case converting(Double)
     }
     var phase: Phase
     var progress: DownloadProgress?
@@ -19,6 +21,8 @@ enum ModelLibraryError: Error, LocalizedError {
     case incomplete
     case missingTokenizer
     case missingModelFolder
+    case alreadyInstalled
+    case unsupportedGGUF(String)
 
     var errorDescription: String? {
         switch self {
@@ -28,11 +32,15 @@ enum ModelLibraryError: Error, LocalizedError {
         case .incomplete:
             return L("ダウンロードが完了していません。", "The download has not finished.")
         case .missingTokenizer:
-            return L("tokenizer.json が見つかりません。このリポジトリには対応するトークナイザが含まれていない可能性があります。",
-                     "tokenizer.json was not found. This repository may not include a compatible tokenizer.")
+            return L("トークナイザが見つかりません。tokenizer.json・tokenizer.model・vocab.json + merges.txt のどれも無く、元のモデルからも取ってこられませんでした（ネットにつないでもう一度読み込むと、取ってこられることがあります）。",
+                     "No tokenizer was found: there is no tokenizer.json, tokenizer.model or vocab.json + merges.txt, and none could be fetched from the base model (try loading again while online).")
         case .missingModelFolder:
             return L("モデルのファイルが見つかりません。削除してもう一度ダウンロードしてください。",
                      "The model files are missing. Delete the model and download it again.")
+        case .alreadyInstalled:
+            return L("同じ名前のモデルがすでに入っています。", "A model with the same name is already installed.")
+        case .unsupportedGGUF(let reason):
+            return L("この GGUF は動かせません: \(reason)", "This GGUF cannot be run: \(reason)")
         }
     }
 }
@@ -115,7 +123,7 @@ final class ModelLibrary {
 
     /// ダウンロードを始める（既に記録があれば続きから）。
     func startDownload(repoID: String, revision: String = "main", variant: ModelVariant, analysis: RepoAnalysis,
-                       metadata: CoreMLMetadata?, client: HFClient) throws {
+                       metadata: CoreMLMetadata?, gguf: GGUFSummary? = nil, client: HFClient) throws {
         let id = InstalledModel.makeID(repoID: repoID, variantPath: variant.path)
         if let existing = model(withID: id) {
             if !existing.isComplete { resumeDownload(id: id, client: client) }
@@ -123,8 +131,10 @@ final class ModelLibrary {
         }
         let files = analysis.filesToDownload(for: variant)
         let total = files.reduce(Int64(0)) { $0 + $1.size }
-        if let available = availableStorageBytes, available < total + 200_000_000 {
-            throw ModelLibraryError.notEnoughStorage(needed: total, available: available)
+        // GGUF は、ダウンロードしたあとに変換する間だけ、変換後のファイルの分も要る
+        let conversionBytes: Int64 = variant.kind == .gguf ? (gguf?.storeBytes ?? total * 2) : 0
+        if let available = availableStorageBytes, available < total + conversionBytes + 200_000_000 {
+            throw ModelLibraryError.notEnoughStorage(needed: total + conversionBytes, available: available)
         }
         let weightBytes = variant.files.filter { $0.path.hasSuffix("weight.bin") }.reduce(Int64(0)) { $0 + $1.size }
         let model = InstalledModel(
@@ -140,11 +150,12 @@ final class ModelLibrary {
             createdAt: Date(),
             isComplete: false,
             compiledModelPath: nil,
-            maxContext: metadata?.interface.maxContext,
+            maxContext: metadata?.interface.maxContext ?? gguf?.defaultContext,
             stateBytes: metadata?.stateBytes,
             weightBytes: weightBytes > 0 ? weightBytes : nil,
             pipeline: variant.pipeline,
-            renames: variant.renames
+            renames: variant.renames,
+            gguf: gguf
         )
         try fileManager.createDirectory(at: directory(for: model), withIntermediateDirectories: true)
         try save(model)
@@ -155,6 +166,11 @@ final class ModelLibrary {
     /// 一時停止中・失敗したダウンロードを続きから再開する。
     func resumeDownload(id: String, client: HFClient) {
         guard let model = model(withID: id), !model.isComplete, tasks[id] == nil else { return }
+        // ファイルから取り込んだ GGUF は、ダウンロードするものが無いので変換からやり直す
+        if model.repoID == Self.localRepoID {
+            startGGUFConversion(model)
+            return
+        }
         let items = model.files.map { file in
             ModelDownloadJob.Item(url: client.resolveURL(repo: model.repoID, path: file.path, revision: model.revision),
                                   relativePath: model.localPath(for: file.path),
@@ -211,14 +227,20 @@ final class ModelLibrary {
         endBackgroundTask(for: id)
         updateIdleTimer()
         guard let model = model(withID: id) else { return }
-        if model.kind == .archive {
-            // ZIP を展開して、中のモデルを調べ直す（時間がかかるので別のスレッドで）
+        if model.kind == .gguf {
+            startGGUFConversion(model)
+            return
+        }
+        let needsJoin = !SplitParts.group(model.files.map(\.path)).isEmpty
+        let hasZippedParts = model.kind == .pipeline && model.files.contains { ModelArchiveExpander.modelRoot(forArchive: $0.path) != nil }
+        if needsJoin || hasZippedParts || model.kind == .archive {
+            // 分割されたファイルをつなげ、ZIP を展開して、中のモデルを調べ直す（時間がかかるので別のスレッドで）
             downloads[id] = DownloadState(phase: .downloading, progress: downloads[id]?.progress)
             let folder = directory(for: model)
             tasks[id] = Task { [self] in
                 do {
                     let adopted = try await Task.detached(priority: .userInitiated) {
-                        try Self.expandArchive(of: model, in: folder)
+                        try Self.postProcess(model, in: folder)
                     }.value
                     tasks[id] = nil
                     completeDownload(adopted)
@@ -229,6 +251,174 @@ final class ModelLibrary {
             return
         }
         completeDownload(model)
+    }
+
+    /// ダウンロードしたあとの片付け: 分けて置かれたファイルを 1 つにつなげ、ZIP の部品を展開する
+    nonisolated private static func postProcess(_ original: InstalledModel, in folder: URL) throws -> InstalledModel {
+        var model = original
+        let groups = SplitParts.group(model.files.map(\.path))
+        for (base, parts) in groups {
+            try SplitParts.join(parts.map { folder.appendingPathComponent(model.localPath(for: $0)) },
+                                into: folder.appendingPathComponent(model.localPath(for: base)))
+        }
+        if !groups.isEmpty { model.files = SplitParts.joinedEntries(model.files).files }
+        if model.kind == .archive { return try expandArchive(of: model, in: folder) }
+        if model.kind == .pipeline {
+            let parts = Set(model.pipeline?.parts ?? [])
+            var remaining: [HFFileEntry] = []
+            for file in model.files {
+                if let root = ModelArchiveExpander.modelRoot(forArchive: file.path), parts.contains(root) {
+                    try ModelArchiveExpander.expand(folder.appendingPathComponent(model.localPath(for: file.path)),
+                                                    root: model.localPath(for: root), in: folder, inflate: ZipArchive.systemInflater)
+                } else {
+                    remaining.append(file)
+                }
+            }
+            model.files = remaining
+        }
+        return model
+    }
+
+    // MARK: - GGUF
+
+    /// ファイルから取り込んだモデルの、リポジトリ名の代わり
+    nonisolated static let localRepoID = "local"
+    /// GGUF を変換したあとの重みのファイル名
+    nonisolated static let ggufStoreName = "model." + GGUFWeightStore.fileExtension
+
+    /// ダウンロード（または取り込み）した GGUF を、このアプリ用の形に変換する
+    private func startGGUFConversion(_ model: InstalledModel) {
+        let id = model.id
+        guard tasks[id] == nil else { return }
+        downloads[id] = DownloadState(phase: .converting(0), progress: nil)
+        beginBackgroundTask(for: id)
+        let folder = directory(for: model)
+        tasks[id] = Task { [self] in
+            do {
+                let converted = try await Self.convertGGUF(model, in: folder) { fraction in
+                    Task { @MainActor in
+                        guard self.tasks[id] != nil else { return }
+                        self.downloads[id] = DownloadState(phase: .converting(fraction), progress: nil)
+                    }
+                }
+                tasks[id] = nil
+                endBackgroundTask(for: id)
+                updateIdleTimer()
+                completeDownload(converted)
+            } catch {
+                failDownload(id: id, error: error)
+            }
+        }
+        updateIdleTimer()
+    }
+
+    /// GGUF から、重み（8 ビットにして保存）とトークナイザのファイルを作る。終わったら元の GGUF は消す（容量の節約）。
+    nonisolated private static func convertGGUF(_ original: InstalledModel, in folder: URL,
+                                                progress: @escaping @Sendable (Double) -> Void) async throws -> InstalledModel {
+        var model = original
+        let fileManager = FileManager.default
+        let source = folder.appendingPathComponent(model.localPath(for: model.variantPath))
+        let store = folder.appendingPathComponent(ggufStoreName)
+        guard fileManager.fileExists(atPath: source.path) else {
+            // 変換は済んでいて、元のファイルを消したあとに中断された
+            if fileManager.fileExists(atPath: store.path), model.gguf != nil {
+                model.ggufStorePath = ggufStoreName
+                return model
+            }
+            throw ModelLibraryError.missingModelFolder
+        }
+        let file = try GGUFFile.open(source)
+        let summary = GGUFSummary(file: file)
+        if let reason = summary.unsupportedReason { throw ModelLibraryError.unsupportedGGUF(reason) }
+        let tokenizer = try GGUFTokenizer.files(from: file)
+        try tokenizer.tokenizerJSON.write(to: folder.appendingPathComponent("tokenizer.json"), options: .atomic)
+        try tokenizer.tokenizerConfigJSON.write(to: folder.appendingPathComponent("tokenizer_config.json"), options: .atomic)
+        try tokenizer.generationConfigJSON.write(to: folder.appendingPathComponent("generation_config.json"), options: .atomic)
+
+        var lastPercent = -1
+        try GGUFConverter.convert(gguf: source, to: store, progress: { fraction in
+            let percent = Int(fraction * 100)
+            if percent != lastPercent {
+                lastPercent = percent
+                progress(fraction)
+            }
+        }, isCancelled: { Task.isCancelled })
+
+        // メタデータ（先頭部分）だけ残して、元のファイルは消す
+        if let handle = try? FileHandle(forReadingFrom: source) {
+            let header = (try? handle.read(upToCount: file.dataOffset)) ?? Data()
+            try? handle.close()
+            try? header.write(to: folder.appendingPathComponent("header.gguf"), options: .atomic)
+        }
+        try? fileManager.removeItem(at: source)
+        let size = (try? fileManager.attributesOfItem(atPath: store.path)[.size] as? NSNumber)?.int64Value
+        model.gguf = summary
+        model.ggufStorePath = ggufStoreName
+        model.totalBytes = size ?? summary.storeBytes
+        model.maxContext = min(model.maxContext ?? summary.defaultContext, summary.contextLength)
+        return model
+    }
+
+    /// 「ファイル」アプリなどから GGUF を取り込む（コピーしてから変換する）
+    func importGGUF(from url: URL) throws {
+        let name = url.lastPathComponent
+        guard GGUFNaming.isGGUF(name) else {
+            throw ModelLibraryError.unsupportedGGUF(L("拡張子が .gguf のファイルを選んでください", "choose a file ending in .gguf"))
+        }
+        let id = InstalledModel.makeID(repoID: Self.localRepoID, variantPath: name)
+        guard model(withID: id) == nil else { throw ModelLibraryError.alreadyInstalled }
+        let accessed = url.startAccessingSecurityScopedResource()
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
+        if let available = availableStorageBytes, available < size * 2 + 200_000_000 {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+            throw ModelLibraryError.notEnoughStorage(needed: size * 2, available: available)
+        }
+        let model = InstalledModel(
+            id: id, repoID: Self.localRepoID, revision: "", variantPath: name, kind: .gguf,
+            displayName: (name as NSString).deletingPathExtension,
+            directoryName: InstalledModel.makeDirectoryName(repoID: Self.localRepoID, variantPath: name),
+            files: [HFFileEntry(path: name, size: size, lfsSHA256: nil)], totalBytes: size, createdAt: Date(),
+            isComplete: false, compiledModelPath: nil, maxContext: nil, stateBytes: nil, weightBytes: nil,
+            pipeline: nil, renames: nil
+        )
+        let folder = directory(for: model)
+        do {
+            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+            try save(model)
+        } catch {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+            throw error
+        }
+        models.insert(model, at: 0)
+        downloads[id] = DownloadState(phase: .converting(0), progress: nil)
+        let destination = folder.appendingPathComponent(name)
+        tasks[id] = Task { [self] in
+            do {
+                try await Self.copyFile(from: url, to: destination)
+                if accessed { url.stopAccessingSecurityScopedResource() }
+                tasks[id] = nil
+                startGGUFConversion(model)
+            } catch {
+                if accessed { url.stopAccessingSecurityScopedResource() }
+                failDownload(id: id, error: error)
+            }
+        }
+        updateIdleTimer()
+    }
+
+    nonisolated private static func copyFile(from source: URL, to destination: URL) async throws {
+        let fileManager = FileManager.default
+        try? fileManager.removeItem(at: destination)
+        try fileManager.copyItem(at: source, to: destination)
+    }
+
+    /// GGUF のモデルで使うコンテキスト長を変える（KV キャッシュの大きさが変わるだけで、ファイルは書き換えない）
+    func setGGUFContext(id: String, to context: Int) throws {
+        guard var model = model(withID: id), model.kind == .gguf else { return }
+        let limit = model.gguf?.contextLength ?? context
+        model.maxContext = max(256, min(context, limit))
+        try save(model)
+        replace(model)
     }
 
     private func completeDownload(_ original: InstalledModel) {
@@ -317,10 +507,11 @@ final class ModelLibrary {
     }
 
     /// 推論エンジンに渡すファイル一式を用意する。.mlpackage なら初回だけコンパイルする（数十秒〜数分）。
-    func prepareFiles(for id: String) async throws -> ModelFiles {
+    func prepareFiles(for id: String, client: HFClient? = nil) async throws -> ModelFiles {
         guard var model = model(withID: id) else { throw ModelLibraryError.missingModelFolder }
         guard model.isComplete else { throw ModelLibraryError.incomplete }
         let folder = directory(for: model)
+        if model.kind == .gguf { return try ggufFiles(for: model, in: folder) }
 
         let source: ModelFiles.Source
         switch model.kind {
@@ -354,7 +545,7 @@ final class ModelLibrary {
                                              chunks: try pipeline.chunks.map(partURL),
                                              lmHead: try pipeline.lmHead.map(partURL),
                                              descriptor: pipeline))
-        case .archive:
+        case .archive, .gguf:
             throw ModelLibraryError.incomplete
         case .compiled, .package:
             if model.compiledModelPath == nil || !fileManager.fileExists(atPath: folder.appendingPathComponent(model.compiledModelPath ?? "").path) {
@@ -372,11 +563,16 @@ final class ModelLibrary {
             source = .single(folder.appendingPathComponent(compiledPath))
         }
 
-        guard let tokenizerPath = model.supportFilePath(named: "tokenizer.json") else { throw ModelLibraryError.missingTokenizer }
+        let tokenizerURL = try await tokenizerURL(for: model, in: folder, client: client)
+        // 取ってきたトークナイザの付属ファイル（モデルのリポジトリに無いときに使う）
+        let fallbackFolder = folder.appendingPathComponent(Self.fallbackTokenizerFolder, isDirectory: true)
 
         func url(_ name: String) -> URL? {
-            model.supportFilePath(named: name).map { folder.appendingPathComponent(model.localPath(for: $0)) }
+            let own = model.supportFilePath(named: name).map { folder.appendingPathComponent(model.localPath(for: $0)) }
                 .flatMap { fileManager.fileExists(atPath: $0.path) ? $0 : nil }
+            if let own { return own }
+            let fetched = fallbackFolder.appendingPathComponent(name)
+            return fileManager.fileExists(atPath: fetched.path) ? fetched : nil
         }
 
         // chat_template.jinja / chat_template.json があれば tokenizer_config.json の chat_template より優先する
@@ -394,12 +590,88 @@ final class ModelLibrary {
             modelID: model.id,
             displayName: model.displayName,
             source: source,
-            tokenizerJSON: folder.appendingPathComponent(model.localPath(for: tokenizerPath)),
+            tokenizerJSON: tokenizerURL,
             tokenizerConfigJSON: url("tokenizer_config.json"),
             generationConfigJSON: url("generation_config.json"),
             configJSON: url("config.json"),
-            chatTemplateOverride: templateOverride
+            chatTemplateOverride: templateOverride,
+            stateBytes: model.stateBytes
         )
+    }
+
+    /// GGUF から変換したモデルのファイル一式（トークナイザなどは変換のときに作ってある）
+    private func ggufFiles(for model: InstalledModel, in folder: URL) throws -> ModelFiles {
+        let store = folder.appendingPathComponent(model.ggufStorePath ?? Self.ggufStoreName)
+        let tokenizer = folder.appendingPathComponent("tokenizer.json")
+        guard fileManager.fileExists(atPath: store.path), fileManager.fileExists(atPath: tokenizer.path) else {
+            throw ModelLibraryError.missingModelFolder
+        }
+        func optional(_ name: String) -> URL? {
+            let url = folder.appendingPathComponent(name)
+            return fileManager.fileExists(atPath: url.path) ? url : nil
+        }
+        let context = model.maxContext ?? model.gguf?.defaultContext ?? 4096
+        return ModelFiles(
+            modelID: model.id,
+            displayName: model.displayName,
+            source: .gguf(GGUFModelFiles(store: store, context: context)),
+            tokenizerJSON: tokenizer,
+            tokenizerConfigJSON: optional("tokenizer_config.json"),
+            generationConfigJSON: optional("generation_config.json"),
+            configJSON: nil,
+            chatTemplateOverride: nil,
+            stateBytes: nil
+        )
+    }
+
+    // MARK: - トークナイザ
+
+    /// ほかのリポジトリから取ってきたトークナイザを置くフォルダ（モデルのフォルダの中）
+    static let fallbackTokenizerFolder = "tokenizer-source"
+    /// ほかの形式から作った tokenizer.json
+    static let synthesizedTokenizerName = "tokenizer.synthesized.json"
+
+    /// tokenizer.json の場所。無ければほかの形式（tokenizer.model、vocab.json + merges.txt、tiktoken）から作り（作ったものは取っておく）、
+    /// それも無ければ元のモデル（base_model）や同じ系列のモデルから取ってくる。
+    private func tokenizerURL(for model: InstalledModel, in folder: URL, client: HFClient?) async throws -> URL {
+        func local(_ name: String) -> URL? {
+            model.supportFilePath(named: name).map { folder.appendingPathComponent(model.localPath(for: $0)) }
+                .flatMap { fileManager.fileExists(atPath: $0.path) ? $0 : nil }
+        }
+        if let own = local("tokenizer.json") { return own }
+        let synthesized = folder.appendingPathComponent(Self.synthesizedTokenizerName)
+        if fileManager.fileExists(atPath: synthesized.path) { return synthesized }
+        let fetched = folder.appendingPathComponent(Self.fallbackTokenizerFolder).appendingPathComponent("tokenizer.json")
+        if fileManager.fileExists(atPath: fetched.path) { return fetched }
+
+        let tiktoken = model.files.map(\.path).first { $0.hasSuffix(".tiktoken") }
+            .map { folder.appendingPathComponent(model.localPath(for: $0)) }
+        let files = TokenizerSynthesizer.Files(tokenizerJSON: nil,
+                                               tokenizerModel: local("tokenizer.model") ?? local("spiece.model") ?? local("sentencepiece.bpe.model"),
+                                               vocabJSON: local("vocab.json"), mergesText: local("merges.txt"),
+                                               tiktoken: tiktoken, addedTokensJSON: local("added_tokens.json"))
+        if files.canSynthesize {
+            let config = local("tokenizer_config.json")
+            try await Task.detached(priority: .userInitiated) {
+                guard let source = try TokenizerSynthesizer.source(for: files) else { throw ModelLibraryError.missingTokenizer }
+                let data = try TokenizerSynthesizer.tokenizerJSON(from: source,
+                                                                  tokenizerConfig: config.flatMap { try? Data(contentsOf: $0) },
+                                                                  addedTokensJSON: files.addedTokensJSON.flatMap { try? Data(contentsOf: $0) })
+                try data.write(to: synthesized, options: .atomic)
+            }.value
+            return synthesized
+        }
+
+        // どの形式も無い: 元のモデルや同じ系列のモデルから取ってくる
+        guard let client else { throw ModelLibraryError.missingTokenizer }
+        var bases: [String] = []
+        if let info = try? await client.modelInfo(repo: model.repoID) { bases = info.baseModels }
+        let candidates = TokenizerFallback.candidates(repoID: model.repoID, baseModels: bases, names: [model.displayName])
+        let destination = folder.appendingPathComponent(Self.fallbackTokenizerFolder, isDirectory: true)
+        guard await TokenizerFallback.fetch(client: client, candidates: candidates, into: destination) != nil else {
+            throw ModelLibraryError.missingTokenizer
+        }
+        return fetched
     }
 
     /// .mlpackage をコンパイルして .mlmodelc にし、元のパッケージは消す。戻り値は .mlmodelc のパス。
@@ -432,7 +704,7 @@ final class ModelLibrary {
             return (model.pipeline?.chunks ?? []).map { folder.appendingPathComponent(model.localPath(for: $0)) }
         case .compiled, .package:
             return model.compiledModelPath.map { [folder.appendingPathComponent($0)] } ?? []
-        case .archive:
+        case .archive, .gguf:
             return []
         }
     }

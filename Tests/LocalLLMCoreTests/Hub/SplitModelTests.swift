@@ -213,3 +213,101 @@ final class ZipArchiveTests: XCTestCase {
         XCTAssertTrue(ZipArchive.isSafe("a/b..c/d"))
     }
 }
+
+/// 分けて置かれたファイルと、ZIP に入った部品を、1 つのモデルにまとめる
+final class SplitPartsTests: XCTestCase {
+    private func entry(_ path: String, _ size: Int64 = 10) -> HFFileEntry { HFFileEntry(path: path, size: size, lfsSHA256: nil) }
+
+    func testRecognizesSplitNames() {
+        XCTAssertEqual(SplitParts.parse("a/weight.bin.part1"), SplitParts.Part(base: "a/weight.bin", index: 1, total: nil))
+        XCTAssertEqual(SplitParts.parse("weight.bin.part-02"), SplitParts.Part(base: "weight.bin", index: 2, total: nil))
+        XCTAssertEqual(SplitParts.parse("weight.bin.part2of3"), SplitParts.Part(base: "weight.bin", index: 2, total: 3))
+        XCTAssertEqual(SplitParts.parse("Model.mlmodelc.zip.001"), SplitParts.Part(base: "Model.mlmodelc.zip", index: 1, total: nil))
+        XCTAssertEqual(SplitParts.parse("weights/weight-00002-of-00003.bin"), SplitParts.Part(base: "weights/weight.bin", index: 2, total: 3))
+        XCTAssertEqual(SplitParts.parse("model.zip.partab"), SplitParts.Part(base: "model.zip", index: 1, total: nil))
+        XCTAssertNil(SplitParts.parse("model-00001-of-00002.safetensors"))
+        XCTAssertNil(SplitParts.parse("weights/weight.bin"))
+        XCTAssertNil(SplitParts.parse("chunk_01of02.mlmodelc/model.mil"))
+
+        let groups = SplitParts.group(["w.bin.part2", "w.bin.part1", "w.bin.part3", "x.zip.001", "only.bin.part1", "gap.bin.part1", "gap.bin.part3"])
+        XCTAssertEqual(groups["w.bin"], ["w.bin.part1", "w.bin.part2", "w.bin.part3"])
+        XCTAssertNil(groups["x.zip"])        // 1 つだけなら分割ではない
+        XCTAssertNil(groups["gap.bin"])      // 番号が抜けている
+        XCTAssertNil(SplitParts.group(["w.bin", "w.bin.part1", "w.bin.part2"])["w.bin"])
+    }
+
+    func testJoinsPartsInOrder() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("split-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        var urls: [URL] = []
+        for (index, text) in ["Hello, ", "split ", "world"].enumerated() {
+            let url = folder.appendingPathComponent("w.bin.part\(index + 1)")
+            try Data(text.utf8).write(to: url)
+            urls.append(url)
+        }
+        let destination = folder.appendingPathComponent("weights/weight.bin")
+        try SplitParts.join(urls, into: destination)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "Hello, split world")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: urls[0].path))
+    }
+
+    func testAnalysisJoinsSplitWeights() {
+        let files = [entry("M.mlmodelc/model.mil"), entry("M.mlmodelc/coremldata.bin"), entry("M.mlmodelc/metadata.json"),
+                     entry("M.mlmodelc/weights/weight.bin.part1", 600), entry("M.mlmodelc/weights/weight.bin.part2", 400),
+                     entry("tokenizer.json")]
+        let analysis = RepoAnalysis.analyze(files: files)
+        XCTAssertEqual(analysis.variants.count, 1)
+        let variant = analysis.variants[0]
+        XCTAssertEqual(variant.kind, .compiled)
+        XCTAssertEqual(variant.totalBytes, 1030)
+        XCTAssertTrue(variant.files.contains { $0.path == "M.mlmodelc/weights/weight.bin.part2" })
+        XCTAssertFalse(variant.files.contains { $0.path == "M.mlmodelc/weights/weight.bin" })
+    }
+
+    func testZippedChunksBecomeOneModel() {
+        let files = [entry("qwen_embeddings.mlmodelc.zip"), entry("qwen_FFN_PF_lut6_chunk_01of02.mlmodelc.zip"),
+                     entry("qwen_FFN_PF_lut6_chunk_02of02.mlmodelc.zip"), entry("qwen_lm_head_lut6.mlmodelc.zip"),
+                     entry("tokenizer.json")]
+        let analysis = RepoAnalysis.analyze(files: files)
+        XCTAssertEqual(analysis.variants.map(\.kind), [.pipeline])
+        let pipeline = analysis.variants[0].pipeline
+        XCTAssertEqual(pipeline?.chunks, ["qwen_FFN_PF_lut6_chunk_01of02.mlmodelc", "qwen_FFN_PF_lut6_chunk_02of02.mlmodelc"])
+        XCTAssertEqual(pipeline?.embeddings, "qwen_embeddings.mlmodelc")
+        XCTAssertEqual(analysis.variants[0].files.count, 4)
+    }
+
+    func testSplitZipArchive() {
+        let files = [entry("Model.mlmodelc.zip.001", 100), entry("Model.mlmodelc.zip.002", 50), entry("tokenizer.json")]
+        let analysis = RepoAnalysis.analyze(files: files)
+        XCTAssertEqual(analysis.variants.map(\.kind), [.archive])
+        XCTAssertEqual(analysis.variants[0].path, "Model.mlmodelc.zip")
+        XCTAssertEqual(analysis.variants[0].files.map(\.path), ["Model.mlmodelc.zip.001", "Model.mlmodelc.zip.002"])
+        XCTAssertEqual(analysis.variants[0].totalBytes, 150)
+    }
+
+    func testExpandsZippedModelInPlace() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("expand-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        // 中にフォルダがある ZIP と、フォルダ無しの ZIP
+        var withFolder = ZipWriter()
+        withFolder.add(path: "A.mlmodelc/model.mil", data: Data("program".utf8))
+        withFolder.add(path: "A.mlmodelc/coremldata.bin", data: Data([1, 2]))
+        try withFolder.finish().write(to: folder.appendingPathComponent("A.mlmodelc.zip"))
+        var flat = ZipWriter()
+        flat.add(path: "model.mil", data: Data("flat".utf8))
+        flat.add(path: "coremldata.bin", data: Data([3]))
+        try flat.finish().write(to: folder.appendingPathComponent("B.mlmodelc.zip"))
+
+        XCTAssertEqual(ModelArchiveExpander.modelRoot(forArchive: "x/A.mlmodelc.zip"), "x/A.mlmodelc")
+        XCTAssertNil(ModelArchiveExpander.modelRoot(forArchive: "notes.zip"))
+        try ModelArchiveExpander.expand(folder.appendingPathComponent("A.mlmodelc.zip"), root: "A.mlmodelc", in: folder, inflate: nil)
+        try ModelArchiveExpander.expand(folder.appendingPathComponent("B.mlmodelc.zip"), root: "B.mlmodelc", in: folder, inflate: nil)
+        XCTAssertEqual(try String(contentsOf: folder.appendingPathComponent("A.mlmodelc/model.mil"), encoding: .utf8), "program")
+        XCTAssertEqual(try String(contentsOf: folder.appendingPathComponent("B.mlmodelc/model.mil"), encoding: .utf8), "flat")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("A.mlmodelc.zip").path))
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: folder.path).filter { $0.hasPrefix(".") }
+        XCTAssertEqual(leftovers, [])
+    }
+}

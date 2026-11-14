@@ -22,8 +22,11 @@ struct WorkspaceHomeView: View {
     var body: some View {
         NavigationStack {
             content
+                .background(CDWSTheme.canvas)
                 .navigationTitle(L("コーディングワークスペース", "Coding Workspace"))
                 .navigationBarTitleDisplayMode(.inline)
+                .toolbarBackground(CDWSTheme.panel, for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
                 .toolbar { toolbar }
                 .navigationDestination(item: $openSession) { session in
                     WorkspaceView(session: session, onClose: { close(session) })
@@ -47,6 +50,9 @@ struct WorkspaceHomeView: View {
                     removeButtons
                 }
         }
+        // IDE らしい暗い見た目にそろえる
+        .preferredColorScheme(.dark)
+        .tint(CDWSTheme.violet)
     }
 
     @ViewBuilder
@@ -54,29 +60,18 @@ struct WorkspaceHomeView: View {
         if store.projects.isEmpty {
             WorkspaceEmptyState(onCreate: { creating = true }, onImport: { importingFolder = true })
         } else {
-            List {
-                Section {
-                    ForEach(store.sortedProjects) { project in
-                        Button {
-                            open(project, roadmap: nil)
-                        } label: {
-                            ProjectRow(project: project)
-                        }
-                        .swipeActions {
-                            Button(role: .destructive) { removing = project } label: {
-                                Label(L("外す", "Remove"), systemImage: "trash")
-                            }
-                        }
-                        .contextMenu {
-                            Button(role: .destructive) { removing = project } label: {
-                                Label(L("一覧から外す…", "Remove…"), systemImage: "trash")
-                            }
-                        }
-                    }
-                } footer: {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    WorkspaceHero(count: store.projects.count, onCreate: { creating = true }, onImport: { importingFolder = true })
+                    ProjectGrid(projects: store.sortedProjects, onOpen: { open($0, roadmap: nil) }, onRemove: { removing = $0 })
                     Text(L("「フォルダを開く」で、iCloud Drive などのフォルダ（Swift Playgrounds の .swiftpm も）をそのままプロジェクトとして編集できます。",
                            "Use \"Open Folder\" to edit any folder (iCloud Drive, Swift Playgrounds .swiftpm packages, …) as a project."))
+                        .font(.caption)
+                        .foregroundStyle(CDWSTheme.secondaryText)
                 }
+                .padding(20)
+                .frame(maxWidth: 1100)
+                .frame(maxWidth: .infinity)
             }
         }
     }
@@ -154,31 +149,124 @@ extension WorkspaceSession: Hashable {
     nonisolated func hash(into hasher: inout Hasher) { hasher.combine(ObjectIdentifier(self)) }
 }
 
-private struct ProjectRow: View {
-    let project: WorkspaceProject
+/// 一覧の上の大きな見出し
+private struct WorkspaceHero: View {
+    let count: Int
+    var onCreate: () -> Void
+    var onImport: () -> Void
 
     var body: some View {
-        HStack(spacing: 14) {
-            Image(systemName: ProjectTemplates.template(id: project.templateID ?? "")?.symbolName ?? "folder")
-                .font(.title2)
-                .foregroundStyle(.tint)
-                .frame(width: 40)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(project.name).font(.headline)
-                Text(project.locationLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+        HStack(alignment: .center, spacing: 18) {
+            CDWSIconTile(symbol: "chevron.left.forwardslash.chevron.right", size: 58)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L("iPad の中の AI と一緒に作る", "Build with the AI on your iPad"))
+                    .font(.title2.bold())
+                    .foregroundStyle(CDWSTheme.text)
+                Text(L("\(count) 個のプロジェクト・エージェントが読んで、書いて、直します", "\(count) projects · the agent reads, writes and fixes"))
+                    .font(.callout)
+                    .foregroundStyle(CDWSTheme.secondaryText)
             }
-            Spacer()
-            if let date = project.lastOpened {
-                Text(date.formatted(.relative(presentation: .named)))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            WorkspaceHeroButtons(onCreate: onCreate, onImport: onImport)
+        }
+        .padding(20)
+        .background(CDWSTheme.hero, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(CDWSTheme.strongStroke))
+    }
+}
+
+private struct WorkspaceHeroButtons: View {
+    var onCreate: () -> Void
+    var onImport: () -> Void
+
+    var body: some View {
+        ViewThatFits {
+            HStack(spacing: 10) { buttons }
+            VStack(alignment: .trailing, spacing: 8) { buttons }
+        }
+    }
+
+    @ViewBuilder
+    private var buttons: some View {
+        Button(action: onImport) {
+            Label(L("フォルダを開く", "Open Folder"), systemImage: "folder.badge.plus")
+        }
+        .buttonStyle(.bordered)
+        .tint(.white)
+        Button(action: onCreate) {
+            Label(L("新しいプロジェクト", "New Project"), systemImage: "plus")
+                .fontWeight(.semibold)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(CDWSTheme.violet)
+    }
+}
+
+/// プロジェクトのカードを並べる
+private struct ProjectGrid: View {
+    let projects: [WorkspaceProject]
+    var onOpen: (WorkspaceProject) -> Void
+    var onRemove: (WorkspaceProject) -> Void
+
+    private let columns = [GridItem(.adaptive(minimum: 250, maximum: 360), spacing: 14)]
+
+    var body: some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 14) {
+            ForEach(projects) { project in
+                Button { onOpen(project) } label: {
+                    ProjectCard(project: project)
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button(role: .destructive) { onRemove(project) } label: {
+                        Label(L("一覧から外す…", "Remove…"), systemImage: "trash")
+                    }
+                }
             }
         }
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
+    }
+}
+
+private struct ProjectCard: View {
+    let project: WorkspaceProject
+
+    private var symbol: String {
+        ProjectTemplates.template(id: project.templateID ?? "")?.symbolName ?? (project.isExternal ? "folder.fill" : "folder")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                CDWSIconTile(symbol: symbol, size: 40)
+                Spacer()
+                if project.isExternal {
+                    CDWSChip(text: L("外のフォルダ", "External"), symbol: "link", color: CDWSTheme.cyan)
+                }
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(project.name)
+                    .font(.headline)
+                    .foregroundStyle(CDWSTheme.text)
+                    .lineLimit(1)
+                Text(project.locationLabel)
+                    .font(.caption)
+                    .foregroundStyle(CDWSTheme.secondaryText)
+                    .lineLimit(1)
+            }
+            HStack {
+                if let date = project.lastOpened {
+                    Label(date.formatted(.relative(presentation: .named)), systemImage: "clock")
+                }
+                Spacer()
+                Image(systemName: "arrow.right.circle.fill").foregroundStyle(CDWSTheme.violet)
+            }
+            .font(.caption)
+            .foregroundStyle(CDWSTheme.secondaryText)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .cdwsPanel(radius: 18)
+        .contentShape(RoundedRectangle(cornerRadius: 18))
     }
 }
 
@@ -187,35 +275,40 @@ private struct WorkspaceEmptyState: View {
     var onImport: () -> Void
 
     var body: some View {
-        VStack(spacing: 18) {
-            Image(systemName: "chevron.left.forwardslash.chevron.right")
-                .font(.system(size: 52))
-                .foregroundStyle(.tint)
+        VStack(spacing: 20) {
+            CDWSIconTile(symbol: "chevron.left.forwardslash.chevron.right", size: 76)
             Text(L("iPad の中の AI と一緒に作る", "Build together with the AI on your iPad"))
                 .font(.title2.bold())
-            VStack(alignment: .leading, spacing: 8) {
-                Label(L("エージェントがファイルを読んで、書いて、直す", "The agent reads, writes and fixes files"), systemImage: "sparkles")
-                Label(L("ファイルエクスプローラとコードエディタ", "File explorer and code editor"), systemImage: "folder")
-                Label(L("作った機能が丸で並ぶロードマップ", "A roadmap where features appear as circles"), systemImage: "point.3.connected.trianglepath.dotted")
-                Label(L("Web アプリのプレビューと JavaScript の実行", "Web previews and JavaScript runs"), systemImage: "play.rectangle")
-                Label(L("すべての変更は元に戻せる", "Every change can be undone"), systemImage: "arrow.uturn.backward")
+                .foregroundStyle(CDWSTheme.text)
+            VStack(alignment: .leading, spacing: 10) {
+                WorkspaceFeatureRow(symbol: "sparkles", text: L("エージェントがファイルを読んで、書いて、直す", "The agent reads, writes and fixes files"))
+                WorkspaceFeatureRow(symbol: "folder", text: L("ファイルエクスプローラとコードエディタ", "File explorer and code editor"))
+                WorkspaceFeatureRow(symbol: "point.3.connected.trianglepath.dotted", text: L("作った機能が丸で並ぶロードマップ", "A roadmap where features appear as circles"))
+                WorkspaceFeatureRow(symbol: "play.rectangle", text: L("Web アプリのプレビューと JavaScript の実行", "Web previews and JavaScript runs"))
+                WorkspaceFeatureRow(symbol: "arrow.uturn.backward", text: L("すべての変更は元に戻せる", "Every change can be undone"))
             }
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            HStack(spacing: 12) {
-                Button(action: onImport) {
-                    Label(L("フォルダを開く", "Open Folder"), systemImage: "folder.badge.plus")
-                }
-                .buttonStyle(.bordered)
-                Button(action: onCreate) {
-                    Label(L("新しいプロジェクト", "New Project"), systemImage: "plus")
-                }
-                .buttonStyle(.borderedProminent)
-            }
+            .padding(18)
+            .cdwsPanel(radius: 18)
+            WorkspaceHeroButtons(onCreate: onCreate, onImport: onImport)
         }
         .padding(32)
         .frame(maxWidth: 560)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct WorkspaceFeatureRow: View {
+    let symbol: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(CDWSTheme.cyan)
+                .frame(width: 24)
+            Text(text).font(.callout).foregroundStyle(CDWSTheme.text)
+        }
     }
 }
 

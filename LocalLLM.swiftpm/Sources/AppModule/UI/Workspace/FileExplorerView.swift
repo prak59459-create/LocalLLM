@@ -29,10 +29,10 @@ struct FileExplorerView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
+            Rectangle().fill(CDWSTheme.stroke).frame(height: 1)
             tree
         }
-        .background(Color(uiColor: .secondarySystemBackground).opacity(0.5))
+        .background(CDWSTheme.panel)
         .alert(prompt?.title ?? "", isPresented: isPrompting) {
             TextField(L("名前", "Name"), text: $promptText)
                 .textInputAutocapitalization(.never)
@@ -93,9 +93,12 @@ struct FileExplorerView: View {
     }
 
     private var header: some View {
-        HStack {
-            Text(session.project.name)
-                .font(.subheadline.weight(.semibold))
+        HStack(spacing: 8) {
+            Image(systemName: "folder.fill").foregroundStyle(CDWSTheme.accent)
+            Text(session.project.name.uppercased())
+                .font(.caption.weight(.bold))
+                .tracking(0.6)
+                .foregroundStyle(CDWSTheme.secondaryText)
                 .lineLimit(1)
             Spacer()
             Menu {
@@ -103,11 +106,15 @@ struct FileExplorerView: View {
                 Button { ask(.newFolder, "") } label: { Label(L("新しいフォルダ", "New Folder"), systemImage: "folder.badge.plus") }
                 Button { session.refreshTree() } label: { Label(L("再読み込み", "Reload"), systemImage: "arrow.clockwise") }
             } label: {
-                Image(systemName: "plus.circle")
+                Image(systemName: "plus")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(CDWSTheme.text)
+                    .frame(width: 26, height: 26)
+                    .background(CDWSTheme.raised, in: Circle())
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 10)
     }
 
     @ViewBuilder
@@ -184,17 +191,31 @@ private struct FileRow: View {
                 .frame(width: 18)
             Text(entry.name)
                 .font(.callout)
+                .foregroundStyle(isSelected ? Color.white : CDWSTheme.text)
                 .lineLimit(1)
             if isDirty {
-                Circle().fill(Color.secondary).frame(width: 6, height: 6)
+                Circle().fill(CDWSTheme.orange).frame(width: 6, height: 6)
             }
             Spacer(minLength: 0)
         }
         .padding(.leading, CGFloat(entry.depth) * 14 + 8)
         .padding(.trailing, 8)
         .padding(.vertical, 5)
-        .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
+        .background { selection }
+        .padding(.horizontal, 6)
         .contentShape(Rectangle())
+    }
+}
+
+extension FileRow {
+    @ViewBuilder
+    fileprivate var selection: some View {
+        if isSelected {
+            RoundedRectangle(cornerRadius: 7, style: .continuous).fill(CDWSTheme.violet.opacity(0.32))
+                .overlay(alignment: .leading) {
+                    Capsule().fill(CDWSTheme.accent).frame(width: 3).padding(.vertical, 3)
+                }
+        }
     }
 }
 
@@ -217,14 +238,16 @@ enum FileIcon {
     }
 
     static func color(for entry: WorkspaceEntry) -> Color {
-        if entry.isDirectory { return .accentColor }
+        if entry.isDirectory { return CDWSTheme.cyan }
         switch (entry.name as NSString).pathExtension.lowercased() {
         case "swift": return .orange
         case "html", "htm": return .blue
         case "css": return .purple
         case "js", "ts", "jsx", "tsx", "mjs": return .yellow
         case "json": return .green
-        default: return .secondary
+        case "md", "txt": return CDWSTheme.secondaryText
+        case "py": return CDWSTheme.green
+        default: return CDWSTheme.secondaryText
         }
     }
 }

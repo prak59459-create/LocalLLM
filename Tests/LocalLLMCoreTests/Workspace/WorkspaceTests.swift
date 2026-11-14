@@ -303,9 +303,13 @@ final class WorkspaceToolTests: XCTestCase {
     func testProfilesAndPrompt() {
         let minimal = WorkspaceToolbox.definitions(profile: .minimal, javaScript: false).map(\.name)
         XCTAssertEqual(minimal, ["read_file", "write_file", "edit_file"])
+        // 標準は 5 つだけ（コンテキストを食わないように）
+        let standard = WorkspaceToolbox.definitions(profile: .standard, javaScript: false).map(\.name)
+        XCTAssertEqual(standard, ["read_file", "write_file", "edit_file", "search_files", "roadmap"])
         let full = WorkspaceToolbox.definitions(profile: .full, javaScript: true).map(\.name)
         XCTAssertTrue(full.contains("run_javascript"))
         XCTAssertEqual(Set(full).count, full.count)
+        XCTAssertLessThanOrEqual(full.count, 8)
         let prompt = CodingAgentPrompt.system(projectName: "Demo", tree: "index.html", roadmap: "#1 [idea] X",
                                               notes: "Use tabs", openFile: "index.html", javaScript: true)
         XCTAssertTrue(prompt.contains("Demo"))
@@ -391,3 +395,52 @@ final class SyntaxHighlighterTests: XCTestCase {
         XCTAssertEqual(tokens.count, 3000 * 4)
     }
 }
+
+final class SlimToolTests: XCTestCase {
+    private func call(_ name: String, _ arguments: [(String, JSONValue)]) -> ToolCall {
+        ToolCall(name: name, arguments: .object(arguments))
+    }
+
+    func testSearchListsFilesWhenEmptyAndFindsNames() throws {
+        let fs = try makeWorkspace()
+        _ = try fs.write("index.html", "<h1>Hello</h1>")
+        _ = try fs.write("src/app.js", "console.log('hello')\nlet total = 1")
+        let executor = WorkspaceToolExecutor(fileSystem: fs)
+        var roadmap = Roadmap()
+        let list = executor.execute(call("search_files", []), roadmap: &roadmap)
+        XCTAssertTrue(list.text.contains("index.html"))
+        XCTAssertTrue(list.text.contains("app.js"))
+        let found = executor.execute(call("search_files", [("pattern", .string("total"))]), roadmap: &roadmap)
+        XCTAssertTrue(found.text.contains("src/app.js:2:"), found.text)
+        let byName = executor.execute(call("search_files", [("pattern", .string("index"))]), roadmap: &roadmap)
+        XCTAssertTrue(byName.text.contains("index.html"), byName.text)
+    }
+
+    func testCombinedRoadmapTool() throws {
+        let fs = try makeWorkspace()
+        let executor = WorkspaceToolExecutor(fileSystem: fs)
+        var roadmap = Roadmap()
+        let added = executor.execute(call("roadmap", [("title", .string("Dark mode"))]), roadmap: &roadmap)
+        XCTAssertFalse(added.isError)
+        XCTAssertTrue(added.roadmapChanged)
+        let reference = try XCTUnwrap(roadmap.nodes.first?.reference)
+        let updated = executor.execute(call("roadmap", [("id", .string(reference)), ("status", .string("in_progress"))]), roadmap: &roadmap)
+        XCTAssertEqual(updated.text, "OK \(reference) in_progress")
+        XCTAssertEqual(roadmap.nodes.first?.status, .inProgress)
+        let listed = executor.execute(call("roadmap", []), roadmap: &roadmap)
+        XCTAssertTrue(listed.text.contains("Dark mode"))
+    }
+
+    func testOutputsAreShort() throws {
+        let fs = try makeWorkspace()
+        let executor = WorkspaceToolExecutor(fileSystem: fs)
+        var roadmap = Roadmap()
+        let long = (1...1000).map { "let line\($0) = \($0)" }.joined(separator: "\n")
+        let written = executor.execute(call("write_file", [("path", .string("big.js")), ("content", .string(long))]), roadmap: &roadmap)
+        XCTAssertEqual(written.text, "OK big.js (1000 " + L("行", "lines") + ")")
+        let read = executor.execute(call("read_file", [("path", .string("big.js"))]), roadmap: &roadmap)
+        XCTAssertLessThan(read.text.count, 5200)
+        XCTAssertTrue(read.text.contains("offset"))
+    }
+}
+

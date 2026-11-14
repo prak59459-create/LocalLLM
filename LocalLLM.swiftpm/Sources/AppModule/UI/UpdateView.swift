@@ -4,7 +4,10 @@ import UniformTypeIdentifiers
 /// アプリの更新画面（設定から開く）。GitHub とこの iPad の .swiftpm を比べて、変わったファイルだけを書き換える。
 struct UpdateView: View {
     @Environment(AppUpdateController.self) private var updater
-    @State private var importing: ImportKind?
+    /// どちらのボタンからファイルを選んでいるか。
+    /// 選ぶ画面が閉じると isImporting が先に false になってから結果が届くので、これは閉じても消さない。
+    @State private var importKind: ImportKind = .target
+    @State private var isImporting = false
     @State private var previewing: UpdateFileChange?
     @State private var confirmingRestore = false
 
@@ -17,14 +20,14 @@ struct UpdateView: View {
 
     private var allowedTypes: [UTType] {
         // .swiftpm がフォルダに見えても、パッケージに見えても選べるように、.item まで含める
-        importing == .target ? [Self.swiftpmType, .package, .folder, .item] : [.zip, Self.swiftpmType, .package, .folder]
+        importKind == .target ? [Self.swiftpmType, .package, .folder, .item] : [.zip, Self.swiftpmType, .package, .folder]
     }
 
     var body: some View {
         Form {
             UpdateOverviewSection(updater: updater)
-            UpdateTargetSection(updater: updater, onPick: { importing = .target })
-            UpdateSourceSection(updater: updater, onPick: { importing = .source })
+            UpdateTargetSection(updater: updater, onPick: { startImport(.target) })
+            UpdateSourceSection(updater: updater, onPick: { startImport(.source) })
             UpdateActionSection(updater: updater)
             if let result = updater.result, !result.diff.changes.isEmpty || !result.diff.keptLocalFiles.isEmpty {
                 UpdateChangesSection(updater: updater, result: result, onPreview: { previewing = $0 })
@@ -34,8 +37,7 @@ struct UpdateView: View {
         }
         .navigationTitle(L("アプリの更新", "Update the App"))
         .navigationBarTitleDisplayMode(.inline)
-        .fileImporter(isPresented: Binding(get: { importing != nil }, set: { if !$0 { importing = nil } }),
-                      allowedContentTypes: allowedTypes) { result in
+        .fileImporter(isPresented: $isImporting, allowedContentTypes: allowedTypes) { result in
             handleImport(result)
         }
         .sheet(item: $previewing) { change in
@@ -54,11 +56,17 @@ struct UpdateView: View {
         }
     }
 
+    private func startImport(_ kind: ImportKind) {
+        importKind = kind
+        isImporting = true
+    }
+
     private func handleImport(_ result: Result<URL, Error>) {
-        let kind = importing
-        importing = nil
         guard case .success(let url) = result else { return }
-        if kind == .target { updater.pickTarget(url) } else { updater.pickSourceFile(url) }
+        switch importKind {
+        case .target: updater.pickTarget(url)
+        case .source: updater.pickSourceFile(url)
+        }
     }
 }
 

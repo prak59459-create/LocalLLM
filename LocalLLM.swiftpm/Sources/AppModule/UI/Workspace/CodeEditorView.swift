@@ -9,7 +9,7 @@ struct EditorPane: View {
         VStack(spacing: 0) {
             if !session.openTabs.isEmpty {
                 EditorTabBar(session: session)
-                Divider()
+                Rectangle().fill(CDWSTheme.stroke).frame(height: 1)
             }
             if let path = session.selectedPath {
                 CodeEditorView(text: session.text(for: path),
@@ -36,9 +36,9 @@ private struct EditorTabBar: View {
                 }
             }
             .padding(.horizontal, 6)
-            .padding(.vertical, 4)
+            .padding(.vertical, 5)
         }
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(CDWSTheme.panel)
     }
 
     private func tab(_ path: String) -> EditorTab {
@@ -57,12 +57,20 @@ private struct EditorTab: View {
     var onSelect: () -> Void
     var onClose: () -> Void
 
-    private var tabBackground: Color { isSelected ? Color(uiColor: .systemBackground) : Color.clear }
+    private var tabBackground: Color { isSelected ? CDWSTheme.raised : Color.clear }
+
+    private var entry: WorkspaceEntry {
+        WorkspaceEntry(path: path, isDirectory: false, size: 0)
+    }
 
     var body: some View {
         HStack(spacing: 6) {
+            Image(systemName: FileIcon.symbol(for: entry))
+                .font(.caption)
+                .foregroundStyle(FileIcon.color(for: entry))
             Text((path as NSString).lastPathComponent)
                 .font(.callout)
+                .foregroundStyle(isSelected ? CDWSTheme.text : CDWSTheme.secondaryText)
                 .lineLimit(1)
             Button(action: onClose) {
                 Image(systemName: isDirty ? "circle.fill" : "xmark")
@@ -74,7 +82,10 @@ private struct EditorTab: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(tabBackground, in: RoundedRectangle(cornerRadius: 8))
+        .background(tabBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(alignment: .top) {
+            if isSelected { Capsule().fill(CDWSTheme.accent).frame(height: 2).padding(.horizontal, 8) }
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .help(path)
@@ -109,10 +120,10 @@ private struct EditorStatusBar: View {
             }
         }
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(CDWSTheme.secondaryText)
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
-        .background(.bar)
+        .background(CDWSTheme.panel)
     }
 }
 

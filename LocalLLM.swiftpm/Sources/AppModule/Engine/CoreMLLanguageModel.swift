@@ -8,6 +8,8 @@ enum EngineError: Error, LocalizedError {
     case missingOutput(String)
     case unexpectedOutputShape([Int])
     case modelNotLoaded
+    case lowMemory(available: Int64)
+    case stateTooLarge(needed: Int64, available: Int64)
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +27,12 @@ enum EngineError: Error, LocalizedError {
             return L("logits の形状が想定外です: \(shape)", "Unexpected logits shape: \(shape)")
         case .modelNotLoaded:
             return L("モデルが読み込まれていません。", "No model is loaded.")
+        case .lowMemory(let available):
+            return L("メモリが残り \(ByteFormat.string(available)) まで減ったので、アプリが落ちないよう途中で止めました。もう一度送ると、古いやり取りを短くして続けます。",
+                     "Stopped early because only \(ByteFormat.string(available)) of memory was left, to keep the app from crashing. Send again to continue with a shorter history.")
+        case .stateTooLarge(let needed, let available):
+            return L("このコンテキスト長では KV キャッシュに \(ByteFormat.string(needed)) 必要ですが、空きが \(ByteFormat.string(available)) しかありません。モデルの詳細でコンテキスト長を短くしてください。",
+                     "The KV cache needs \(ByteFormat.string(needed)) at this context length but only \(ByteFormat.string(available)) is free. Shorten the context length in the model details.")
         }
     }
 }
@@ -51,6 +59,15 @@ final class CoreMLLanguageModel: LanguageModelRunner {
     private var state: MLState?
     /// ステートレス形式で attention_mask が要求する型。
     private var attentionMaskDataType: MLMultiArrayDataType = .int32
+    let logitsElementBytes: Int
+    var gate: MemoryGate?
+
+    var isStateless: Bool {
+        if case .statelessCausalLM = interface { return true }
+        return false
+    }
+
+    var needsNewState: Bool { state == nil && !isStateless }
 
     init(model: MLModel, computeUnits: MLComputeUnits) throws {
         self.model = model
@@ -74,6 +91,13 @@ final class CoreMLLanguageModel: LanguageModelRunner {
             }
         }
         self.interface = interface
+        var logitsName = ""
+        switch interface {
+        case .statefulCausalLM(_, _, let name, _, _), .statelessCausalLM(_, _, let name, _, _): logitsName = name
+        case .unsupported: break
+        }
+        let logitsType = model.modelDescription.outputDescriptionsByName[logitsName]?.multiArrayConstraint?.dataType
+        logitsElementBytes = logitsType?.byteCount ?? 4
     }
 
     /// モデルファイル（.mlmodelc）を読み込む。
@@ -161,7 +185,10 @@ final class CoreMLLanguageModel: LanguageModelRunner {
         progress?(position, tokens.count)
         while position < tokens.count {
             try Task.checkCancellation()
-            let end = min(position + chunkSize, tokens.count)
+            // 1 回ごとにメモリを確かめ、少なければ小さく区切って読む
+            try gate?.check()
+            let size = gate?.chunk(chunkSize) ?? chunkSize
+            let end = min(position + size, tokens.count)
             let chunk = Array(tokens[position..<end])
             lastLogits = try await predictStateful(chunk: chunk, pastLength: position, state: state,
                                                    idsName: idsName, maskName: maskName,
@@ -175,6 +202,16 @@ final class CoreMLLanguageModel: LanguageModelRunner {
 
     private func predictStateful(chunk: [Int], pastLength: Int, state: MLState, idsName: String, maskName: String,
                                  logitsName: String, maskType: TensorSpec.DataType) async throws -> [Float] {
+        let model = self.model
+        return try await InferenceQueue.run {
+            try Self.predictStatefulNow(model: model, chunk: chunk, pastLength: pastLength, state: state, idsName: idsName,
+                                        maskName: maskName, logitsName: logitsName, maskType: maskType)
+        }
+    }
+
+    /// 1 回の予測（InferenceQueue の中で動かす。大きな出力はここを抜けるときに解放される）
+    private static func predictStatefulNow(model: MLModel, chunk: [Int], pastLength: Int, state: MLState, idsName: String,
+                                           maskName: String, logitsName: String, maskType: TensorSpec.DataType) throws -> [Float] {
         let n = chunk.count
         let ids = try CoreMLTensors.int32Array(chunk, shape: [1, n])
         let mask = try CoreMLTensors.causalMask(rows: n, columns: pastLength + n, firstRowPosition: pastLength,
@@ -183,7 +220,7 @@ final class CoreMLLanguageModel: LanguageModelRunner {
             idsName: MLFeatureValue(multiArray: ids),
             maskName: MLFeatureValue(multiArray: mask),
         ])
-        let output = try await model.prediction(from: input, using: state, options: MLPredictionOptions())
+        let output = try model.prediction(from: input, using: state, options: MLPredictionOptions())
         guard let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
             throw EngineError.missingOutput(logitsName)
         }
@@ -196,6 +233,7 @@ final class CoreMLLanguageModel: LanguageModelRunner {
                                    fixedLength: Int?) async throws -> [Float] {
         let length = fixedLength ?? tokens.count
         guard tokens.count <= length else { throw EngineError.contextOverflow(tokens.count, length) }
+        try gate?.check()
         // 右側をパディングする（因果モデルなので、後ろのパディングは前の位置の logits に影響しない）。
         var padded = tokens
         padded.append(contentsOf: repeatElement(0, count: length - tokens.count))
@@ -210,17 +248,21 @@ final class CoreMLLanguageModel: LanguageModelRunner {
             features[maskName] = MLFeatureValue(multiArray: mask)
         }
         let input = try MLDictionaryFeatureProvider(dictionary: features)
-        let output = try await model.prediction(from: input, options: MLPredictionOptions())
-        guard let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
-            throw EngineError.missingOutput(logitsName)
+        let model = self.model
+        let position = tokens.count - 1
+        return try await InferenceQueue.run {
+            let output = try model.prediction(from: input, options: MLPredictionOptions())
+            guard let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
+                throw EngineError.missingOutput(logitsName)
+            }
+            return try Self.row(of: logits, position: position)
         }
-        return try row(of: logits, position: tokens.count - 1)
     }
 
     // MARK: - 補助
 
     /// logits から指定位置の 1 行（語彙数ぶん）を Float 配列として取り出す。
-    private func row(of logits: MLMultiArray, position: Int) throws -> [Float] {
+    private static func row(of logits: MLMultiArray, position: Int) throws -> [Float] {
         let layout = try CoreMLTensors.rowLayout(of: logits, position: position)
         var result = [Float](repeating: 0, count: layout.count)
         CoreMLTensors.copyRow(of: logits, elementOffset: layout.offset, count: layout.count, stride: layout.stride,

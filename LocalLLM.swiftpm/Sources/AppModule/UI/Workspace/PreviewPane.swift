@@ -79,7 +79,7 @@ private struct ConsoleView: View {
             .padding(.vertical, 4)
             ConsoleLines(lines: session.consoleLines)
         }
-        .background(Color(uiColor: .secondarySystemBackground))
+        .background(CDWSTheme.panel)
     }
 }
 
@@ -139,6 +139,8 @@ private struct WebPreview: UIViewRepresentable {
         configuration.userContentController = controller
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.isInspectable = true
+        view.navigationDelegate = context.coordinator
+        context.coordinator.onTerminated = { message in session.appendConsole(message) }
         load(into: view, context: context)
         return view
     }
@@ -161,8 +163,28 @@ private struct WebPreview: UIViewRepresentable {
         view.configuration.userContentController.removeAllScriptMessageHandlers()
     }
 
-    final class Coordinator {
+    final class Coordinator: NSObject, WKNavigationDelegate {
         var loadedRevision = -1
         var loadedEntry = ""
+        var onTerminated: ((String) -> Void)?
+        private var recentReloads: [Date] = []
+
+        /// メモリが足りなくなると、iOS はプレビューを動かしているプロセスだけを終了させることがある。
+        /// そのままだと真っ白で何も反応しないので、読み込み直す（続けて落ちるときは、やり直しを繰り返さない）。
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            let now = Date()
+            recentReloads = recentReloads.filter { now.timeIntervalSince($0) < 30 }
+            // 次に画面が更新されたとき、必ず読み込み直す
+            loadedRevision = -1
+            guard recentReloads.count < 2 else {
+                onTerminated?(L("[preview] メモリ不足でプレビューが止まりました。「再読み込み」を押すと、もう一度表示します。",
+                                "[preview] The preview stopped because memory ran low. Press Reload to show it again."))
+                return
+            }
+            recentReloads.append(now)
+            onTerminated?(L("[preview] メモリ不足でプレビューが止まったので、読み込み直しました。",
+                            "[preview] The preview was stopped because memory ran low; it has been reloaded."))
+            webView.reload()
+        }
     }
 }

@@ -23,7 +23,7 @@ TOKENIZER_REPOS=(
   "unsloth/gemma-2-2b-it"
   "unsloth/mistral-7b-instruct-v0.3"
 )
-SUPPORT_FILES=(tokenizer.json tokenizer_config.json generation_config.json config.json special_tokens_map.json chat_template.jinja chat_template.json)
+SUPPORT_FILES=(tokenizer.json tokenizer_config.json generation_config.json config.json special_tokens_map.json chat_template.jinja chat_template.json tokenizer.model)
 
 for repo in "${TOKENIZER_REPOS[@]}"; do
   dir="$OUT/tokenizers/${repo//\//__}"
@@ -108,3 +108,33 @@ for range in "0 63" "291329088 291591295" "291591296 291853503"; do
   curl -sSL -r "$1-$2" -o "$dir/$1.bin" "$ANEMLL_WEIGHTS"
 done
 echo "anemll weight parts: $(ls "$dir" | tr '\n' ' ')"
+
+# GGUF の先頭部分（メタデータと語彙。重みは取らない）: リポジトリ, ファイル
+GGUF_HEADERS=(
+  "Qwen/Qwen2.5-0.5B-Instruct-GGUF|qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  "bartowski/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+  "bartowski/SmolLM2-135M-Instruct-GGUF|SmolLM2-135M-Instruct-Q4_K_M.gguf"
+  "bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF|DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf"
+  "unsloth/Qwen3-0.6B-GGUF|Qwen3-0.6B-Q4_K_M.gguf"
+  "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF|tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+  "microsoft/Phi-3-mini-4k-instruct-gguf|Phi-3-mini-4k-instruct-q4.gguf"
+  "bartowski/gemma-2-2b-it-GGUF|gemma-2-2b-it-Q4_K_M.gguf"
+  "bartowski/Mistral-7B-Instruct-v0.3-GGUF|Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
+  "bartowski/google_gemma-3-1b-it-GGUF|google_gemma-3-1b-it-Q4_K_M.gguf"
+)
+mkdir -p "$OUT/gguf-headers"
+for entry in "${GGUF_HEADERS[@]}"; do
+  repo="${entry%%|*}"; file="${entry#*|}"
+  target="$OUT/gguf-headers/${repo//\//__}.gguf"
+  if [ -s "$target" ]; then continue; fi
+  code=$(curl -sSL -r 0-16777215 -w "%{http_code}" -o "$target" "https://huggingface.co/$repo/resolve/main/$file" || true)
+  if [ "$code" != "206" ] && [ "$code" != "200" ]; then rm -f "$target"; echo "gguf header missing: $repo ($code)"; else echo "gguf header: $repo"; fi
+done
+
+# 画像生成（Stable Diffusion）の CLIP トークナイザの語彙
+mkdir -p "$OUT/clip"
+for f in vocab.json merges.txt; do
+  if [ -s "$OUT/clip/$f" ]; then continue; fi
+  curl -sSL -o "$OUT/clip/$f" "https://huggingface.co/apple/coreml-stable-diffusion-v1-5-palettized/resolve/main/split_einsum_v2/compiled/$f"
+done
+echo "clip fixture: $(ls "$OUT/clip" | tr '\n' ' ')"

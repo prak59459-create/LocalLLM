@@ -13,8 +13,8 @@ enum WorkspaceToolbox {
         var label: String {
             switch self {
             case .minimal: return L("最小（読む・書く・直す）", "Minimal (read, write, edit)")
-            case .standard: return L("標準", "Standard")
-            case .full: return L("すべて", "All")
+            case .standard: return L("標準（＋探す・ロードマップ）", "Standard (+ search, roadmap)")
+            case .full: return L("すべて（＋消す・移動・JS）", "All (+ delete, move, JS)")
             }
         }
     }
@@ -32,6 +32,8 @@ enum WorkspaceToolbox {
         static let roadmapList = "roadmap_list"
         static let roadmapAdd = "roadmap_add"
         static let roadmapUpdate = "roadmap_update"
+        /// 追加と更新をまとめたもの（id があれば更新）
+        static let roadmap = "roadmap"
         static let runJavaScript = "run_javascript"
     }
 
@@ -41,76 +43,45 @@ enum WorkspaceToolbox {
     /// 中身を消すなど、元に戻しにくいツール（「編集は自動で許可」でも確認する）
     static let destructiveTools: Set<String> = [Name.deleteFile]
 
+    /// モデルに渡すツール。小さいモデルでも迷わず、コンテキストも食わないよう、数も説明も最小限にしてある。
+    /// - 最小: 読む・書く・直す
+    /// - 標準: ＋ 探す（空ならファイル一覧）・ロードマップ
+    /// - すべて: ＋ 消す・移動・JavaScript の実行
     static func definitions(profile: Profile, javaScript: Bool) -> [ToolDefinition] {
+        let path = (L("パス", "path"), true)
         var tools: [ToolDefinition] = [
-            ToolDefinition(name: Name.readFile,
-                           description: L("ファイルを行番号付きで読む。", "Read a file with line numbers."),
-                           arguments: [("path", L("ファイルのパス", "file path"), true),
-                                       ("offset", L("始める行（省略可）", "first line (optional)"), false)]),
-            ToolDefinition(name: Name.writeFile,
-                           description: L("ファイルを作る、または全体を書き換える。", "Create a file or replace its whole content."),
-                           arguments: [("path", L("ファイルのパス", "file path"), true),
-                                       ("content", L("ファイルの中身全体", "the full file content"), true)]),
-            ToolDefinition(name: Name.editFile,
-                           description: L("ファイルの一部を置き換える。old_string は今の中身と完全に同じで、1 か所だけにあること。",
-                                          "Replace part of a file. old_string must match the current text exactly and occur once."),
-                           arguments: [("path", L("ファイルのパス", "file path"), true),
-                                       ("old_string", L("置き換える元の文字列", "text to replace"), true),
-                                       ("new_string", L("新しい文字列", "replacement text"), true)]),
+            ToolDefinition(name: Name.readFile, description: L("ファイルを読む（行番号付き）", "Read a file (numbered lines)"),
+                           arguments: [("path", path.0, true), ("offset", L("始める行", "first line"), false)]),
+            ToolDefinition(name: Name.writeFile, description: L("ファイルを作る・全体を書き換える", "Create or overwrite a file"),
+                           arguments: [("path", path.0, true), ("content", L("中身全体", "full content"), true)]),
+            ToolDefinition(name: Name.editFile, description: L("old_string（1 か所だけ）を new_string に置き換える", "Replace old_string (unique) with new_string"),
+                           arguments: [("path", path.0, true), ("old_string", "old", true), ("new_string", "new", true)]),
         ]
         if profile != .minimal {
-            tools.insert(ToolDefinition(name: Name.listFiles,
-                                        description: L("フォルダの中のファイルの一覧。", "List files in a folder."),
-                                        arguments: [("path", L("フォルダ（省略でプロジェクト全体）", "folder (optional)"), false)]), at: 0)
-            tools += [
-                ToolDefinition(name: Name.searchFiles,
-                               description: L("プロジェクトの中の文字列を探して、ファイル名と行を返す。", "Search text in the project; returns file and line."),
-                               arguments: [("pattern", L("探す文字列", "text to find"), true)]),
-                ToolDefinition(name: Name.roadmapAdd,
-                               description: L("ロードマップに機能やアイデアの丸を足す。", "Add a feature or idea to the roadmap."),
-                               arguments: [("title", L("短い名前", "short title"), true),
-                                           ("detail", L("説明（省略可）", "description (optional)"), false),
-                                           ("parent", L("つなぐ元の番号（例 #2、省略可）", "parent number like #2 (optional)"), false)]),
-                ToolDefinition(name: Name.roadmapUpdate,
-                               description: L("ロードマップの丸の状態などを変える。status は idea / planned / in_progress / done / blocked。",
-                                              "Update a roadmap item. status: idea / planned / in_progress / done / blocked."),
-                               arguments: [("id", L("番号（例 #3）", "number like #3"), true),
-                                           ("status", L("新しい状態（省略可）", "new status (optional)"), false),
-                                           ("detail", L("新しい説明（省略可）", "new description (optional)"), false)]),
-            ]
+            tools.append(ToolDefinition(name: Name.searchFiles, description: L("文字列を探す（空ならファイル一覧）", "Search text (empty: list files)"),
+                                        arguments: [("pattern", L("探す文字列", "text"), false)]))
+            tools.append(ToolDefinition(name: Name.roadmap,
+                                        description: L("ロードマップ: id 無しで追加、id 有りで更新（status: idea/planned/in_progress/done/blocked）",
+                                                       "Roadmap: add (no id) or update (id; status: idea/planned/in_progress/done/blocked)"),
+                                        arguments: [("id", L("番号（例 #2）", "number like #2"), false), ("title", L("名前", "title"), false),
+                                                    ("status", "status", false), ("parent", L("親の番号", "parent number"), false)]))
         }
         if profile == .full {
-            tools += [
-                ToolDefinition(name: Name.findFiles,
-                               description: L("名前でファイルを探す（* が使える）。", "Find files by name (supports *)."),
-                               arguments: [("pattern", L("名前のパターン（例 *.js）", "name pattern like *.js"), true)]),
-                ToolDefinition(name: Name.makeDirectory,
-                               description: L("フォルダを作る。", "Create a folder."),
-                               arguments: [("path", L("フォルダのパス", "folder path"), true)]),
-                ToolDefinition(name: Name.moveFile,
-                               description: L("ファイルやフォルダを移動・名前の変更をする。", "Move or rename a file or folder."),
-                               arguments: [("from", L("今のパス", "current path"), true), ("to", L("新しいパス", "new path"), true)]),
-                ToolDefinition(name: Name.deleteFile,
-                               description: L("ファイルやフォルダを消す。", "Delete a file or folder."),
-                               arguments: [("path", L("パス", "path"), true)]),
-                ToolDefinition(name: Name.roadmapList,
-                               description: L("ロードマップの丸の一覧。", "List the roadmap items."),
-                               arguments: []),
-            ]
-        }
-        if javaScript {
-            tools.append(ToolDefinition(name: Name.runJavaScript,
-                                        description: L("JavaScript を実行して console.log の出力と最後の値を返す。path でファイルを実行もできる。",
-                                                       "Run JavaScript and return console.log output and the result. Can run a file via path."),
-                                        arguments: [("code", L("実行するコード（path を使うなら省略）", "code to run (omit when using path)"), false),
-                                                    ("path", L("実行する .js ファイル（省略可）", ".js file to run (optional)"), false)]))
+            tools.append(ToolDefinition(name: Name.deleteFile, description: L("ファイル・フォルダを消す", "Delete a file or folder"),
+                                        arguments: [("path", path.0, true)]))
+            tools.append(ToolDefinition(name: Name.moveFile, description: L("移動・名前の変更", "Move or rename"),
+                                        arguments: [("from", "from", true), ("to", "to", true)]))
+            if javaScript {
+                tools.append(ToolDefinition(name: Name.runJavaScript, description: L("JavaScript を実行して出力を返す", "Run JavaScript and return the output"),
+                                            arguments: [("code", "code", false), ("path", L(".js ファイル", ".js file"), false)]))
+            }
         }
         return tools
     }
 
     static func isWorkspaceTool(_ name: String) -> Bool {
         [Name.listFiles, Name.readFile, Name.writeFile, Name.editFile, Name.searchFiles, Name.findFiles, Name.makeDirectory,
-         Name.deleteFile, Name.moveFile, Name.roadmapList, Name.roadmapAdd, Name.roadmapUpdate].contains(name)
+         Name.deleteFile, Name.moveFile, Name.roadmapList, Name.roadmapAdd, Name.roadmapUpdate, Name.roadmap].contains(name)
     }
 }
 
@@ -168,18 +139,19 @@ struct WorkspaceToolExecutor: Sendable {
         switch call.name {
         case Name.listFiles:
             let path = Self.path(call) ?? ""
-            let tree = fileSystem.tree(path, maxDepth: 3, maxEntries: 200)
-            return WorkspaceToolResult(text: tree.isEmpty ? L("（空です）", "(empty)") : tree, isError: false)
+            let tree = fileSystem.tree(path, maxDepth: 3, maxEntries: 80)
+            return WorkspaceToolResult(text: tree.isEmpty ? L("（空）", "(empty)") : tree, isError: false)
 
         case Name.readFile:
             let path = try required(Self.path(call), "path")
             let offset = Self.argument(call, ["offset", "start", "line", "start_line"]).flatMap { Int($0) } ?? 1
-            let limit = Self.argument(call, ["limit", "lines", "count"]).flatMap { Int($0) } ?? 400
-            let read = try fileSystem.readNumbered(path, offset: offset, limit: limit, maxCharacters: 9000)
-            var text = read.text.isEmpty ? L("（空のファイル）", "(empty file)") : read.text
+            // 1 回で読むのは少しずつ（コンテキストとメモリを食わないように）
+            let limit = min(Self.argument(call, ["limit", "lines", "count"]).flatMap { Int($0) } ?? 160, 300)
+            let read = try fileSystem.readNumbered(path, offset: offset, limit: limit, maxCharacters: 4500)
+            var text = read.text.isEmpty ? L("（空）", "(empty)") : read.text
             if read.shownUntil < read.totalLines {
-                text += L("…（全 \(read.totalLines) 行。続きは offset: \(read.shownUntil + 1)）",
-                          "… (\(read.totalLines) lines in total; continue with offset: \(read.shownUntil + 1))")
+                text += L("\n…続きは offset: \(read.shownUntil + 1)（全 \(read.totalLines) 行）",
+                          "\n… continue with offset: \(read.shownUntil + 1) (\(read.totalLines) lines)")
             }
             return WorkspaceToolResult(text: text, isError: false, touchedFile: try fileSystem.normalize(path))
 
@@ -187,8 +159,7 @@ struct WorkspaceToolExecutor: Sendable {
             let path = try required(Self.path(call), "path")
             let content = Self.argument(call, ["content", "text", "code", "contents", "data"]) ?? ""
             let change = try fileSystem.write(path, content)
-            return WorkspaceToolResult(text: L("書きました: \(change.path)（\(TextDiff.lines(content).count) 行）",
-                                               "Wrote \(change.path) (\(TextDiff.lines(content).count) lines)"),
+            return WorkspaceToolResult(text: "OK \(change.path) (\(TextDiff.lines(content).count) " + L("行", "lines") + ")",
                                        isError: false, changes: [change], touchedFile: change.path)
 
         case Name.editFile:
@@ -198,17 +169,26 @@ struct WorkspaceToolExecutor: Sendable {
             let replaceAll = ["true", "1", "yes"].contains((Self.argument(call, ["replace_all", "all"]) ?? "").lowercased())
             let change = try fileSystem.edit(path, old: old, new: new, replaceAll: replaceAll)
             let stats = change.stats
-            return WorkspaceToolResult(text: L("直しました: \(change.path)（+\(stats.added) −\(stats.removed)）",
-                                               "Edited \(change.path) (+\(stats.added) −\(stats.removed))"),
+            return WorkspaceToolResult(text: "OK \(change.path) +\(stats.added) −\(stats.removed)",
                                        isError: false, changes: [change], touchedFile: change.path)
 
         case Name.searchFiles:
-            let pattern = try required(Self.argument(call, ["pattern", "query", "text", "regex"]), "pattern")
+            let pattern = (Self.argument(call, ["pattern", "query", "text", "regex", "name"]) ?? "").trimmingCharacters(in: .whitespaces)
+            // 空ならファイルの一覧（list_files の代わり）
+            if pattern.isEmpty || pattern == "*" {
+                let tree = fileSystem.tree(Self.path(call) ?? "", maxDepth: 3, maxEntries: 80)
+                return WorkspaceToolResult(text: tree.isEmpty ? L("（空）", "(empty)") : tree, isError: false)
+            }
             let isRegex = ["true", "1", "yes"].contains((Self.argument(call, ["regex", "is_regex"]) ?? "").lowercased())
-            let matches = try fileSystem.search(pattern, in: Self.path(call) ?? "", isRegex: isRegex, limit: 50)
-            let text = matches.isEmpty ? L("見つかりませんでした", "No matches")
-                                       : matches.map { "\($0.path):\($0.line): \($0.text)" }.joined(separator: "\n")
-            return WorkspaceToolResult(text: text, isError: false)
+            let matches = try fileSystem.search(pattern, in: Self.path(call) ?? "", isRegex: isRegex, limit: 25)
+            var lines = matches.map { match -> String in
+                let text = match.text.trimmingCharacters(in: .whitespaces)
+                return "\(match.path):\(match.line): " + (text.count > 100 ? String(text.prefix(100)) + "…" : text)
+            }
+            // ファイル名に含まれるものも（find_files の代わり）
+            let named = ((try? fileSystem.find("*\(pattern)*", limit: 10)) ?? []).filter { name in !lines.contains { $0.hasPrefix(name + ":") } }
+            lines += named
+            return WorkspaceToolResult(text: lines.isEmpty ? L("見つかりませんでした", "No matches") : lines.joined(separator: "\n"), isError: false)
 
         case Name.findFiles:
             let pattern = try required(Self.argument(call, ["pattern", "name", "glob", "query"]), "pattern")
@@ -236,6 +216,20 @@ struct WorkspaceToolExecutor: Sendable {
         case Name.roadmapList:
             return WorkspaceToolResult(text: roadmap.summary(maxNodes: 80), isError: false)
 
+        case Name.roadmap:
+            // id があれば更新、無ければ追加（title も無ければ一覧）
+            if Self.argument(call, ["id", "number", "node", "item"]) != nil {
+                var update = call
+                update.name = Name.roadmapUpdate
+                return try run(update, roadmap: &roadmap)
+            }
+            if Self.argument(call, ["title", "name", "feature", "idea"]) == nil {
+                return WorkspaceToolResult(text: roadmap.summary(maxNodes: 30), isError: false)
+            }
+            var add = call
+            add.name = Name.roadmapAdd
+            return try run(add, roadmap: &roadmap)
+
         case Name.roadmapAdd:
             let title = try required(Self.argument(call, ["title", "name", "feature", "idea"]), "title")
             let detail = Self.argument(call, ["detail", "description", "details", "body"]) ?? ""
@@ -243,8 +237,7 @@ struct WorkspaceToolExecutor: Sendable {
             let kind = Self.argument(call, ["kind", "type"]).flatMap(RoadmapNode.Kind.parse) ?? (parent == nil ? .feature : .idea)
             let status = Self.argument(call, ["status", "state"]).flatMap(RoadmapNode.Status.parse) ?? .idea
             let node = roadmap.add(title: title, detail: detail, kind: kind, status: status, parent: parent?.id)
-            return WorkspaceToolResult(text: L("ロードマップに \(node.reference)「\(node.title)」を足しました",
-                                               "Added \(node.reference) \"\(node.title)\" to the roadmap"),
+            return WorkspaceToolResult(text: "OK \(node.reference) \(node.title)",
                                        isError: false, roadmapChanged: true)
 
         case Name.roadmapUpdate:
@@ -266,8 +259,8 @@ struct WorkspaceToolExecutor: Sendable {
                 }
             }
             let updated = roadmap.node(node.id) ?? node
-            return WorkspaceToolResult(text: L("\(updated.reference)「\(updated.title)」: \(updated.status.label)",
-                                               "\(updated.reference) \"\(updated.title)\": \(updated.status.label)"),
+            let statusName = updated.status == .inProgress ? "in_progress" : updated.status.rawValue
+            return WorkspaceToolResult(text: "OK \(updated.reference) \(statusName)",
                                        isError: false, roadmapChanged: true)
 
         default:
@@ -316,33 +309,28 @@ struct WorkspaceToolExecutor: Sendable {
 /// コーディングエージェントへの指示。
 enum CodingAgentPrompt {
     static func system(projectName: String, tree: String, roadmap: String, notes: String?, openFile: String?,
-                       javaScript: Bool, extra: String? = nil) -> String {
-        var parts: [String] = []
-        parts.append(L("""
-        あなたは iPad の中で動くコーディングエージェントです。プロジェクト「\(projectName)」のファイルをツールで読み書きして、ユーザーの依頼を実装します。
-        進め方:
-        1. 変更する前に read_file で今の中身を読む（推測で書き換えない）。
-        2. 小さな変更は edit_file、新しいファイルや全体の書き換えは write_file。
-        3. 機能を作り終えたら roadmap_update で done にする。新しい案は roadmap_add で足す。
-        4. 最後に、何を変えたかを短く日本語で伝える。
-        ツールを使うときは説明を書かずにすぐ呼び出すこと。
+                       javaScript: Bool, usesRoadmap: Bool = true, extra: String? = nil) -> String {
+        // 小さいモデルでも守れるよう短く。毎回送るので、短いほど速くメモリも食わない。
+        var parts: [String] = [L("""
+        iPad のコーディングエージェント。プロジェクト「\(projectName)」をツールで編集して依頼を実装する。
+        - 変える前に read_file で読む。小さな変更は edit_file、新規・全体は write_file。
+        - ツールは前置きなしで呼ぶ。終わったら変えた内容を 1〜2 文で伝える。
         """, """
-        You are a coding agent running on an iPad. Use the tools to read and write files in the project "\(projectName)" and implement what the user asks.
-        How to work:
-        1. Read files with read_file before changing them (never guess their content).
-        2. Use edit_file for small changes and write_file for new files or full rewrites.
-        3. When a feature is finished, mark it done with roadmap_update. Add new ideas with roadmap_add.
-        4. Finish with a short summary of what you changed.
-        When you use a tool, call it right away without extra explanation.
-        """))
+        Coding agent on an iPad. Edit the project "\(projectName)" with the tools to do what the user asks.
+        - Read with read_file before changing. edit_file for small changes, write_file for new files or rewrites.
+        - Call tools without preamble. When done, summarize the change in 1–2 sentences.
+        """)]
+        if usesRoadmap {
+            parts[0] += L("\n- 機能ができたら roadmap で done にする。", "\n- Mark finished features done with roadmap.")
+        }
         if javaScript {
-            parts.append(L("run_javascript で JavaScript を実行して動作を確かめられます。", "You can check JavaScript with run_javascript."))
+            parts[0] += L("\n- run_javascript で動作を確かめられる。", "\n- run_javascript can check JavaScript.")
         }
         parts.append(L("ファイル:", "Files:") + "\n" + (tree.isEmpty ? L("（空）", "(empty)") : tree))
-        parts.append(L("ロードマップ:", "Roadmap:") + "\n" + roadmap)
-        if let openFile { parts.append(L("ユーザーが開いているファイル: ", "File open in the editor: ") + openFile) }
+        if usesRoadmap, !roadmap.isEmpty { parts.append(L("ロードマップ:", "Roadmap:") + "\n" + roadmap) }
+        if let openFile { parts.append(L("開いているファイル: ", "Open file: ") + openFile) }
         if let notes, !notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(L("プロジェクトのメモ（CDWS.md）:", "Project notes (CDWS.md):") + "\n" + String(notes.prefix(1500)))
+            parts.append(L("メモ（CDWS.md）:", "Notes (CDWS.md):") + "\n" + String(notes.prefix(600)))
         }
         if let extra, !extra.isEmpty { parts.append(extra) }
         return parts.joined(separator: "\n\n")
@@ -351,19 +339,19 @@ enum CodingAgentPrompt {
     /// ロードマップの丸を実装してもらう依頼
     static func implement(_ node: RoadmapNode) -> String {
         let detail = node.detail.isEmpty ? "" : L("\n詳細: \(node.detail)", "\nDetails: \(node.detail)")
-        return L("ロードマップの \(node.reference)「\(node.title)」を実装してください。\(detail)\n必要なファイルを読んでから変更し、終わったら roadmap_update で \(node.reference) を done にしてください。",
-                 "Please implement roadmap item \(node.reference) \"\(node.title)\".\(detail)\nRead the files you need before changing them, and mark \(node.reference) done with roadmap_update when finished.")
+        return L("ロードマップの \(node.reference)「\(node.title)」を実装して。\(detail)\n終わったら roadmap（id: \(node.reference), status: done）。",
+                 "Implement roadmap item \(node.reference) \"\(node.title)\".\(detail)\nWhen done, call roadmap (id: \(node.reference), status: done).")
     }
 
     /// 丸から新しい案を生やしてもらう依頼
     static func brainstorm(from node: RoadmapNode, count: Int = 3) -> String {
-        L("ロードマップの \(node.reference)「\(node.title)」から発展させられる新しいアイデアを \(count) つ考えて、それぞれ roadmap_add（parent: \(node.reference)）で足してください。最後に一言ずつ説明してください。",
-          "Think of \(count) new ideas that grow out of roadmap item \(node.reference) \"\(node.title)\" and add each with roadmap_add (parent: \(node.reference)). Then explain each in one sentence.")
+        L("ロードマップの \(node.reference)「\(node.title)」から発展させる新しいアイデアを \(count) つ、roadmap（title, parent: \(node.reference)）で足して。",
+          "Add \(count) new ideas that grow out of roadmap item \(node.reference) \"\(node.title)\" with roadmap (title, parent: \(node.reference)).")
     }
 
     /// 最初のロードマップを作ってもらう依頼
     static func planRoadmap(goal: String) -> String {
-        L("次の目標のための実装計画を立てて、機能ごとに roadmap_add でロードマップに足してください（順番に依存するものは parent でつなぐ）。目標: \(goal)",
-          "Plan the implementation for this goal and add each feature to the roadmap with roadmap_add (link dependent steps with parent). Goal: \(goal)")
+        L("次の目標の実装計画を、機能ごとに roadmap（title、依存は parent）で足して。目標: \(goal)",
+          "Plan this goal: add each feature with roadmap (title; link dependent steps with parent). Goal: \(goal)")
     }
 }

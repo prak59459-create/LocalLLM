@@ -25,6 +25,7 @@ struct HFSearchPage: Sendable {
 enum HFSearchSource: String, CaseIterable, Identifiable, Sendable {
     case coreML     // coreml タグの付いたモデル
     case anemll     // ANEMLL の分割モデル
+    case gguf       // GGUF（llama.cpp 形式）
     case all        // すべて
 
     var id: String { rawValue }
@@ -33,6 +34,7 @@ enum HFSearchSource: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .coreML: return L("Core ML", "Core ML")
         case .anemll: return L("分割モデル（ANEMLL）", "Split models (ANEMLL)")
+        case .gguf: return "GGUF"
         case .all: return L("すべて", "All")
         }
     }
@@ -157,6 +159,9 @@ final class HFClient: @unchecked Sendable {
         case .anemll:
             // ANEMLL（Neural Engine 向けに分割したモデル）はタグが付いていないので、作者で探す
             items.append(URLQueryItem(name: "author", value: "anemll"))
+        case .gguf:
+            items.append(URLQueryItem(name: "filter", value: "gguf"))
+            if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
         case .all:
             if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
         }
@@ -245,11 +250,32 @@ final class HFClient: @unchecked Sendable {
         try await get(resolveURL(repo: repo, path: path, revision: revision)).0
     }
 
+    /// ファイルの先頭 count バイトだけを取得する（サーバーが範囲指定に対応していなければ、全体が返ることがある）
+    func fetchPrefix(repo: String, path: String, revision: String, count: Int) async throws -> Data {
+        try await get(resolveURL(repo: repo, path: path, revision: revision), range: 0..<count).0
+    }
+
+    /// GGUF の先頭部分（メタデータと重みの一覧）だけを取ってきて読む。重みの中身は取らない。
+    func fetchGGUFHeader(repo: String, path: String, revision: String = "main") async throws -> GGUFFile {
+        var count = 4 << 20
+        while true {
+            let data = try await fetchPrefix(repo: repo, path: path, revision: revision, count: count)
+            do {
+                return try GGUFFile.parse(data)
+            } catch GGUFError.truncated(let needed) {
+                // 語彙の大きなモデルは先頭部分が大きい。足りなければ増やして取り直す（上限 96MB）
+                guard data.count >= count, count < 96 << 20 else { throw GGUFError.truncated(needed: needed) }
+                count = min(96 << 20, max(count * 2, needed))
+            }
+        }
+    }
+
     // MARK: - 補助
 
-    private func get(_ url: URL) async throws -> (Data, HTTPURLResponse) {
+    private func get(_ url: URL, range: Range<Int>? = nil) async throws -> (Data, HTTPURLResponse) {
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
+        if let range { request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range") }
         for (key, value) in authorizationHeaders { request.setValue(value, forHTTPHeaderField: key) }
         let data: Data
         let response: URLResponse

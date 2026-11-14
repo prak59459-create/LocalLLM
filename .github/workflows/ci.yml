@@ -45,12 +45,21 @@ jobs:
             python -I "$script"
           done
 
+      # GGUF の推論を本物のモデル（SmolLM2 135M）で確かめる
+      - name: Download a small GGUF model
+        run: |
+          mkdir -p "$RUNNER_TEMP/gguf"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/SmolLM2-135M-Instruct-Q4_K_M.gguf" \
+            "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+          ls -la "$RUNNER_TEMP/gguf"
+
       - name: Build
         run: swift build
 
       - name: Test
         env:
           LOCALLLM_LIVE_TESTS: "1"
+          LOCALLLM_GGUF_MODELS: ${{ runner.temp }}/gguf
           # アプリの更新の本物の GitHub とのテストで使う（ランナーの IP で共有される回数制限を避ける）
           GITHUB_TOKEN: ${{ github.token }}
         run: swift test
@@ -69,8 +78,22 @@ jobs:
       - name: Fetch fixtures
         run: ./Tools/fetch_fixtures.sh
 
+      # GGUF の推論（Accelerate を使う経路）を本物のモデルで確かめて、速さも測る
+      - name: Download small GGUF models
+        run: |
+          mkdir -p "$RUNNER_TEMP/gguf"
+          for f in SmolLM2-135M-Instruct-Q4_K_M.gguf SmolLM2-135M-Instruct-Q8_0.gguf; do
+            curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/$f" "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/$f"
+          done
+          # GPU（Metal）の計算は、速さの目標にしている Qwen2.5 1.5B でも確かめる
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/qwen2.5-1.5b-instruct-q4_k_m.gguf" \
+            "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+          ls -la "$RUNNER_TEMP/gguf"
+
       - name: Test
-        run: swift test --filter "Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|SHA1|GitHubSource|PackageManifest|UpdateDiff|PackageScanner|Tool|JSONValue|MCP|ContextResizer|ProtoWire|HalfAndBlob|RopeTable"
+        env:
+          LOCALLLM_GGUF_MODELS: ${{ runner.temp }}/gguf
+        run: swift test --filter "GGUF|DPMSolver|CLIPText|ImageRepoLayout|SpeechText|Generation|Sampler|Logits|ZipArchive|SplitModel|Workspace|TextDiff|Roadmap|SyntaxHighlighter|AppUpdater|SHA1|GitHubSource|PackageManifest|UpdateDiff|PackageScanner|AgentContext|MemoryBudget|MemoryTrend|MemoryRecovery|SlimTool|SplitParts|TokenizerSynthesizer|Tool|JSONValue|MCP|ContextResizer|ProtoWire|HalfAndBlob|RopeTable"
 
       # コンテキスト長を変えた本物のモデルを Core ML で読み込んで、元の長さを超えた位置で推論できるか確かめる
       - name: Download models for the Core ML end-to-end test

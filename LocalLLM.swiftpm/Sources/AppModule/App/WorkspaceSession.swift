@@ -119,6 +119,8 @@ final class WorkspaceSession {
     private(set) var pendingApproval: PendingApproval?
     /// エージェントの欄を開いてほしいとき（ロードマップから依頼したときなど）に増える
     private(set) var agentPanelRequest = 0
+    /// 直近にモデルへ渡したプロンプトのトークン数（下の帯のメーターに出す）
+    private(set) var lastPromptTokens = 0
     var notice: String?
     var approvalMode: AgentApprovalMode {
         didSet { UserDefaults.standard.set(approvalMode.rawValue, forKey: "cdws.approvalMode") }
@@ -130,7 +132,11 @@ final class WorkspaceSession {
         didSet { UserDefaults.standard.set(useWebTools, forKey: "cdws.useWebTools") }
     }
 
+    /// メモリが足りなくなって止まったあとは、次の依頼でやり取りをさらに短くする
+    @ObservationIgnored private var compactHarder = false
     @ObservationIgnored private var agentTask: Task<Void, Never>?
+    /// 今動いているエージェントの実行（止めたあとに届く、古い実行からの知らせを無視するため）
+    @ObservationIgnored private var agentRunID: UUID?
     @ObservationIgnored private var approvalContinuation: CheckedContinuation<Bool, Never>?
     @ObservationIgnored private var saveTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private let javaScript = JavaScriptRunner()
@@ -518,54 +524,74 @@ final class WorkspaceSession {
         var parameters = settings.generation
         parameters.temperature = min(parameters.temperature, 0.4)
         parameters.repetitionPenalty = 1.0
-        parameters.maxNewTokens = max(parameters.maxNewTokens, 2048)
-        let javaScriptEnabled = toolProfile != .minimal
+        parameters.maxNewTokens = max(parameters.maxNewTokens, 1536)
+        let javaScriptEnabled = toolProfile == .full
         var tools = WorkspaceToolbox.definitions(profile: toolProfile, javaScript: javaScriptEnabled)
         if useWebTools {
             tools += [ConnectorStore.BuiltinTool.webSearch, .fetchPage].filter { connectors.isEnabled($0) }.map(\.definition)
         }
+        // 毎回送るものは小さく（長いコンテキストのモデルでも、ファイルの一覧などは控えめに）
+        let roomy = info.maxContext > 4096 && !compactHarder
         let notes = try? fileSystem.read("CDWS.md")
         let system = CodingAgentPrompt.system(projectName: project.name,
-                                              tree: fileSystem.tree(maxDepth: 3, maxEntries: info.maxContext > 4096 ? 150 : 60),
-                                              roadmap: roadmap.summary(maxNodes: info.maxContext > 4096 ? 40 : 15),
-                                              notes: notes, openFile: selectedPath, javaScript: javaScriptEnabled)
-        let configuration = AgentLoop.Configuration(systemPrompt: system, parameters: parameters,
+                                              tree: fileSystem.tree(maxDepth: 3, maxEntries: roomy ? 80 : 35),
+                                              roadmap: roadmap.summary(maxNodes: roomy ? 20 : 8),
+                                              notes: notes, openFile: selectedPath, javaScript: javaScriptEnabled,
+                                              usesRoadmap: toolProfile != .minimal)
+        let budget = compactHarder || info.maxContext <= 2048 ? AgentContext.Budget.tight : AgentContext.Budget()
+        compactHarder = false
+        var configuration = AgentLoop.Configuration(systemPrompt: system, parameters: parameters,
                                                     enableThinking: settings.thinkingMode.enableThinking,
                                                     tools: tools, maxRounds: 12)
-        let history = messages.suffix(40).map(\.chatMessage)
+        configuration.compact = { AgentContext.compact($0, budget: budget) }
+        let history = AgentContext.compact(messages.suffix(60).map(\.chatMessage), budget: budget)
         isAgentRunning = true
         agentStatus = L("考えています…", "Thinking…")
         notice = nil
 
         let loop = AgentLoop(engine: chat.engine)
+        let runID = UUID()
+        agentRunID = runID
         agentTask = Task {
             do {
                 try await loop.run(history: Array(history), configuration: configuration,
-                                   execute: { call in await self.executeTool(call, batchID: batchID, connectors: connectors) },
-                                   approve: { call in await self.approve(call) },
-                                   onEvent: { event in self.handle(event, batchID: batchID) })
+                                   execute: { call in await self.executeTool(call, batchID: batchID, runID: runID, connectors: connectors) },
+                                   approve: { call in await self.approve(call, runID: runID) },
+                                   onEvent: { event in self.handle(event, batchID: batchID, runID: runID) })
             } catch is CancellationError {
             } catch {
-                notice = error.localizedDescription
+                if agentRunID == runID { notice = error.localizedDescription }
             }
-            if let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }),
-               messages[index].content.isEmpty, messages[index].toolCalls.isEmpty {
-                messages.remove(at: index)
-            }
-            streamingMessageID = nil
-            isAgentRunning = false
-            agentStatus = nil
-            agentTask = nil
-            saveMessages()
-            refreshTree()
+            // 止めたあとに終わった古い実行は、もう片づけてある
+            guard agentRunID == runID else { return }
+            finishAgentRun()
         }
+    }
+
+    /// エージェントの実行を終わった状態にする（入力欄などをまた使えるようにする）
+    private func finishAgentRun() {
+        if let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }),
+           messages[index].content.isEmpty, messages[index].toolCalls.isEmpty {
+            messages.remove(at: index)
+        }
+        streamingMessageID = nil
+        isAgentRunning = false
+        agentStatus = nil
+        agentTask = nil
+        agentRunID = nil
+        saveMessages()
+        refreshTree()
     }
 
     func requestAgentPanel() { agentPanelRequest += 1 }
 
+    /// エージェントを止める。計算やツールの返事を待たずに、すぐ操作できる状態に戻す
+    /// （メモリが足りなくなったときなど、返事がなかなか来なくても固まったままにならないように）。
     func stopAgent() {
         agentTask?.cancel()
         resolveApproval(false)
+        javaScript.cancel()
+        if isAgentRunning { finishAgentRun() }
     }
 
     func clearConversation() {
@@ -574,34 +600,41 @@ final class WorkspaceSession {
         saveMessages()
     }
 
-    private func handle(_ event: AgentLoop.Event, batchID: UUID) {
+    private func handle(_ event: AgentLoop.Event, batchID: UUID, runID: UUID) {
+        guard agentRunID == runID else { return }
         switch event {
         case .assistantStarted:
             let message = AgentMessage(role: .assistant, content: "", batchID: batchID)
             messages.append(message)
             streamingMessageID = message.id
             agentStatus = L("考えています…", "Thinking…")
-        case .promptReady(_, let dropped):
+        case .promptReady(let tokens, let dropped):
+            lastPromptTokens = tokens
             if dropped > 0 {
                 notice = L("コンテキストに収まらないため、古いやり取り \(dropped) 件を省きました。",
                            "\(dropped) older messages were left out to fit the context.")
             }
         case .prefill(let done, let total):
             agentStatus = L("読み込み \(done)/\(total)", "Reading \(done)/\(total)")
+        case .status(let text):
+            agentStatus = text
         case .text(let visible):
-            guard let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }) else { return }
-            // 画面の更新が重くならないよう、少しずつ伸びたときだけ反映する
-            if visible.count - messages[index].content.count >= 6 || visible.hasSuffix("\n") {
-                messages[index].content = visible
-            }
-            agentStatus = L("書いています…", "Writing…")
+            guard let id = streamingMessageID, let index = messages.lastIndex(where: { $0.id == id }) else { return }
+            // AgentLoop がまとめて送ってくるので、そのまま反映する
+            messages[index].content = visible
+            if agentStatus != L("書いています…", "Writing…") { agentStatus = L("書いています…", "Writing…") }
         case .assistantFinished(let content, let calls, let stats):
-            guard let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }) else { return }
+            guard let id = streamingMessageID, let index = messages.lastIndex(where: { $0.id == id }) else { return }
             messages[index].content = content
             messages[index].toolCalls = calls
             messages[index].stats = stats
             if content.isEmpty && calls.isEmpty { messages.remove(at: index) }
             streamingMessageID = nil
+            if stats.stopReason == .lowMemory {
+                compactHarder = true
+                notice = L("メモリが足りなくなりそうだったので、落ちないよう途中で止めました。もう一度送ると、やり取りをもっと短くして続けます。",
+                           "Stopped early to avoid running out of memory. Send again to continue with a shorter history.")
+            }
             saveMessages()
         case .toolStarted(let call):
             agentStatus = L("実行中: ", "Running: ") + call.summary
@@ -612,7 +645,9 @@ final class WorkspaceSession {
         }
     }
 
-    private func executeTool(_ call: ToolCall, batchID: UUID, connectors: ConnectorStore) async -> ToolOutcome {
+    private func executeTool(_ call: ToolCall, batchID: UUID, runID: UUID, connectors: ConnectorStore) async -> ToolOutcome {
+        // 止めたあとの古い実行には、ファイルを触らせない
+        guard agentRunID == runID else { return ToolOutcome(text: L("止めました。", "Stopped."), isError: true) }
         if WorkspaceToolbox.isWorkspaceTool(call.name) {
             let executor = WorkspaceToolExecutor(fileSystem: fileSystem)
             let result = executor.execute(call, roadmap: &roadmap)
@@ -646,7 +681,8 @@ final class WorkspaceSession {
         return await connectors.execute(call)
     }
 
-    private func approve(_ call: ToolCall) async -> Bool {
+    private func approve(_ call: ToolCall, runID: UUID) async -> Bool {
+        guard agentRunID == runID else { return false }
         guard WorkspaceToolbox.mutatingTools.contains(call.name) else { return true }
         switch approvalMode {
         case .auto: return true

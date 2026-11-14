@@ -12,7 +12,13 @@ final class JavaScriptRunner: NSObject, WKNavigationDelegate {
 
     private var webView: WKWebView?
     private var lines: [String] = []
-    private var loadContinuation: CheckedContinuation<Void, Never>?
+    /// ページの読み込み待ち・実行結果待ち（どちらも必ず 1 回だけ再開する。時間切れ・Web 用プロセスの終了・中止でも再開する）
+    private var loadContinuation: CheckedContinuation<Bool, Never>?
+    private var evaluationContinuation: CheckedContinuation<String?, Never>?
+    /// 何回目の実行か（古い実行の時間切れが、新しい実行を止めないように）
+    private var runNumber = 0
+    /// ページの用意を待つ時間（秒）
+    private static let loadTimeout = 6.0
 
     /// console.log などを Swift に送るスクリプト
     static let consoleBridge = """
@@ -36,6 +42,9 @@ final class JavaScriptRunner: NSObject, WKNavigationDelegate {
     """
 
     func run(_ code: String, timeout: Double = 8) async -> Result {
+        // 前の実行がまだ待っていれば、先に終わらせる
+        cancel()
+        runNumber += 1
         lines = []
         let configuration = WKWebViewConfiguration()
         let controller = WKUserContentController()
@@ -51,9 +60,12 @@ final class JavaScriptRunner: NSObject, WKNavigationDelegate {
             self.webView = nil
         }
 
-        await withCheckedContinuation { continuation in
-            loadContinuation = continuation
-            webView.loadHTMLString("<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>", baseURL: nil)
+        let loaded = await load(in: webView)
+        guard loaded else {
+            // メモリが足りないときなどに、Web 用のプロセスが始まらない・落とされることがある。待ち続けない
+            return Result(output: L("JavaScript を実行する準備ができませんでした（メモリが足りないと起きることがあります）。少し待ってからもう一度試してください。",
+                                    "Could not get ready to run JavaScript (this can happen when memory is low). Wait a moment and try again."),
+                          isError: true)
         }
 
         // eval で最後の式の値も返す。例外はメッセージにして返す。
@@ -94,24 +106,59 @@ final class JavaScriptRunner: NSObject, WKNavigationDelegate {
         return Result(output: output, isError: isError)
     }
 
+    /// 空のページを読み込む。読み込めたら true（時間切れ・失敗・中止なら false）
+    private func load(in webView: WKWebView) async -> Bool {
+        let number = runNumber
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.loadTimeout * 1_000_000_000))
+            guard let self, self.runNumber == number else { return }
+            self.finishLoad(false)
+        }
+        return await withCheckedContinuation { continuation in
+            loadContinuation = continuation
+            webView.loadHTMLString("<!doctype html><html><head><meta charset='utf-8'></head><body></body></html>", baseURL: nil)
+        }
+    }
+
+    private func finishLoad(_ succeeded: Bool) {
+        loadContinuation?.resume(returning: succeeded)
+        loadContinuation = nil
+    }
+
+    private func finishEvaluation(_ value: String?) {
+        evaluationContinuation?.resume(returning: value)
+        evaluationContinuation = nil
+    }
+
+    /// 実行して結果を待つ。時間切れ・中止なら nil。
+    /// （スクリプトが無限ループになると WebKit からは返事が来ないので、返事を待たずに戻れるようにしている）
     private func evaluate(_ script: String, in webView: WKWebView, timeout: Double) async -> String? {
-        await withTaskGroup(of: String?.self) { group in
-            group.addTask { @MainActor in
-                do {
-                    let result = try await webView.evaluateJavaScript(script)
-                    return (result as? String) ?? String(describing: result)
-                } catch {
-                    return "__error__" + error.localizedDescription
+        let number = runNumber
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard let self, self.runNumber == number else { return }
+            self.finishEvaluation(nil)
+        }
+        return await withCheckedContinuation { continuation in
+            evaluationContinuation = continuation
+            webView.evaluateJavaScript(script) { [weak self] result, error in
+                Task { @MainActor [weak self] in
+                    guard let self, self.runNumber == number else { return }
+                    if let error {
+                        self.finishEvaluation("__error__" + error.localizedDescription)
+                    } else {
+                        self.finishEvaluation((result as? String) ?? String(describing: result))
+                    }
                 }
             }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
         }
+    }
+
+    /// 実行中のものを止める（待っているところを終わらせる）
+    func cancel() {
+        finishLoad(false)
+        finishEvaluation(nil)
+        webView?.stopLoading()
     }
 
     static func format(_ message: String) -> String {
@@ -121,16 +168,24 @@ final class JavaScriptRunner: NSObject, WKNavigationDelegate {
     }
 
     nonisolated func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        Task { @MainActor in
-            self.loadContinuation?.resume()
-            self.loadContinuation = nil
-        }
+        Task { @MainActor in self.finishLoad(true) }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        Task { @MainActor in self.finishLoad(false) }
+    }
+
+    nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        Task { @MainActor in self.finishLoad(false) }
+    }
+
+    /// メモリが足りなくなると、iOS は Web 用のプロセスだけを終了させることがある（アプリ本体は落ちない）。
+    /// そのままだと返事が永久に来ないので、待っているところを終わらせる。
+    nonisolated func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         Task { @MainActor in
-            self.loadContinuation?.resume()
-            self.loadContinuation = nil
+            self.finishLoad(false)
+            self.finishEvaluation("__error__" + L("JavaScript を動かしていたプロセスが、メモリ不足などで終了しました。",
+                                                  "The process running the JavaScript was terminated (for example, because memory ran low)."))
         }
     }
 }

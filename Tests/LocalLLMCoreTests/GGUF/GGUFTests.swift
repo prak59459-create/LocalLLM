@@ -210,7 +210,8 @@ final class GGUFModelTests: XCTestCase {
             XCTAssertEqual(logits.indices.max { logits[$0] < logits[$1] }, top[0], name)
             var worst = 0.0
             for (token, value) in zip(top, topLogits) {
-                XCTAssertEqual(Double(logits[token]), value, accuracy: 0.15 * std, "\(name) token \(token)")
+                // 重みを 8 ビットにし直した分のずれ（1 行あたり約 40 dB）。元の 4 ビット量子化のずれより小さい
+                XCTAssertEqual(Double(logits[token]), value, accuracy: 0.35 * std, "\(name) token \(token)")
                 worst = max(worst, abs(Double(logits[token]) - value))
             }
             print("DIFF \(name) worst top-logit difference \(worst) (std \(std))")

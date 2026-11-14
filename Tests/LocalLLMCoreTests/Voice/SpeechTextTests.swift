@@ -43,18 +43,4 @@ final class SpeechTextTests: XCTestCase {
         XCTAssertEqual(SpeechText.language(of: "Swift の配列について説明します"), "ja-JP")
         XCTAssertEqual(SpeechText.language(of: "12345"), "en-US")
     }
-
-    func testSentenceChunker() {
-        var chunker = SentenceChunker()
-        XCTAssertEqual(chunker.append("こんにちは。今日はとても"), [])
-        XCTAssertEqual(chunker.append("いい天気ですね。散歩に"), ["こんにちは。今日はとてもいい天気ですね。"])
-        XCTAssertEqual(chunker.append("行きましょう！"), [])
-        XCTAssertEqual(chunker.finish(), "散歩に行きましょう！")
-        XCTAssertNil(chunker.finish())
-
-        var english = SentenceChunker()
-        XCTAssertEqual(english.append("The value is 3.14 and that is fine. Next"), ["The value is 3.14 and that is fine."])
-        XCTAssertEqual(english.append(" sentence here.\n"), ["Next sentence here."])
-        XCTAssertNil(english.finish())
-    }
 }

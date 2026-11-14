@@ -764,7 +764,6 @@ llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推�
 ## Core/Voice と音声
 
 - `SpeechText`: 読み上げ用の整形（<think>・コードブロック・Markdown の記号・URL を省く）と、言語の判定。
-- `SentenceChunker`: 少しずつ届く文章から、文の終わりまでを取り出す。
 - `VoiceController`（App）: SFSpeechRecognizer（端末内で認識できる言語は端末内だけで）と AVSpeechSynthesizer。
   声だけの会話では、話し終わって 1.8 秒黙ると区切って送り、返答を読み上げたあと、また聞き取る。
 

@@ -63,7 +63,8 @@ final class GGUFLanguageModel: LanguageModelRunner {
 
     func resetCache() {
         cachedTokens = []
-        model.truncate(to: 0)
+        // 巻き戻すだけでなく、KV キャッシュのメモリも手放す（メモリが足りなくなったときに空けられるように）
+        model.releaseCache()
     }
 
     func evaluate(tokens: [Int], chunkSize: Int, progress: ((Int, Int) -> Void)?) async throws

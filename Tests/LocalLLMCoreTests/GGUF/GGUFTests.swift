@@ -128,6 +128,11 @@ final class GGUFModelTests: XCTestCase {
             XCTAssertLessThan(maxDifference(try model.evaluate([expected.tokens[9]]), expected.logits[9]), tolerance, "\(family) rewind")
             logits = try model.evaluate(Array(expected.tokens[10...]))
             XCTAssertLessThan(maxDifference(logits, expected.logits[count - 1]), tolerance, "\(family) rewind tail")
+            // KV キャッシュを手放したあとも、最初から読み直せる
+            model.releaseCache()
+            XCTAssertEqual(model.length, 0)
+            logits = try model.evaluate(expected.tokens)
+            XCTAssertLessThan(maxDifference(logits, expected.logits[count - 1]), tolerance, "\(family) after release")
         }
     }
 
@@ -183,7 +188,12 @@ final class GGUFModelTests: XCTestCase {
     /// 本物のモデル（SmolLM2 135M）で、llama.cpp と同じ続きを生成する
     func testRealModelsMatchLlamaCpp() throws {
         guard let directory = GGUFFixtures.realModels else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
-        for name in ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0"] {
+        // 正解のある本物のモデルのうち、フォルダに置いてあるものを確かめる（CI では SmolLM2 だけ）
+        let names = ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0", "qwen2.5-0.5b-q4_k_m", "qwen3-0.6b-q4_k_m",
+                     "gemma-3-1b-q4_k_m", "llama-3.2-1b-q4_k_m"]
+        var checked = 0
+        defer { print("GGUF real models checked: \(checked)") }
+        for name in names {
             let json = try GGUFFixtures.json("real-\(name).json")
             let source = directory.appendingPathComponent(try XCTUnwrap(json["file"] as? String))
             guard FileManager.default.fileExists(atPath: source.path) else { continue }
@@ -219,6 +229,7 @@ final class GGUFModelTests: XCTestCase {
             _ = try model.evaluate(prompt)
             let prefillSeconds = Date().timeIntervalSince(prefillStart)
             print(String(format: "SPEED %@: decode %.1f tok/s, prefill %.1f tok/s", name, 8 / decodeSeconds, 64 / prefillSeconds))
+            checked += 1
         }
     }
 }

@@ -181,6 +181,11 @@ REAL = [
     ("smollm2-135m-q4_k_m", "SmolLM2-135M-Instruct-Q4_K_M.gguf", "The capital of France is"),
     ("smollm2-135m-q8_0", "SmolLM2-135M-Instruct-Q8_0.gguf", "The capital of France is"),
     ("smollm2-135m-f16", "SmolLM2-135M-Instruct-f16.gguf", "The capital of France is"),
+    # ほかの系列（手元で確かめる用。大きいので CI では取ってこない）
+    ("qwen2.5-0.5b-q4_k_m", "qwen2.5-0.5b-instruct-q4_k_m.gguf", "The capital of France is"),
+    ("qwen3-0.6b-q4_k_m", "Qwen3-0.6B-Q4_K_M.gguf", "The capital of France is"),
+    ("gemma-3-1b-q4_k_m", "gemma-3-1b-it-Q4_K_M.gguf", "The capital of France is"),
+    ("llama-3.2-1b-q4_k_m", "Llama-3.2-1B-Instruct-Q4_K_M.gguf", "The capital of France is"),
 ]
 
 

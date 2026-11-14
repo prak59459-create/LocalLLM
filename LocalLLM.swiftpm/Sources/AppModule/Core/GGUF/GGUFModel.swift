@@ -183,6 +183,18 @@ final class GGUFModel {
         length = max(0, min(length, newLength))
     }
 
+    /// KV キャッシュを空にして、使っていたメモリを OS に返す（確保し直す。使うまで実メモリにはならない）
+    func releaseCache() {
+        length = 0
+        let count = config.kvSize * maxContext
+        for index in keys.indices {
+            keys[index].deallocate()
+            values[index].deallocate()
+            keys[index] = .allocate(capacity: count)
+            values[index] = .allocate(capacity: count)
+        }
+    }
+
     /// KV キャッシュが今使っているメモリの目安（バイト）
     var cacheBytes: Int { length * config.kvBytesPerToken }
 

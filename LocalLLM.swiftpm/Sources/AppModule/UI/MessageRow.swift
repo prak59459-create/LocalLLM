@@ -70,6 +70,9 @@ struct MessageRow: View {
         } label: {
             Label(L("コピー", "Copy"), systemImage: "doc.on.doc")
         }
+        if message.role == .assistant && !isStreaming {
+            SpeakMessageButton(text: message.content)
+        }
         if message.role == .assistant && isLast && !isStreaming {
             Button(action: onRegenerate) {
                 Label(L("作り直す", "Regenerate"), systemImage: "arrow.clockwise")

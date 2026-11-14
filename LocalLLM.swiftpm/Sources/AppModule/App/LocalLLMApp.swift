@@ -13,6 +13,7 @@ struct LocalLLMApp: App {
     @State private var updater = AppUpdateController()
     @State private var imageStudio = ImageStudio()
     @State private var imageModels = ImageModelStore()
+    @State private var voice = VoiceController()
 
     var body: some Scene {
         WindowGroup {
@@ -20,6 +21,7 @@ struct LocalLLMApp: App {
                 .modifier(ImageStudioPresenter())
                 .environment(imageStudio)
                 .environment(imageModels)
+                .environment(voice)
                 .environment(settings)
                 .environment(library)
                 .environment(chat)

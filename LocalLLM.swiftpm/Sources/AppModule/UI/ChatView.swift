@@ -8,6 +8,7 @@ struct ChatView: View {
     @Environment(ChatController.self) private var chat
     @Environment(KnowledgeStore.self) private var knowledge
     @Environment(ConnectorStore.self) private var connectors
+    @Environment(VoiceController.self) private var voice
     @Environment(\.modelContext) private var context
 
     @Bindable var conversation: Conversation
@@ -42,9 +43,10 @@ struct ChatView: View {
                 focused: $composerFocused,
                 onSend: send,
                 onStop: { chat.stopGenerating() },
-                accessory: { ComposerOptions(searchWeb: $searchWeb) }
+                accessory: { ComposerOptions(searchWeb: $searchWeb, draft: $draft, onSend: send) }
             )
         }
+        .modifier(VoiceReplyModifier(latestReply: latestReply, listenAgain: listenAgain))
         .navigationTitle(conversation.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -92,6 +94,22 @@ struct ChatView: View {
     }
 
     private let bottomID = "bottom"
+
+    /// いちばん新しい返答の本文（読み上げ用）
+    private func latestReply() -> String? {
+        conversation.orderedMessages.last { $0.role == .assistant }?.content
+    }
+
+    /// 声だけの会話: 返答を読み終えたら、また聞き取る
+    private func listenAgain() {
+        Task {
+            await voice.startListening(onUpdate: { draft = $0 }, onFinish: { heard in
+                guard !heard.isEmpty else { return }
+                draft = heard
+                send()
+            })
+        }
+    }
 
     /// この会話のアシスタント（あれば）
     private var assistant: Assistant? {
@@ -257,10 +275,13 @@ struct ComposerOptions: View {
     @Environment(AppSettings.self) private var settings
     @Environment(ConnectorStore.self) private var connectors
     @Binding var searchWeb: Bool
+    @Binding var draft: String
+    var onSend: () -> Void
 
     var body: some View {
         @Bindable var settings = settings
         HStack(spacing: 4) {
+            VoiceButton(text: $draft, onSend: onSend)
             Button {
                 searchWeb.toggle()
             } label: {

@@ -101,9 +101,33 @@ final class MemoryTrendTests: XCTestCase {
         XCTAssertEqual(trend.largestDrop, 0)
         trend.record(available: 1150 * mb)
         XCTAssertEqual(trend.largestDrop, 50 * mb)
-        // 増えたときは数えない
+        // 増えた（戻った）ときは、前の減りを半分まで忘れる
         trend.record(available: 1300 * mb)
-        XCTAssertEqual(trend.largestDrop, 50 * mb)
+        XCTAssertEqual(trend.largestDrop, 25 * mb)
+    }
+
+    /// 一瞬だけ跳ねて元に戻ったメモリは、そのあとの計算を止め続けない
+    func testOneOffSpikeIsForgotten() {
+        var trend = MemoryTrend()
+        for available in [2000, 1900, 1850, 1300] { trend.record(available: Int64(available) * mb) }
+        XCTAssertEqual(trend.largestDrop, 550 * mb)
+        let limit: Int64 = 4000 * mb
+        // 跳ねた直後は用心する
+        XCTAssertFalse(trend.isSafe(MemoryBudget(available: 700 * mb, appLimit: limit)))
+        // 元に戻った
+        trend.record(available: 1850 * mb)
+        XCTAssertEqual(trend.largestDrop, 275 * mb)
+        // そのあと何も起きなければ、だんだん忘れる
+        for _ in 0..<12 { trend.record(available: 1850 * mb) }
+        XCTAssertLessThan(trend.largestDrop, 60 * mb)
+        XCTAssertTrue(trend.isSafe(MemoryBudget(available: 700 * mb, appLimit: limit)))
+    }
+
+    /// 毎回同じだけ減り続けるときは、忘れない
+    func testSteadyDropsAreKept() {
+        var trend = MemoryTrend()
+        for step in 0..<12 { trend.record(available: Int64(3000 - step * 100) * mb) }
+        XCTAssertEqual(trend.largestDrop, 100 * mb)
     }
 
     func testStopsBeforeTheNextStepWouldRunOut() {

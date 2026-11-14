@@ -48,7 +48,7 @@ struct MemoryBudget: Equatable, Sendable {
 /// 残りが今は十分でも、1 回の計算で一気に数百 MB 使うことがある（GPU が形ごとに作る作業用のメモリなど）。
 /// 減り方を見ておけば、iOS に強制終了される前に止められる。
 struct MemoryTrend: Equatable, Sendable {
-    /// 1 回で減ったいちばん大きな量（バイト）
+    /// 1 回で減ったいちばん大きな量（バイト）。続けて起きなければ、だんだん小さくなる
     private(set) var largestDrop: Int64 = 0
     private var last: Int64?
     private var samples = 0
@@ -69,7 +69,13 @@ struct MemoryTrend: Equatable, Sendable {
             samples += 1
         }
         guard let last, samples >= Self.warmUpSamples else { return }
-        largestDrop = max(largestDrop, last - available)
+        // 減った量（増えたら負）
+        let change = last - available
+        // 前の大きな減りは、少しずつ忘れる。メモリが戻ったとき（一瞬だけ跳ねた）は、戻った分だけ早く忘れる（半分までは残す）。
+        // 1 度きりの跳ねを覚え続けると、そのあとずっと「次で足りなくなる」と見なして、必要もないのに止めてしまう
+        var kept = largestDrop * 7 / 8
+        if change < 0 { kept = min(kept, max(largestDrop + change, largestDrop / 2)) }
+        largestDrop = max(change, kept, 0)
     }
 
     /// 次の 1 回で見込む減り（いちばん大きかった減りの 1.5 倍。ただしアプリの上限の 1/8 まで）

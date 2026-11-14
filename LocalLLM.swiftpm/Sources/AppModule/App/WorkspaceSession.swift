@@ -135,6 +135,8 @@ final class WorkspaceSession {
     /// メモリが足りなくなって止まったあとは、次の依頼でやり取りをさらに短くする
     @ObservationIgnored private var compactHarder = false
     @ObservationIgnored private var agentTask: Task<Void, Never>?
+    /// 今動いているエージェントの実行（止めたあとに届く、古い実行からの知らせを無視するため）
+    @ObservationIgnored private var agentRunID: UUID?
     @ObservationIgnored private var approvalContinuation: CheckedContinuation<Bool, Never>?
     @ObservationIgnored private var saveTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private let javaScript = JavaScriptRunner()
@@ -548,34 +550,48 @@ final class WorkspaceSession {
         notice = nil
 
         let loop = AgentLoop(engine: chat.engine)
+        let runID = UUID()
+        agentRunID = runID
         agentTask = Task {
             do {
                 try await loop.run(history: Array(history), configuration: configuration,
-                                   execute: { call in await self.executeTool(call, batchID: batchID, connectors: connectors) },
-                                   approve: { call in await self.approve(call) },
-                                   onEvent: { event in self.handle(event, batchID: batchID) })
+                                   execute: { call in await self.executeTool(call, batchID: batchID, runID: runID, connectors: connectors) },
+                                   approve: { call in await self.approve(call, runID: runID) },
+                                   onEvent: { event in self.handle(event, batchID: batchID, runID: runID) })
             } catch is CancellationError {
             } catch {
-                notice = error.localizedDescription
+                if agentRunID == runID { notice = error.localizedDescription }
             }
-            if let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }),
-               messages[index].content.isEmpty, messages[index].toolCalls.isEmpty {
-                messages.remove(at: index)
-            }
-            streamingMessageID = nil
-            isAgentRunning = false
-            agentStatus = nil
-            agentTask = nil
-            saveMessages()
-            refreshTree()
+            // 止めたあとに終わった古い実行は、もう片づけてある
+            guard agentRunID == runID else { return }
+            finishAgentRun()
         }
+    }
+
+    /// エージェントの実行を終わった状態にする（入力欄などをまた使えるようにする）
+    private func finishAgentRun() {
+        if let id = streamingMessageID, let index = messages.firstIndex(where: { $0.id == id }),
+           messages[index].content.isEmpty, messages[index].toolCalls.isEmpty {
+            messages.remove(at: index)
+        }
+        streamingMessageID = nil
+        isAgentRunning = false
+        agentStatus = nil
+        agentTask = nil
+        agentRunID = nil
+        saveMessages()
+        refreshTree()
     }
 
     func requestAgentPanel() { agentPanelRequest += 1 }
 
+    /// エージェントを止める。計算やツールの返事を待たずに、すぐ操作できる状態に戻す
+    /// （メモリが足りなくなったときなど、返事がなかなか来なくても固まったままにならないように）。
     func stopAgent() {
         agentTask?.cancel()
         resolveApproval(false)
+        javaScript.cancel()
+        if isAgentRunning { finishAgentRun() }
     }
 
     func clearConversation() {
@@ -584,7 +600,8 @@ final class WorkspaceSession {
         saveMessages()
     }
 
-    private func handle(_ event: AgentLoop.Event, batchID: UUID) {
+    private func handle(_ event: AgentLoop.Event, batchID: UUID, runID: UUID) {
+        guard agentRunID == runID else { return }
         switch event {
         case .assistantStarted:
             let message = AgentMessage(role: .assistant, content: "", batchID: batchID)
@@ -628,7 +645,9 @@ final class WorkspaceSession {
         }
     }
 
-    private func executeTool(_ call: ToolCall, batchID: UUID, connectors: ConnectorStore) async -> ToolOutcome {
+    private func executeTool(_ call: ToolCall, batchID: UUID, runID: UUID, connectors: ConnectorStore) async -> ToolOutcome {
+        // 止めたあとの古い実行には、ファイルを触らせない
+        guard agentRunID == runID else { return ToolOutcome(text: L("止めました。", "Stopped."), isError: true) }
         if WorkspaceToolbox.isWorkspaceTool(call.name) {
             let executor = WorkspaceToolExecutor(fileSystem: fileSystem)
             let result = executor.execute(call, roadmap: &roadmap)
@@ -662,7 +681,8 @@ final class WorkspaceSession {
         return await connectors.execute(call)
     }
 
-    private func approve(_ call: ToolCall) async -> Bool {
+    private func approve(_ call: ToolCall, runID: UUID) async -> Bool {
+        guard agentRunID == runID else { return false }
         guard WorkspaceToolbox.mutatingTools.contains(call.name) else { return true }
         switch approvalMode {
         case .auto: return true

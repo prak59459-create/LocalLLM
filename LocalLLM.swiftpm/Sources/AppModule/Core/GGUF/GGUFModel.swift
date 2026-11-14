@@ -85,12 +85,13 @@ final class GGUFModel {
     /// 1 回にまとめて計算するトークン数の上限
     static let maxBatch = 64
 
-    init(store: GGUFWeightStore, maxContext: Int? = nil, threadCount: Int? = nil) throws {
+    /// - Parameter chunkCount: 並列に計算するときのまとまりの数（nil ならコアの数から決める）
+    init(store: GGUFWeightStore, maxContext: Int? = nil, chunkCount: Int? = nil) throws {
         self.store = store
         let config = store.config
         self.config = config
         self.maxContext = max(8, min(config.contextLength, maxContext ?? config.contextLength))
-        workers = GGUFWorkers(threadCount: threadCount, widestRow: max(config.feedForwardSize, config.embeddingSize))
+        workers = GGUFWorkers(chunkCount: chunkCount, widestRow: max(config.feedForwardSize, config.embeddingSize))
         embedding = try store.matrix("token_embd.weight")
         outputMatrix = try store.matrix(config.tiedOutput ? "token_embd.weight" : "output.weight")
         outputNorm = try store.requiredVector("output_norm.weight")

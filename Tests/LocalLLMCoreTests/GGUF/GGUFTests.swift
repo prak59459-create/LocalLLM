@@ -74,11 +74,11 @@ final class GGUFQuantTests: XCTestCase {
 final class GGUFModelTests: XCTestCase {
     static let families = ["llama", "qwen2", "qwen3", "gemma", "gemma2", "gemma3", "phi3"]
 
-    private func load(_ family: String, compact: Bool, threads: Int? = nil) throws -> (GGUFModel, URL) {
+    private func load(_ family: String, compact: Bool, chunks: Int? = nil) throws -> (GGUFModel, URL) {
         let source = GGUFFixtures.root.appendingPathComponent("tiny-\(family).gguf")
         let destination = GGUFFixtures.temporaryFile("\(family).llw")
         try GGUFConverter.convert(gguf: source, to: destination, compact: compact)
-        return (try GGUFModel(store: try GGUFWeightStore(url: destination), threadCount: threads), destination)
+        return (try GGUFModel(store: try GGUFWeightStore(url: destination), chunkCount: chunks), destination)
     }
 
     private func reference(_ family: String) throws -> (tokens: [Int], logits: [[Float]]) {
@@ -115,7 +115,7 @@ final class GGUFModelTests: XCTestCase {
     /// まとめて読み込んでも（プロンプトの読み込み）、途中で巻き戻しても同じ結果になる
     func testBatchedAndRewoundEvaluationMatch() throws {
         for family in Self.families {
-            let (model, file) = try load(family, compact: false, threads: 3)
+            let (model, file) = try load(family, compact: false, chunks: 3)
             defer { try? FileManager.default.removeItem(at: file) }
             let expected = try reference(family)
             let count = expected.tokens.count

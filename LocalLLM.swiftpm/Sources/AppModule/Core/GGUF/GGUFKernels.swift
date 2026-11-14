@@ -28,24 +28,28 @@ struct GGUFMatrix {
     }
 }
 
-/// 並列に計算するときの、スレッドごとの作業用メモリ。
+/// 並列に計算するときの作業用メモリ。
+///
+/// 行列の行を「まとまり」に分け、空いているコアが次のまとまりを取っていく（DispatchQueue.concurrentPerform）。
+/// iPad は速いコアと遅いコアが混ざっているので、コアの数で均等に割るより、細かく分けたほうが速いコアを生かせる。
 final class GGUFWorkers {
-    let threadCount: Int
-    /// 整数の重みを Float に直して置く場所（スレッドごと）
+    /// 1 つの行列を分けるまとまりの数の上限
+    let chunkCount: Int
+    /// 整数の重みを Float に直して置く場所（まとまりごと）
     private var scratch: [UnsafeMutablePointer<Float>]
     private let scratchCapacity: Int
 
     /// 1 回に Float に直す量（CPU のキャッシュに収まる大きさ）
     static let blockElements = 96 * 1024
 
-    init(threadCount: Int? = nil, widestRow: Int) {
+    /// - Parameter chunkCount: まとまりの数（nil なら、コアの数の 3 倍。1 なら並列にしない）
+    init(chunkCount: Int? = nil, widestRow: Int) {
         let cores = ProcessInfo.processInfo.activeProcessorCount
-        // 高性能コアの数くらいまで（全部使うと、効率コアに引っ張られてかえって遅くなる）
-        let threads = max(1, threadCount ?? min(4, max(1, cores - (cores > 4 ? 2 : 0))))
+        let chunks = max(1, chunkCount ?? min(24, cores * 3))
         let capacity = max(Self.blockElements, widestRow * 4)
-        self.threadCount = threads
+        self.chunkCount = chunks
         scratchCapacity = capacity
-        scratch = (0..<threads).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: capacity) }
+        scratch = (0..<chunks).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: capacity) }
     }
 
     deinit {
@@ -56,7 +60,7 @@ final class GGUFWorkers {
         max(1, min(512, scratchCapacity / max(columns, 1)))
     }
 
-    func scratch(_ thread: Int) -> UnsafeMutablePointer<Float> { scratch[thread] }
+    func scratch(_ chunk: Int) -> UnsafeMutablePointer<Float> { scratch[chunk] }
 }
 
 /// GGUF の推論で使う計算（iPad では Accelerate、Linux のテストでは素朴なループ）。
@@ -107,18 +111,20 @@ enum GGUFKernels {
     static func linear(_ matrix: GGUFMatrix, input: In, count: Int, output: Out, rowStride: Int? = nil, workers: GGUFWorkers) {
         let stride = rowStride ?? matrix.rows
         let work = matrix.rows * matrix.columns * count
-        let threads = work < 400_000 ? 1 : min(workers.threadCount, matrix.rows)
-        if threads <= 1 {
-            linearRows(matrix, 0..<matrix.rows, input: input, count: count, output: output, stride: stride, scratch: workers.scratch(0), workers: workers)
+        // 小さい行列は、分けるほうが高くつく
+        let chunks = work < 400_000 ? 1 : min(workers.chunkCount, max(1, matrix.rows / 16))
+        if chunks <= 1 {
+            linearRows(matrix, 0..<matrix.rows, input: input, count: count, output: output, stride: stride,
+                       scratch: workers.scratch(0), workers: workers)
             return
         }
-        let perThread = (matrix.rows + threads - 1) / threads
-        DispatchQueue.concurrentPerform(iterations: threads) { thread in
-            let start = thread * perThread
-            let end = min(matrix.rows, start + perThread)
+        let perChunk = (matrix.rows + chunks - 1) / chunks
+        DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
+            let start = chunk * perChunk
+            let end = min(matrix.rows, start + perChunk)
             guard start < end else { return }
             linearRows(matrix, start..<end, input: input, count: count, output: output, stride: stride,
-                       scratch: workers.scratch(thread), workers: workers)
+                       scratch: workers.scratch(chunk), workers: workers)
         }
     }
 

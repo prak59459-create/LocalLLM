@@ -24,34 +24,119 @@ final class GGUFBuffer {
     }
 }
 
+/// 1 層ぶんの重み（保存ファイルの中身を指す）。CPU 用と GPU 用のどちらの計算でも使う。
+struct GGUFLayerWeights {
+    var attentionNorm: UnsafePointer<Float>
+    var query: GGUFMatrix
+    var key: GGUFMatrix
+    var value: GGUFMatrix
+    var queryBias: UnsafePointer<Float>?
+    var keyBias: UnsafePointer<Float>?
+    var valueBias: UnsafePointer<Float>?
+    var output: GGUFMatrix
+    var outputBias: UnsafePointer<Float>?
+    var queryNorm: UnsafePointer<Float>?
+    var keyNorm: UnsafePointer<Float>?
+    var postAttentionNorm: UnsafePointer<Float>?
+    var feedForwardNorm: UnsafePointer<Float>
+    var gate: GGUFMatrix
+    var up: GGUFMatrix
+    var down: GGUFMatrix
+    var gateBias: UnsafePointer<Float>?
+    var upBias: UnsafePointer<Float>?
+    var downBias: UnsafePointer<Float>?
+    var postFeedForwardNorm: UnsafePointer<Float>?
+
+    static func load(_ index: Int, store: GGUFWeightStore, config: GGUFModelConfig) throws -> GGUFLayerWeights {
+        let prefix = "blk.\(index)."
+        let q = config.querySize, kv = config.kvSize, ff = config.feedForwardSize
+        var query: GGUFMatrix, key: GGUFMatrix, value: GGUFMatrix
+        var queryBias: UnsafePointer<Float>?, keyBias: UnsafePointer<Float>?, valueBias: UnsafePointer<Float>?
+        if config.hasFusedQKV {
+            let fused = try store.matrix(prefix + "attn_qkv.weight")
+            query = fused.slice(0..<q)
+            key = fused.slice(q..<(q + kv))
+            value = fused.slice((q + kv)..<(q + 2 * kv))
+            if let bias = store.vector(prefix + "attn_qkv.bias") {
+                queryBias = bias
+                keyBias = bias + q
+                valueBias = bias + q + kv
+            }
+        } else {
+            query = try store.matrix(prefix + "attn_q.weight")
+            key = try store.matrix(prefix + "attn_k.weight")
+            value = try store.matrix(prefix + "attn_v.weight")
+        }
+        queryBias = queryBias ?? store.vector(prefix + "attn_q.bias")
+        keyBias = keyBias ?? store.vector(prefix + "attn_k.bias")
+        valueBias = valueBias ?? store.vector(prefix + "attn_v.bias")
+
+        var gate: GGUFMatrix, up: GGUFMatrix
+        if config.hasFusedGateUp {
+            let fused = try store.matrix(prefix + "ffn_up.weight")
+            gate = fused.slice(0..<ff)
+            up = fused.slice(ff..<(2 * ff))
+        } else {
+            gate = try store.matrix(prefix + "ffn_gate.weight")
+            up = try store.matrix(prefix + "ffn_up.weight")
+        }
+        return GGUFLayerWeights(
+            attentionNorm: try store.requiredVector(prefix + "attn_norm.weight"),
+            query: query, key: key, value: value,
+            queryBias: queryBias, keyBias: keyBias, valueBias: valueBias,
+            output: try store.matrix(prefix + "attn_output.weight"),
+            outputBias: store.vector(prefix + "attn_output.bias"),
+            queryNorm: config.hasQKNorm ? try store.requiredVector(prefix + "attn_q_norm.weight") : nil,
+            keyNorm: config.hasQKNorm ? try store.requiredVector(prefix + "attn_k_norm.weight") : nil,
+            postAttentionNorm: config.hasPostNorms ? try store.requiredVector(prefix + "post_attention_norm.weight") : nil,
+            feedForwardNorm: try store.requiredVector(prefix + "ffn_norm.weight"),
+            gate: gate, up: up,
+            down: try store.matrix(prefix + "ffn_down.weight"),
+            gateBias: config.hasFusedGateUp ? nil : store.vector(prefix + "ffn_gate.bias"),
+            upBias: config.hasFusedGateUp ? nil : store.vector(prefix + "ffn_up.bias"),
+            downBias: store.vector(prefix + "ffn_down.bias"),
+            postFeedForwardNorm: config.hasPostNorms ? try store.requiredVector(prefix + "post_ffw_norm.weight") : nil
+        )
+    }
+}
+
+/// GGUF のモデルを計算するもの（CPU 用の GGUFModel と、GPU 用の GGUFMetalModel）。
+protocol GGUFEvaluator: AnyObject {
+    var config: GGUFModelConfig { get }
+    /// 扱える最大のトークン数
+    var maxContext: Int { get }
+    /// KV キャッシュに入っているトークン数
+    var length: Int { get }
+    /// どこで計算しているか（画面に出す）
+    var computeDescription: String { get }
+    func truncate(to newLength: Int)
+    func releaseCache()
+    /// tokens を今の系列の後ろに足して計算し、最後のトークンの次の logits を返す
+    @discardableResult
+    func evaluate(_ tokens: [Int], batch: Int, progress: ((Int) throws -> Void)?) throws -> [Float]
+}
+
+extension GGUFEvaluator {
+    @discardableResult
+    func evaluate(_ tokens: [Int], batch: Int = GGUFModel.maxBatch) throws -> [Float] {
+        try evaluate(tokens, batch: batch, progress: nil)
+    }
+
+    /// evaluate に渡すトークンの確認（どの計算でも同じ）
+    func validate(_ tokens: [Int]) throws {
+        guard !tokens.isEmpty else { throw GGUFError.invalid("no tokens") }
+        guard length + tokens.count <= maxContext else {
+            throw GGUFError.invalid(L("コンテキストの上限（\(maxContext) トークン）を超えました", "context limit of \(maxContext) tokens exceeded"))
+        }
+        if let bad = tokens.first(where: { $0 < 0 || $0 >= config.vocabSize }) { throw GGUFError.invalid("token id \(bad)") }
+    }
+}
+
 /// GGUF から変換した重みで、トランスフォーマーの計算（順伝播）を行う。KV キャッシュを持つ。
 ///
 /// llama.cpp の llama / qwen2 / qwen3 / gemma / gemma2 / gemma3 / phi3 と同じ計算の流れ。
 /// スレッドセーフではないので、1 つの場所から順番に使う。
-final class GGUFModel {
-    private struct Layer {
-        var attentionNorm: UnsafePointer<Float>
-        var query: GGUFMatrix
-        var key: GGUFMatrix
-        var value: GGUFMatrix
-        var queryBias: UnsafePointer<Float>?
-        var keyBias: UnsafePointer<Float>?
-        var valueBias: UnsafePointer<Float>?
-        var output: GGUFMatrix
-        var outputBias: UnsafePointer<Float>?
-        var queryNorm: UnsafePointer<Float>?
-        var keyNorm: UnsafePointer<Float>?
-        var postAttentionNorm: UnsafePointer<Float>?
-        var feedForwardNorm: UnsafePointer<Float>
-        var gate: GGUFMatrix
-        var up: GGUFMatrix
-        var down: GGUFMatrix
-        var gateBias: UnsafePointer<Float>?
-        var upBias: UnsafePointer<Float>?
-        var downBias: UnsafePointer<Float>?
-        var postFeedForwardNorm: UnsafePointer<Float>?
-    }
-
+final class GGUFModel: GGUFEvaluator {
     let config: GGUFModelConfig
     /// 扱える最大のトークン数（KV キャッシュの大きさ）
     let maxContext: Int
@@ -60,7 +145,7 @@ final class GGUFModel {
 
     private let store: GGUFWeightStore
     private let workers: GGUFWorkers
-    private let layers: [Layer]
+    private let layers: [GGUFLayerWeights]
     private let embedding: GGUFMatrix
     private let outputMatrix: GGUFMatrix
     private let outputNorm: UnsafePointer<Float>
@@ -96,7 +181,7 @@ final class GGUFModel {
         outputMatrix = try store.matrix(config.tiedOutput ? "token_embd.weight" : "output.weight")
         outputNorm = try store.requiredVector("output_norm.weight")
         outputBias = store.vector("output.bias")
-        layers = try (0..<config.layerCount).map { try Self.makeLayer($0, store: store, config: config) }
+        layers = try (0..<config.layerCount).map { try GGUFLayerWeights.load($0, store: store, config: config) }
 
         let factors = store.vector("rope_freqs.weight")
         frequencies = Self.ropeFrequencies(config: config, base: config.ropeBase, factors: factors)
@@ -114,60 +199,8 @@ final class GGUFModel {
         for pointer in values { pointer.deallocate() }
     }
 
-    private static func makeLayer(_ index: Int, store: GGUFWeightStore, config: GGUFModelConfig) throws -> Layer {
-        let prefix = "blk.\(index)."
-        let q = config.querySize, kv = config.kvSize, ff = config.feedForwardSize
-        var query: GGUFMatrix, key: GGUFMatrix, value: GGUFMatrix
-        var queryBias: UnsafePointer<Float>?, keyBias: UnsafePointer<Float>?, valueBias: UnsafePointer<Float>?
-        if config.hasFusedQKV {
-            let fused = try store.matrix(prefix + "attn_qkv.weight")
-            query = fused.slice(0..<q)
-            key = fused.slice(q..<(q + kv))
-            value = fused.slice((q + kv)..<(q + 2 * kv))
-            if let bias = store.vector(prefix + "attn_qkv.bias") {
-                queryBias = bias
-                keyBias = bias + q
-                valueBias = bias + q + kv
-            }
-        } else {
-            query = try store.matrix(prefix + "attn_q.weight")
-            key = try store.matrix(prefix + "attn_k.weight")
-            value = try store.matrix(prefix + "attn_v.weight")
-        }
-        queryBias = queryBias ?? store.vector(prefix + "attn_q.bias")
-        keyBias = keyBias ?? store.vector(prefix + "attn_k.bias")
-        valueBias = valueBias ?? store.vector(prefix + "attn_v.bias")
-
-        var gate: GGUFMatrix, up: GGUFMatrix
-        if config.hasFusedGateUp {
-            let fused = try store.matrix(prefix + "ffn_up.weight")
-            gate = fused.slice(0..<ff)
-            up = fused.slice(ff..<(2 * ff))
-        } else {
-            gate = try store.matrix(prefix + "ffn_gate.weight")
-            up = try store.matrix(prefix + "ffn_up.weight")
-        }
-        return Layer(
-            attentionNorm: try store.requiredVector(prefix + "attn_norm.weight"),
-            query: query, key: key, value: value,
-            queryBias: queryBias, keyBias: keyBias, valueBias: valueBias,
-            output: try store.matrix(prefix + "attn_output.weight"),
-            outputBias: store.vector(prefix + "attn_output.bias"),
-            queryNorm: config.hasQKNorm ? try store.requiredVector(prefix + "attn_q_norm.weight") : nil,
-            keyNorm: config.hasQKNorm ? try store.requiredVector(prefix + "attn_k_norm.weight") : nil,
-            postAttentionNorm: config.hasPostNorms ? try store.requiredVector(prefix + "post_attention_norm.weight") : nil,
-            feedForwardNorm: try store.requiredVector(prefix + "ffn_norm.weight"),
-            gate: gate, up: up,
-            down: try store.matrix(prefix + "ffn_down.weight"),
-            gateBias: config.hasFusedGateUp ? nil : store.vector(prefix + "ffn_gate.bias"),
-            upBias: config.hasFusedGateUp ? nil : store.vector(prefix + "ffn_up.bias"),
-            downBias: store.vector(prefix + "ffn_down.bias"),
-            postFeedForwardNorm: config.hasPostNorms ? try store.requiredVector(prefix + "post_ffw_norm.weight") : nil
-        )
-    }
-
     /// 位置 p の i 番目の組の角度 = p × frequencies[i]
-    private static func ropeFrequencies(config: GGUFModelConfig, base: Float, factors: UnsafePointer<Float>?) -> [Float] {
+    static func ropeFrequencies(config: GGUFModelConfig, base: Float, factors: UnsafePointer<Float>?) -> [Float] {
         let pairs = config.ropeDimensions / 2
         return (0..<pairs).map { index in
             let theta = Foundation.pow(Double(base), -2 * Double(index) / Double(config.ropeDimensions))
@@ -195,6 +228,8 @@ final class GGUFModel {
         }
     }
 
+    var computeDescription: String { "CPU (Accelerate)" }
+
     /// KV キャッシュが今使っているメモリの目安（バイト）
     var cacheBytes: Int { length * config.kvBytesPerToken }
 
@@ -205,12 +240,8 @@ final class GGUFModel {
     ///   - batch: 1 回にまとめて計算するトークン数
     ///   - progress: 何トークン読めたか（ここでエラーを投げると、そこで止まる。読めた分は KV キャッシュに残る）
     @discardableResult
-    func evaluate(_ tokens: [Int], batch: Int = GGUFModel.maxBatch, progress: ((Int) throws -> Void)? = nil) throws -> [Float] {
-        guard !tokens.isEmpty else { throw GGUFError.invalid("no tokens") }
-        guard length + tokens.count <= maxContext else {
-            throw GGUFError.invalid(L("コンテキストの上限（\(maxContext) トークン）を超えました", "context limit of \(maxContext) tokens exceeded"))
-        }
-        if let bad = tokens.first(where: { $0 < 0 || $0 >= config.vocabSize }) { throw GGUFError.invalid("token id \(bad)") }
+    func evaluate(_ tokens: [Int], batch: Int, progress: ((Int) throws -> Void)?) throws -> [Float] {
+        try validate(tokens)
         var offset = 0
         var logits: [Float] = []
         while offset < tokens.count {

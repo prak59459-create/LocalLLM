@@ -85,6 +85,9 @@ jobs:
           for f in SmolLM2-135M-Instruct-Q4_K_M.gguf SmolLM2-135M-Instruct-Q8_0.gguf; do
             curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/$f" "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/$f"
           done
+          # GPU（Metal）の計算は、速さの目標にしている Qwen2.5 1.5B でも確かめる
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/qwen2.5-1.5b-instruct-q4_k_m.gguf" \
+            "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
           ls -la "$RUNNER_TEMP/gguf"
 
       - name: Test

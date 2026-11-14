@@ -186,6 +186,8 @@ REAL = [
     ("qwen3-0.6b-q4_k_m", "Qwen3-0.6B-Q4_K_M.gguf", "The capital of France is"),
     ("gemma-3-1b-q4_k_m", "gemma-3-1b-it-Q4_K_M.gguf", "The capital of France is"),
     ("llama-3.2-1b-q4_k_m", "Llama-3.2-1B-Instruct-Q4_K_M.gguf", "The capital of France is"),
+    # 速さの目標にしているモデル（macOS の CI で GPU の計算を確かめるのに使う）
+    ("qwen2.5-1.5b-q4_k_m", "qwen2.5-1.5b-instruct-q4_k_m.gguf", "The capital of France is"),
 ]
 
 

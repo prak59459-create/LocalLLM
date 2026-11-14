@@ -124,7 +124,7 @@ actor InferenceEngine {
         case .pipeline(let pipeline):
             return try await PipelineLanguageModel.load(files: pipeline, computeUnits: computeUnits.resolved(isPipeline: true))
         case .gguf(let files):
-            return try await GGUFLanguageModel.load(files: files)
+            return try await GGUFLanguageModel.load(files: files, useGPU: computeUnits != .cpuOnly)
         }
     }
 

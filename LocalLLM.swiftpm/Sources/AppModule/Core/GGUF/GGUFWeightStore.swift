@@ -12,7 +12,7 @@ final class MappedFile {
         var info = stat()
         guard fstat(descriptor, &info) == 0, info.st_size > 0 else { throw CocoaError(.fileReadCorruptFile) }
         let size = Int(info.st_size)
-        guard let address = mmap(nil, size, PROT_READ, MAP_PRIVATE, descriptor, 0),
+        guard let address = mmap(nil, size, PROT_READ, MAP_SHARED, descriptor, 0),
               address != UnsafeMutableRawPointer(bitPattern: -1) else {
             throw CocoaError(.fileReadUnknown)
         }

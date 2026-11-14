@@ -126,6 +126,55 @@ final class ImageStudio {
         task?.cancel()
     }
 
+    // MARK: - プロンプトの英訳
+
+    /// 文章のモデルで、日本語などで書いたプロンプトを英語の画像用プロンプトにしている途中か
+    private(set) var isTranslating = false
+
+    /// 入力欄のプロンプトを、読み込んである文章のモデルで英語の画像用プロンプトに書き直す
+    func translatePrompt(chat: ChatController) {
+        let source = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty, !isTranslating, !isGenerating, chat.loadedInfo != nil, !chat.isGenerating else { return }
+        isTranslating = true
+        errorMessage = nil
+        var parameters = GenerationParameters()
+        parameters.temperature = 0.3
+        parameters.maxNewTokens = 120
+        let request = GenerationRequest(
+            systemPrompt: "You write prompts for an image generation model. Rewrite the user's description as one short English prompt: the subject first, then style, lighting and details, separated by commas. Reply with the prompt only, on one line, without quotes or explanations.",
+            history: [ChatMessage(role: .user, content: source)],
+            parameters: parameters,
+            enableThinking: false)
+        task = Task { [self] in
+            var output = ""
+            do {
+                for try await event in chat.engine.generate(request) {
+                    if case .text(let piece) = event { output += piece }
+                }
+                let cleaned = Self.cleanPrompt(output)
+                if !cleaned.isEmpty { prompt = cleaned }
+            } catch is CancellationError {
+                // 止めた
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            isTranslating = false
+        }
+    }
+
+    /// モデルの返答から、プロンプトの 1 行だけを取り出す（考えている途中・引用符・前置きを除く）
+    nonisolated static func cleanPrompt(_ output: String) -> String {
+        var text = ThinkingSplit.split(output).answer
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let line = text.split(whereSeparator: \.isNewline).first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+            text = String(line)
+        }
+        for prefix in ["Prompt:", "prompt:", "English prompt:"] where text.hasPrefix(prefix) {
+            text = String(text.dropFirst(prefix.count))
+        }
+        return text.trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”「」 "))
+    }
+
     private func keep(_ image: CGImage, request: ImageRequest, model: InstalledImageModel, seconds: Double) throws {
         let id = UUID()
         let fileName = "\(id.uuidString).png"

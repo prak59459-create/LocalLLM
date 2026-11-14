@@ -175,11 +175,38 @@ private struct ImagePromptSection: View {
                 .lineLimit(3...8)
             TextField(L("描いてほしくないもの（任意）", "What to avoid (optional)"), text: $studio.negativePrompt, axis: .vertical)
                 .lineLimit(1...4)
+            ImageTranslateButton()
         } header: {
             Text(L("プロンプト", "Prompt"))
         } footer: {
             Text(L("このモデルは英語で学習しているので、英語で書くときれいに出ます（例: a watercolor painting of a cat sitting on a windowsill, soft light）。日本語のままでは、うまく伝わりません。",
                    "The model was trained on English, so write in English (for example: a watercolor painting of a cat sitting on a windowsill, soft light)."))
+        }
+    }
+}
+
+/// 日本語などで書いたプロンプトを、読み込んである文章のモデルで英語にするボタン。
+private struct ImageTranslateButton: View {
+    @Environment(ImageStudio.self) private var studio
+    @Environment(ChatController.self) private var chat
+
+    var body: some View {
+        if chat.loadedInfo != nil {
+            Button {
+                studio.translatePrompt(chat: chat)
+            } label: {
+                if studio.isTranslating {
+                    HStack {
+                        ProgressView()
+                        Text(L("英語のプロンプトにしています…", "Rewriting as an English prompt…"))
+                    }
+                } else {
+                    Label(L("文章のモデルで英語のプロンプトにする", "Rewrite as an English prompt with the chat model"),
+                          systemImage: "character.bubble")
+                }
+            }
+            .disabled(studio.isTranslating || studio.isGenerating || chat.isGenerating
+                      || studio.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 }

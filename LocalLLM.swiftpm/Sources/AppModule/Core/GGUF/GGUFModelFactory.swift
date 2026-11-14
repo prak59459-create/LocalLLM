@@ -36,7 +36,13 @@ enum GGUFModelFactory {
         lock.lock()
         let done = verified.contains(key)
         lock.unlock()
-        if done { return }
+        if done {
+            // 確かめ済みでも 1 トークンだけ計算しておく（重みを GPU から読める状態にする最初の 1 回は、メモリの使い方が
+            // 大きく動く。生成の途中でそれが起きると、メモリの見張りが「急に減った」と見なしてしまう）
+            _ = try model.evaluate([min(1, store.config.vocabSize - 1)])
+            model.truncate(to: 0)
+            return
+        }
         try verify(model, against: try GGUFModel(store: store, maxContext: 16))
         lock.lock()
         verified.insert(key)

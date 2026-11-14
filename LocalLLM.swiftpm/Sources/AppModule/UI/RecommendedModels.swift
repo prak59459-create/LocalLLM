@@ -45,8 +45,8 @@ struct RecommendedModel: Identifiable, Hashable {
             case .reasoning: return L("考えてから答える（<think>）。難しい質問・数学・論理に強いが、答えるまで時間がかかる。",
                                       "Think before answering (<think>). Stronger at hard questions, math and logic, but slower to answer.")
             case .tiny: return L("メモリの少ない iPad でも動く。賢さは控えめ。", "Run even on iPads with little memory. Not very smart.")
-            case .gguf: return L("Ollama や LM Studio で使われている形式。ダウンロード後にこのアプリ用に変換して、CPU で動かします（Core ML 版より遅め）。検索で「GGUF」を選ぶと、ほかのモデルも探せます。",
-                                 "The format used by Ollama and LM Studio. Converted for this app after download and run on the CPU (slower than the Core ML versions). Choose \"GGUF\" in Search to find more.")
+            case .gguf: return L("Ollama や LM Studio で使われている形式。ダウンロード後にこのアプリ用に変換して、GPU（Metal）で動かします。検索で「GGUF」を選ぶと、ほかのモデルも探せます。",
+                                 "The format used by Ollama and LM Studio. Converted for this app after download and run on the GPU (Metal). Choose \"GGUF\" in Search to find more.")
             }
         }
 
@@ -118,8 +118,8 @@ enum RecommendedModels {
         RecommendedModel(
             repoID: "Qwen/Qwen2.5-1.5B-Instruct-GGUF", title: "Qwen2.5 1.5B Instruct (GGUF)",
             approximateBytes: 1_117_000_000, japanese: .good, isExperimental: true,
-            note: L("試験的。0.5B より賢いが、CPU で動かすので遅め（変換後は約 1.6GB）。",
-                    "Experimental. Smarter than 0.5B but slow on the CPU (about 1.6 GB after conversion)."),
+            note: L("0.5B より賢い。GPU で動かす（変換後は約 1.6GB）。",
+                    "Smarter than 0.5B; runs on the GPU (about 1.6 GB after conversion)."),
             category: .gguf, isGGUF: true
         ),
         RecommendedModel(

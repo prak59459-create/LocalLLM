@@ -440,7 +440,7 @@ struct ModelFiles: Sendable {
         case single(URL)
         /// 分割モデル（ANEMLL）
         case pipeline(PipelineFiles)
-        /// GGUF から変換したモデル（CPU で動かす）
+        /// GGUF から変換したモデル（GPU か CPU で動かす）
         case gguf(GGUFModelFiles)
     }
 

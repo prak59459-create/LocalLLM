@@ -512,8 +512,8 @@ private struct GGUFVariantRow: View {
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Text(L("GGUF（llama.cpp 形式）。ダウンロード後にこのアプリ用に変換して、CPU で動かします。",
-                   "GGUF (llama.cpp format). Converted for this app after download and run on the CPU."))
+            Text(L("GGUF（llama.cpp 形式）。ダウンロード後にこのアプリ用に変換して、GPU（使えないときは CPU）で動かします。",
+                   "GGUF (llama.cpp format). Converted for this app after download and run on the GPU (or the CPU when the GPU is unavailable)."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
             compatibility

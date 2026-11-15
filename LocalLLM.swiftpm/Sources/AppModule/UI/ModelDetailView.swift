@@ -15,6 +15,8 @@ struct ModelDetailView: View {
     @State private var metadata: [String: CoreMLMetadata] = [:]
     /// GGUF の先頭部分から分かった情報（リポジトリ内の GGUF は量子化が違うだけなので、1 つ調べれば足りる）
     @State private var gguf: GGUFSummary?
+    /// gguf を調べたファイル
+    @State private var ggufPath: String?
     @State private var isLoading = true
     @State private var loadError: String?
     @State private var actionError: String?
@@ -45,7 +47,7 @@ struct ModelDetailView: View {
             Button(L("もう一度", "Retry")) { Task { await load() } }
         } else if let analysis {
             warnings(analysis)
-            VariantsSection(repoID: repoID, analysis: analysis, metadata: metadata, gguf: gguf, onUse: onUse,
+            VariantsSection(repoID: repoID, analysis: analysis, metadata: metadata, gguf: gguf, ggufPath: ggufPath, onUse: onUse,
                             onError: { actionError = $0 })
             if let actionError {
                 Section {
@@ -61,7 +63,7 @@ struct ModelDetailView: View {
     private var header: some View {
         Section {
             VStack(alignment: .leading, spacing: 6) {
-                Text(repoID)
+                Text(ModelScope.displayName(repoID))
                     .font(.headline)
                     .textSelection(.enabled)
                 if let info {
@@ -76,7 +78,9 @@ struct ModelDetailView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                if let url = URL(string: "https://huggingface.co/\(repoID)") {
+                if ModelScope.isModelScope(repoID), let url = URL(string: "\(ModelScope.base)/models/\(ModelScope.path(repoID))") {
+                    Link(L("ModelScope で開く", "Open on ModelScope"), destination: url)
+                } else if let url = URL(string: "https://huggingface.co/\(repoID)") {
                     Link(L("Hugging Face で開く", "Open on Hugging Face"), destination: url)
                         .font(.footnote)
                 }
@@ -151,6 +155,7 @@ struct ModelDetailView: View {
             if let variant = analysis.variants.first(where: { $0.kind == .gguf }),
                let header = try? await client.fetchGGUFHeader(repo: repoID, path: variant.path) {
                 gguf = GGUFSummary(file: header)
+                ggufPath = variant.path
             }
         } catch {
             loadError = error.localizedDescription
@@ -176,6 +181,7 @@ private struct VariantsSection: View {
     let analysis: RepoAnalysis
     let metadata: [String: CoreMLMetadata]
     let gguf: GGUFSummary?
+    let ggufPath: String?
     var onUse: () -> Void
     var onError: (String) -> Void
 
@@ -189,7 +195,7 @@ private struct VariantsSection: View {
                 ForEach(analysis.variants) { variant in
                     if variant.kind == .gguf {
                         GGUFVariantRow(repoID: repoID, variant: variant, analysis: analysis, summary: gguf,
-                                       onUse: onUse, onError: onError)
+                                       summaryIsThisFile: ggufPath == variant.path, onUse: onUse, onError: onError)
                     } else {
                         VariantRow(repoID: repoID, variant: variant, analysis: analysis,
                                    metadata: metadata[variant.path], onUse: onUse, onError: onError)
@@ -478,10 +484,15 @@ private struct GGUFVariantRow: View {
     let repoID: String
     let variant: ModelVariant
     let analysis: RepoAnalysis
-    /// リポジトリの GGUF の情報（取れなかったら nil）
+    /// リポジトリの GGUF の情報（取れなかったら nil）。ふつうは別のファイル（Q4_K_M など）を調べたもの
     let summary: GGUFSummary?
+    /// summary がこのファイルを調べたものか
+    var summaryIsThisFile = false
     var onUse: () -> Void
     var onError: (String) -> Void
+
+    /// このファイルの先頭を取ってきて調べたもの（変換後の大きさは量子化ごとに違うので、ファイルごとに調べる）
+    @State private var own: GGUFSummary?
 
     private var installed: InstalledModel? {
         library.model(withID: InstalledModel.makeID(repoID: repoID, variantPath: variant.path))
@@ -489,11 +500,10 @@ private struct GGUFVariantRow: View {
 
     private var quantization: String? { GGUFNaming.quantization(of: variant.path) }
 
-    /// このファイルの情報（量子化の名前だけ、このファイルのものにする）
+    /// このファイルの情報。まだ調べていないあいだは nil（ほかのファイルの大きさを出さないように）
     private var variantSummary: GGUFSummary? {
-        guard var copy = summary else { return nil }
-        if let quantization { copy.quantization = quantization }
-        return copy
+        if summaryIsThisFile { return summary }
+        return own
     }
 
     private var canDownload: Bool {
@@ -522,6 +532,12 @@ private struct GGUFVariantRow: View {
                                installed: installed, canDownload: canDownload, onUse: onUse, onError: onError)
         }
         .padding(.vertical, 4)
+        .task(id: variant.path) {
+            guard !summaryIsThisFile, own == nil, GGUFNaming.isReadable(quantization: quantization) else { return }
+            if let header = try? await settings.makeHFClient().fetchGGUFHeader(repo: repoID, path: variant.path) {
+                own = GGUFSummary(file: header)
+            }
+        }
     }
 
     @ViewBuilder
@@ -552,7 +568,7 @@ private struct GGUFVariantRow: View {
 
     @ViewBuilder
     private var details: some View {
-        if let summary, summary.isSupported {
+        if let summary = variantSummary, summary.isSupported {
             let context = summary.defaultContext
             let required = summary.memoryBytes(context: context)
             let fit = GGUFMemoryFit.fit(requiredBytes: required)
@@ -570,6 +586,10 @@ private struct GGUFVariantRow: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+        } else if summary?.isSupported == true, GGUFNaming.isReadable(quantization: quantization) {
+            Label(L("このファイルの変換後の大きさを調べています…", "Checking this file's size after conversion…"), systemImage: "hourglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }

@@ -25,8 +25,9 @@ struct HFSearchPage: Sendable {
 enum HFSearchSource: String, CaseIterable, Identifiable, Sendable {
     case coreML     // coreml タグの付いたモデル
     case anemll     // ANEMLL の分割モデル
-    case gguf       // GGUF（llama.cpp 形式）
-    case all        // すべて
+    case gguf       // GGUF（llama.cpp 形式）。Hugging Face と ModelScope の両方
+    case modelScope // ModelScope（GGUF だけ）
+    case all        // すべて（Hugging Face と ModelScope）
 
     var id: String { rawValue }
 
@@ -35,6 +36,7 @@ enum HFSearchSource: String, CaseIterable, Identifiable, Sendable {
         case .coreML: return L("Core ML", "Core ML")
         case .anemll: return L("分割モデル（ANEMLL）", "Split models (ANEMLL)")
         case .gguf: return "GGUF"
+        case .modelScope: return "ModelScope"
         case .all: return L("すべて", "All")
         }
     }
@@ -122,11 +124,21 @@ final class HFClient: @unchecked Sendable {
         self.session = session
     }
 
-    /// ダウンロードに付けるヘッダ
+    /// ダウンロードに付けるヘッダ（Hugging Face 用。トークンを含む）
     var authorizationHeaders: [String: String] {
         var headers = ["User-Agent": Self.userAgent]
         if let token { headers["Authorization"] = "Bearer \(token)" }
         return headers
+    }
+
+    /// そのリポジトリのダウンロードに付けるヘッダ（Hugging Face のトークンは、Hugging Face にだけ送る）
+    func headers(forRepo repo: String) -> [String: String] {
+        ModelScope.isModelScope(repo) ? ["User-Agent": Self.userAgent] : authorizationHeaders
+    }
+
+    /// その URL に送ってよいヘッダ
+    private func headers(for url: URL) -> [String: String] {
+        url.host == endpoint.host ? authorizationHeaders : ["User-Agent": Self.userAgent]
     }
 
     // MARK: - API
@@ -144,6 +156,22 @@ final class HFClient: @unchecked Sendable {
     }
 
     func searchURL(query: String, source: HFSearchSource, textGenerationOnly: Bool, sort: HFSearchSort, limit: Int) -> URL {
+        switch source {
+        case .modelScope:
+            return ModelScope.searchURL(query: query, sort: sort, page: 1, limit: limit)
+        case .gguf, .all:
+            // Hugging Face と ModelScope をまとめて探す
+            let huggingFace = huggingFaceSearchURL(query: query, source: source, textGenerationOnly: textGenerationOnly,
+                                                   sort: sort, limit: limit)
+            return ModelScope.combinedURL(huggingFace: huggingFace,
+                                          modelScope: ModelScope.searchURL(query: query, sort: sort, page: 1, limit: limit / 2))!
+        case .coreML, .anemll:
+            return huggingFaceSearchURL(query: query, source: source, textGenerationOnly: textGenerationOnly, sort: sort, limit: limit)
+        }
+    }
+
+    private func huggingFaceSearchURL(query: String, source: HFSearchSource, textGenerationOnly: Bool, sort: HFSearchSort,
+                                      limit: Int) -> URL {
         var components = URLComponents(url: endpoint.appendingPathComponent("api/models"), resolvingAgainstBaseURL: false)!
         var items = [
             URLQueryItem(name: "sort", value: sort.rawValue),
@@ -162,7 +190,7 @@ final class HFClient: @unchecked Sendable {
         case .gguf:
             items.append(URLQueryItem(name: "filter", value: "gguf"))
             if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
-        case .all:
+        case .all, .modelScope:
             if textGenerationOnly { items.append(URLQueryItem(name: "pipeline_tag", value: "text-generation")) }
         }
         components.queryItems = items
@@ -171,6 +199,11 @@ final class HFClient: @unchecked Sendable {
 
     /// 検索結果の 1 ページ（Link ヘッダに次のページがあれば next に入る）
     func searchPage(_ url: URL) async throws -> HFSearchPage {
+        if url.scheme == ModelScope.combinedScheme { return try await combinedPage(url) }
+        if ModelScope.isSearchURL(url) {
+            let (data, _) = try await send(url, method: "PUT", body: ModelScope.searchBody(for: url))
+            return try ModelScope.parseSearch(data, requestURL: url)
+        }
         let (data, response) = try await get(url)
         guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             throw HFError.invalidResponse("models")
@@ -189,7 +222,35 @@ final class HFClient: @unchecked Sendable {
         return HFSearchPage(models: models, next: response.value(forHTTPHeaderField: "Link").flatMap(Self.nextLink))
     }
 
+    /// Hugging Face と ModelScope の両方の続き。片方が失敗しても、もう片方の結果は出す
+    private func combinedPage(_ url: URL) async throws -> HFSearchPage {
+        let parts = ModelScope.combinedParts(url)
+        async let first = optionalPage(parts.huggingFace)
+        async let second = optionalPage(parts.modelScope)
+        let (huggingFace, modelScope) = await (first, second)
+        var pages: [HFSearchPage?] = [nil, nil]
+        var failure: Error?
+        for (index, result) in [huggingFace, modelScope].enumerated() {
+            switch result {
+            case .success(let page): pages[index] = page
+            case .failure(let error): failure = failure ?? error
+            case nil: break
+            }
+        }
+        if pages.allSatisfy({ $0 == nil }), let failure { throw failure }
+        return HFSearchPage(models: ModelScope.interleave(pages[0]?.models ?? [], pages[1]?.models ?? []),
+                            next: ModelScope.combinedURL(huggingFace: pages[0]?.next, modelScope: pages[1]?.next))
+    }
+
+    private func optionalPage(_ url: URL?) async -> Result<HFSearchPage, Error>? {
+        guard let url else { return nil }
+        do { return .success(try await searchPage(url)) } catch { return .failure(error) }
+    }
+
     func modelInfo(repo: String) async throws -> HFModelInfo {
+        if ModelScope.isModelScope(repo) {
+            return try ModelScope.parseInfo(try await get(ModelScope.infoURL(repo: repo)).0, repo: repo)
+        }
         let (data, _) = try await get(endpoint.appendingPathComponent("api/models").appendingPathComponent(repo))
         guard let item = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw HFError.invalidResponse("model info")
@@ -215,6 +276,9 @@ final class HFClient: @unchecked Sendable {
 
     /// リポジトリの全ファイル（再帰的に、ページングもたどる）
     func listFiles(repo: String, revision: String) async throws -> [HFFileEntry] {
+        if ModelScope.isModelScope(repo) {
+            return try ModelScope.parseFiles(try await get(ModelScope.filesURL(repo: repo, revision: revision)).0)
+        }
         var url: URL? = treeURL(repo: repo, revision: revision)
         var files: [HFFileEntry] = []
         var pages = 0
@@ -236,6 +300,7 @@ final class HFClient: @unchecked Sendable {
 
     /// https://huggingface.co/{repo}/resolve/{revision}/{path}
     func resolveURL(repo: String, path: String, revision: String) -> URL {
+        if ModelScope.isModelScope(repo) { return ModelScope.resolveURL(repo: repo, path: path, revision: revision) }
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#[]@!$&'()*+,;="))
         let encodedPath = path.split(separator: "/", omittingEmptySubsequences: false)
             .map { String($0).addingPercentEncoding(withAllowedCharacters: allowed) ?? String($0) }
@@ -273,10 +338,19 @@ final class HFClient: @unchecked Sendable {
     // MARK: - 補助
 
     private func get(_ url: URL, range: Range<Int>? = nil) async throws -> (Data, HTTPURLResponse) {
+        try await send(url, range: range)
+    }
+
+    private func send(_ url: URL, method: String = "GET", body: Data? = nil, range: Range<Int>? = nil) async throws -> (Data, HTTPURLResponse) {
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
+        request.httpMethod = method
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         if let range { request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range") }
-        for (key, value) in authorizationHeaders { request.setValue(value, forHTTPHeaderField: key) }
+        for (key, value) in headers(for: url) { request.setValue(value, forHTTPHeaderField: key) }
         let data: Data
         let response: URLResponse
         do {

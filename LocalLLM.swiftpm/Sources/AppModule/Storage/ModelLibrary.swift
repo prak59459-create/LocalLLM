@@ -177,7 +177,7 @@ final class ModelLibrary {
                                   expectedSize: file.size > 0 ? file.size : nil)
         }
         let job = ModelDownloadJob(items: items, destinationDirectory: directory(for: model),
-                                   headers: client.authorizationHeaders)
+                                   headers: client.headers(forRepo: model.repoID))
         downloads[id] = DownloadState(phase: .downloading, progress: downloads[id]?.progress)
         beginBackgroundTask(for: id)
         updateIdleTimer()

@@ -79,16 +79,7 @@ extension GGUFModelConfig {
     /// メタデータと重みの一覧から構造を決める。対応していない構造なら GGUFError を投げる。
     init(file: GGUFFile) throws {
         let arch = file.architecture
-        guard let family = Self.supportedArchitectures[arch] else {
-            throw GGUFError.unsupportedArchitecture(arch.isEmpty ? "?" : arch)
-        }
-        guard let embedding = file.tensor("token_embd.weight"), embedding.dimensions.count == 2 else {
-            throw GGUFError.missingTensor("token_embd.weight")
-        }
-        // 混合エキスパート（MoE）は扱わない
-        if file.has("blk.0.ffn_gate_inp.weight") || (file.archInt("expert_count") ?? 0) > 0 {
-            throw GGUFError.unsupportedArchitecture("\(arch) (MoE)")
-        }
+        let (family, embedding) = try Self.checkSupported(file)
         let rules = Self.rules(family, file: file)
         architecture = arch
         self.family = family
@@ -127,17 +118,15 @@ extension GGUFModelConfig {
         feedForwardSize = shapes.map(\.feedForwardSize).max() ?? 0
 
         // RoPE
-        ropeDimensions = file.archInt("rope.dimension_count") ?? fullHead
-        slidingRopeDimensions = file.archInt("rope.dimension_count_swa") ?? min(ropeDimensions, slidingHead)
-        guard ropeDimensions % 2 == 0, ropeDimensions <= fullHead, slidingRopeDimensions % 2 == 0,
-              slidingRopeDimensions <= slidingHead else { throw GGUFError.invalid("rope dimensions") }
-        ropeBase = Float(file.archDouble("rope.freq_base") ?? 10000)
-        slidingRopeBase = Float(file.archDouble("rope.freq_base_swa") ?? (family == .gemma3 ? 10000 : Double(ropeBase)))
+        let rope = try Self.rope(file, family: family, fullHead: fullHead, slidingHead: slidingHead)
+        ropeDimensions = rope.dimensions
+        slidingRopeDimensions = rope.slidingDimensions
+        ropeBase = rope.base
+        slidingRopeBase = rope.slidingBase
         ropeFactorsOnSlidingLayers = family != .gemma4
-        (ropeScale, yarn) = Self.ropeScaling(file)
-        // llama.cpp: 直近だけを見る層は、系列によって全体と同じ倍率か、伸ばさない（1）
-        let scalesSliding: Set<Family> = [.gemma2, .cohere2, .exaone4]
-        slidingRopeScale = scalesSliding.contains(family) ? ropeScale : 1
+        ropeScale = rope.scale
+        yarn = rope.yarn
+        slidingRopeScale = rope.slidingScale
         contextLength = try Self.usableContext(file, family: family, trained: contextLength, yarn: yarn,
                                                learnedPositions: rules.learnedPositions)
 
@@ -166,6 +155,37 @@ extension GGUFModelConfig {
             throw GGUFError.unsupportedArchitecture("olmo (clamp_kqv)")
         }
         try validateTensors(file)
+    }
+
+    /// 対応している構造か（系列と、埋め込みの表）
+    private static func checkSupported(_ file: GGUFFile) throws -> (Family, GGUFTensorInfo) {
+        let arch = file.architecture
+        guard let family = supportedArchitectures[arch] else {
+            throw GGUFError.unsupportedArchitecture(arch.isEmpty ? "?" : arch)
+        }
+        guard let embedding = file.tensor("token_embd.weight"), embedding.dimensions.count == 2 else {
+            throw GGUFError.missingTensor("token_embd.weight")
+        }
+        // 混合エキスパート（MoE）は扱わない
+        if file.has("blk.0.ffn_gate_inp.weight") || (file.archInt("expert_count") ?? 0) > 0 {
+            throw GGUFError.unsupportedArchitecture("\(arch) (MoE)")
+        }
+        return (family, embedding)
+    }
+
+    /// RoPE の次元・底・倍率
+    private static func rope(_ file: GGUFFile, family: Family, fullHead: Int, slidingHead: Int) throws
+        -> (dimensions: Int, slidingDimensions: Int, base: Float, slidingBase: Float, scale: Float, yarn: YaRN?, slidingScale: Float) {
+        let dimensions = file.archInt("rope.dimension_count") ?? fullHead
+        let slidingDimensions = file.archInt("rope.dimension_count_swa") ?? min(dimensions, slidingHead)
+        guard dimensions % 2 == 0, dimensions <= fullHead, slidingDimensions % 2 == 0,
+              slidingDimensions <= slidingHead else { throw GGUFError.invalid("rope dimensions") }
+        let base = Float(file.archDouble("rope.freq_base") ?? 10000)
+        let slidingBase = Float(file.archDouble("rope.freq_base_swa") ?? (family == .gemma3 ? 10000 : Double(base)))
+        let (scale, yarn) = ropeScaling(file)
+        // llama.cpp: 直近だけを見る層は、系列によって全体と同じ倍率か、伸ばさない（1）
+        let scalesSliding: Set<Family> = [.gemma2, .cohere2, .exaone4]
+        return (dimensions, slidingDimensions, base, slidingBase, scale, yarn, scalesSliding.contains(family) ? scale : 1)
     }
 
     /// 層ごとの形（ヘッドの数・大きさ・FFN・RoPE を使うか・KV キャッシュを持つ層）

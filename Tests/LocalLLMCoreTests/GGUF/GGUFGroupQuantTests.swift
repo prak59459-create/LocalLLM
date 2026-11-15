@@ -163,6 +163,21 @@ final class GGUFGroupQuantTests: XCTestCase {
                 for index in output.indices {
                     XCTAssertEqual(narrow[index], output[index], accuracy: 1e-3 * max(1, abs(output[index])), "\(storage) narrow \(index)")
                 }
+                // 何まとまりにも分かれるとき（5 行ずつ）も同じ結果
+                let perBlock = columns / 32 + 64 + 5 * GGUFGroupQuant.floatsPerRow(columns: columns, five: storage == .q5Groups)
+                var blocks = [Float](repeating: .nan, count: count * rows)
+                var blockRoom = [Float](repeating: 0, count: perBlock)
+                input.withUnsafeBufferPointer { x in
+                    blocks.withUnsafeMutableBufferPointer { y in
+                        blockRoom.withUnsafeMutableBufferPointer { scratch in
+                            GGUFGroupQuant.linear(matrix, 0..<rows, input: x.baseAddress!, count: count, output: y.baseAddress!,
+                                                  stride: rows, scratch: scratch.baseAddress!, capacity: scratch.count)
+                        }
+                    }
+                }
+                for index in output.indices {
+                    XCTAssertEqual(blocks[index], output[index], accuracy: 1e-3 * max(1, abs(output[index])), "\(storage) blocks \(index)")
+                }
                 // 一部の行だけ（q・k・v が 1 つの行列のときに使う）
                 let part = matrix.slice(5..<17)
                 var partOutput = [Float](repeating: .nan, count: part.rows)

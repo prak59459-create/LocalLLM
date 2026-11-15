@@ -208,11 +208,17 @@ enum GGUFGroupQuant {
 
     // MARK: - 線形層（CPU）
 
-    /// scratch の大きさ（Float の個数）に入る行数（Accelerate での計算の置き場所に合わせる）
+    /// Accelerate での計算の置き場所の、1 行あたりの大きさ（Float の個数）
+    static func floatsPerRow(columns: Int, five: Bool) -> Int {
+        let half = columns / 2, groups = columns / groupSize
+        // バイト・上の 4 ビット・積・x の並び 2 つ（5 ビットは + 4）、倍率と下限 2・倍率・下限・組ごとの和・倍率 × 和
+        return (five ? 9 : 5) * half + 6 * groups
+    }
+
+    /// scratch の大きさ（Float の個数）に入る行数
     static func blockRows(columns: Int, capacity: Int, five: Bool) -> Int {
         let groups = columns / groupSize
-        let perRow = (five ? 4 * columns : columns + columns / 2) + 3 * groups
-        return max(1, min(512, (capacity - columns - groups - 64) / perRow))
+        return max(1, min(512, (capacity - groups - 64) / floatsPerRow(columns: columns, five: five)))
     }
 
     /// output[n, r] = Σ_c X[n, c] · W[r, c]（range の行だけ。stride は output の 1 行の長さ）
@@ -237,11 +243,23 @@ enum GGUFGroupQuant {
     }
 
     #if canImport(Accelerate)
-    private static let onesVector = [Float](repeating: 1, count: 32)
+    /// 足し合わせ用の 1 の並び（組の数がこれより多い行列は 1 行ずつの計算にする）
+    private static let ones = [Float](repeating: 1, count: 4096)
+
+    /// 1 行ぶんを rows 行に並べる（倍にしながら写すので、呼び出しは log rows 回）
+    private static func tile(_ target: UnsafeMutablePointer<Float>, length: Int, rows: Int) {
+        var filled = 1
+        while filled < rows {
+            let count = min(filled, rows - filled)
+            (target + filled * length).update(from: target, count: count * length)
+            filled += count
+        }
+    }
 
     /// 下位 4 ビットを取り出さずに、1 バイトの値 b = 下 + 16 × 上 のまま使う:
-    /// Σ q·x = Σ (b · x偶 + 上 · (x奇 − 16 · x偶))。1 行につき vDSP_vmma 1 回で済む。
-    /// そのあと y = Σ_組 (倍率 × Σ q·x + 下限 × Σ x)。どの手順も Accelerate でまとめて計算する（最適化なしのビルドでも速い）
+    /// Σ q·x = Σ (b · x偶 + 上 · (x奇 − 16 · x偶))。x を行の数だけ並べておけば、まとまり全体を vDSP_vmma 1 回で計算できる。
+    /// そのあと y = 倍率 · (組ごとの Σ q·x) + 下限 · (組ごとの Σ x) を sgemv 2 回で。
+    /// 行ごとの呼び出しが無い（最適化なしのビルドでは、行ごとの呼び出しのほうが計算より高くつく）
     private static func accelerated(_ matrix: GGUFMatrix, _ range: Range<Int>, input: UnsafePointer<Float>, count: Int,
                                     output: UnsafeMutablePointer<Float>, stride: Int,
                                     scratch: UnsafeMutablePointer<Float>, capacity: Int) {
@@ -249,68 +267,73 @@ enum GGUFGroupQuant {
         let columns = matrix.columns, halfColumns = columns / 2
         let groups = columns / groupSize
         let five = matrix.highBits != nil
-        let perRow = (five ? 4 * columns : columns + halfColumns) + 3 * groups
-        guard capacity >= columns + groups + 64 + perRow else {
+        guard groups <= ones.count, capacity >= groups + 64 + floatsPerRow(columns: columns, five: five) else {
             // とても長い行で置き場所が足りないとき（ふつうは起きない）: 1 行ずつ Float に戻して掛ける
             simple(matrix, range, input: input, count: count, output: output, stride: stride, row: scratch)
             return
         }
         let blockRows = blockRows(columns: columns, capacity: capacity, five: five)
-        // 置き場所: バイトの値・上の 4 ビット・積（5 ビットなら 2 倍）・5 ビット目 × 16・倍率と下限・組ごとの和・x偶・x奇の補正・Σ x
-        let bytes = scratch
-        let high = bytes + blockRows * halfColumns
-        let products = high + blockRows * halfColumns
-        let fifth = products + blockRows * (five ? columns : halfColumns)
-        let params = fifth + (five ? blockRows * columns : 0)
-        let dots = params + 2 * blockRows * groups
-        let even = dots + blockRows * groups
-        let odd = even + halfColumns
-        let sums = odd + halfColumns
+        let block = blockRows * halfColumns, groupBlock = blockRows * groups
+        // 置き場所（block = 行 × 列 ÷ 2）: バイトの値・上の 4 ビット・積・x偶の並び・x奇補正の並び
+        // （5 ビット: 偶数番目と奇数番目の 5 ビット目 × 16・x奇の並び・積 2）・倍率と下限・倍率・下限・組ごとの和・Σ x
+        let bytes = scratch, high = bytes + block, products = high + block
+        let evenTiles = products + block, oddTiles = evenTiles + block
+        let fifthEven = oddTiles + block, fifthOdd = fifthEven + (five ? block : 0)
+        let plainOddTiles = fifthOdd + (five ? block : 0), products2 = plainOddTiles + (five ? block : 0)
+        let params = products2 + (five ? block : 0)
+        let scales = params + 2 * groupBlock, minimums = scales + groupBlock
+        let dots = minimums + groupBlock, scaledDots = dots + groupBlock
+        let sums = scaledDots + groupBlock
         var minusSixteen: Float = -16
-        onesVector.withUnsafeBufferPointer { ones in
+        ones.withUnsafeBufferPointer { onesBuffer in
+            let one = onesBuffer.baseAddress!
             var row = range.lowerBound
             while row < range.upperBound {
                 let rows = min(blockRows, range.upperBound - row)
-                unpack(matrix, firstRow: row, rows: rows, bytes: bytes, high: high, fifth: five ? fifth : nil, work: products)
-                // 倍率と下限（半精度 → Float）
+                let pairs = rows * halfColumns, blockGroups = rows * groups
+                unpack(matrix, firstRow: row, rows: rows, bytes: bytes, high: high,
+                       fifth: five ? (fifthEven, fifthOdd) : nil, work: products)
+                // 倍率と下限（半精度 → Float）→ 倍率だけ・下限だけに分ける
                 var source = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: groupParams + row * groups * 4), height: 1,
-                                           width: vImagePixelCount(rows * groups * 2), rowBytes: rows * groups * 4)
-                var target = vImage_Buffer(data: params, height: 1, width: vImagePixelCount(rows * groups * 2), rowBytes: rows * groups * 8)
+                                           width: vImagePixelCount(blockGroups * 2), rowBytes: blockGroups * 4)
+                var target = vImage_Buffer(data: params, height: 1, width: vImagePixelCount(blockGroups * 2), rowBytes: blockGroups * 8)
                 vImageConvert_Planar16FtoPlanarF(&source, &target, vImage_Flags(kvImageNoFlags))
+                cblas_scopy(Int32(blockGroups), params, 2, scales, 1)
+                cblas_scopy(Int32(blockGroups), params + 1, 2, minimums, 1)
                 for n in 0..<count {
                     let x = input + n * columns
-                    // 組ごとの Σ x、偶数番目の x、奇数番目 − 16 × 偶数番目
-                    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(groups), 32, 1, x, 32, ones.baseAddress!, 1, 0, sums, 1)
-                    cblas_scopy(Int32(halfColumns), x, 2, even, 1)
-                    vDSP_vsma(even, 1, &minusSixteen, x + 1, 2, odd, 1, vDSP_Length(halfColumns))
-                    for r in 0..<rows {
-                        vDSP_vmma(bytes + r * halfColumns, 1, even, 1, high + r * halfColumns, 1, odd, 1, products + r * halfColumns, 1,
-                                  vDSP_Length(halfColumns))
-                    }
-                    // 1 つの組は 16 バイト（32 個）
-                    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(rows * groups), 16, 1, products, 16, ones.baseAddress!, 1, 0, dots, 1)
+                    let y = output + n * stride + row
+                    // 組ごとの Σ x
+                    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(groups), 32, 1, x, 32, one, 1, 0, sums, 1)
+                    // x偶、x奇 − 16 × x偶（5 ビットなら x奇も）を行の数だけ並べる
+                    cblas_scopy(Int32(halfColumns), x, 2, evenTiles, 1)
+                    vDSP_vsma(evenTiles, 1, &minusSixteen, x + 1, 2, oddTiles, 1, vDSP_Length(halfColumns))
+                    tile(evenTiles, length: halfColumns, rows: rows)
+                    tile(oddTiles, length: halfColumns, rows: rows)
+                    vDSP_vmma(bytes, 1, evenTiles, 1, high, 1, oddTiles, 1, products, 1, vDSP_Length(pairs))
                     if five {
-                        // 5 ビット目の分（16 × ビット）· x を足す
-                        for r in 0..<rows {
-                            vDSP_vmul(fifth + r * columns, 1, x, 1, products + r * columns, 1, vDSP_Length(columns))
-                        }
-                        cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(rows * groups), 32, 1, products, 32, ones.baseAddress!, 1, 1, dots, 1)
+                        cblas_scopy(Int32(halfColumns), x + 1, 2, plainOddTiles, 1)
+                        tile(plainOddTiles, length: halfColumns, rows: rows)
+                        vDSP_vmma(fifthEven, 1, evenTiles, 1, fifthOdd, 1, plainOddTiles, 1, products2, 1, vDSP_Length(pairs))
+                        vDSP_vadd(products, 1, products2, 1, products, 1, vDSP_Length(pairs))
                     }
-                    for r in 0..<rows {
-                        var scaled: Float = 0, shifted: Float = 0
-                        vDSP_dotpr(params + r * groups * 2, 2, dots + r * groups, 1, &scaled, vDSP_Length(groups))
-                        vDSP_dotpr(params + r * groups * 2 + 1, 2, sums, 1, &shifted, vDSP_Length(groups))
-                        output[n * stride + row + r] = scaled + shifted
-                    }
+                    // 組ごとの Σ q·x（1 つの組は 16 バイト = 32 個）
+                    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(blockGroups), 16, 1, products, 16, one, 1, 0, dots, 1)
+                    // y = 下限 · Σ x + (倍率 ⊙ Σ q·x) の行ごとの和
+                    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(rows), Int32(groups), 1, minimums, Int32(groups), sums, 1, 0, y, 1)
+                    vDSP_vmul(scales, 1, dots, 1, scaledDots, 1, vDSP_Length(blockGroups))
+                    cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(rows), Int32(groups), 1, scaledDots, Int32(groups), one, 1, 1, y, 1)
                 }
                 row += rows
             }
         }
     }
 
-    /// rows 行ぶんの、バイトの値（b）と上の 4 ビット（floor(b / 16)）。5 ビットなら、5 ビット目 × 16 を fifth に（並びは要素の順）
+    /// rows 行ぶんの、バイトの値（b）と上の 4 ビット（floor(b / 16)）。
+    /// 5 ビットなら、5 ビット目 × 16 を、偶数番目（fifth.0）と奇数番目（fifth.1）に分けて置く
     private static func unpack(_ matrix: GGUFMatrix, firstRow: Int, rows: Int, bytes: UnsafeMutablePointer<Float>,
-                               high: UnsafeMutablePointer<Float>, fifth: UnsafeMutablePointer<Float>?,
+                               high: UnsafeMutablePointer<Float>,
+                               fifth: (UnsafeMutablePointer<Float>, UnsafeMutablePointer<Float>)?,
                                work: UnsafeMutablePointer<Float>) {
         let columns = matrix.columns
         let total = rows * columns
@@ -322,7 +345,8 @@ enum GGUFGroupQuant {
         var length = Int32(pairs)
         vvfloorf(high, high, &length)
         guard let fifth, let highBits = matrix.highBits else { return }
-        // 5 ビット目: c 番目は (c / 8) バイト目の (c % 8) ビット目。floor で 1 ビットずつ取り出す
+        // 5 ビット目: c 番目は (c / 8) バイト目の (c % 8) ビット目。floor で 1 ビットずつ取り出す。
+        // c = 8k + j は、j が偶数なら偶数番目の 4k + j/2 番、奇数なら奇数番目の 4k + (j−1)/2 番
         let eighths = total / 8
         let source = highBits.assumingMemoryBound(to: UInt8.self) + firstRow * columns / 8
         var current = work, next = work + eighths
@@ -334,7 +358,8 @@ enum GGUFGroupQuant {
             vvfloorf(next, next, &count)
             // このビット = 今の値 − 2 × 次の値（current に入れる）
             vDSP_vsma(next, 1, &minusTwo, current, 1, current, 1, vDSP_Length(eighths))
-            vDSP_vsmul(current, 1, &sixteen, fifth + bit, 8, vDSP_Length(eighths))
+            let target = bit % 2 == 0 ? fifth.0 : fifth.1
+            vDSP_vsmul(current, 1, &sixteen, target + bit / 2, 4, vDSP_Length(eighths))
             swap(&current, &next)
         }
     }

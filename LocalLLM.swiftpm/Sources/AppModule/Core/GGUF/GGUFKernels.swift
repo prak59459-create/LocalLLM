@@ -12,6 +12,11 @@ struct GGUFMatrix {
         case int8Rows
         /// GGUF の量子化のまま（行を取り出すだけの大きな表に使う。掛け算には使えない）
         case raw
+        /// 4 ビット・5 ビット（32 個ずつの組ごとに倍率と下限。GGUFGroupQuant）。元の GGUF が 4・5 ビットのとき
+        case q4Groups
+        case q5Groups
+
+        var isGrouped: Bool { self == .q4Groups || self == .q5Groups }
     }
 
     var rows: Int
@@ -22,6 +27,10 @@ struct GGUFMatrix {
     var scales: UnsafePointer<Float>?
     /// raw のときの量子化の形式
     var rawType: GGUFTensorType? = nil
+    /// q5Groups のときの 5 ビット目の面
+    var highBits: UnsafeRawPointer? = nil
+    /// q4Groups・q5Groups のときの、組ごとの倍率と下限（半精度 2 つずつ）
+    var groupParams: UnsafeRawPointer? = nil
 
     /// raw のときの 1 行のバイト数
     var rawRowBytes: Int {
@@ -36,10 +45,14 @@ struct GGUFMatrix {
         case .float32: rowBytes = columns * MemoryLayout<Float>.size
         case .int8Rows: rowBytes = columns
         case .raw: rowBytes = rawRowBytes
+        case .q4Groups, .q5Groups: rowBytes = columns / 2
         }
+        let first = range.lowerBound
         return GGUFMatrix(rows: range.count, columns: columns, storage: storage,
-                          data: data + range.lowerBound * rowBytes,
-                          scales: scales.map { $0 + range.lowerBound }, rawType: rawType)
+                          data: data + first * rowBytes,
+                          scales: scales.map { $0 + first }, rawType: rawType,
+                          highBits: highBits.map { $0 + first * columns / 8 },
+                          groupParams: groupParams.map { $0 + first * (columns / GGUFGroupQuant.groupSize) * 4 })
     }
 }
 
@@ -70,6 +83,9 @@ final class GGUFWorkers {
     deinit {
         for pointer in scratch { pointer.deallocate() }
     }
+
+    /// 作業用メモリ 1 つの大きさ（Float の個数）
+    var scratchSize: Int { scratchCapacity }
 
     func blockRows(columns: Int) -> Int {
         max(1, min(512, scratchCapacity / max(columns, 1)))
@@ -154,6 +170,9 @@ enum GGUFKernels {
         case .raw:
             // 掛け算には使わない（変換のときに raw にするのは、行を取り出すだけの表）
             output.update(repeating: 0, count: count * stride)
+        case .q4Groups, .q5Groups:
+            GGUFGroupQuant.linear(matrix, range, input: input, count: count, output: output, stride: stride,
+                                  scratch: scratch, capacity: workers.scratchSize)
         case .int8Rows:
             let weights = matrix.data.assumingMemoryBound(to: Int8.self)
             let blockRows = workers.blockRows(columns: columns)
@@ -196,6 +215,9 @@ enum GGUFKernels {
         case .int8Rows:
             int8ToFloat(matrix.data.assumingMemoryBound(to: Int8.self) + row * columns, output, count: columns)
             MiniVector.scale(output, scale * (matrix.scales?[row] ?? 1), output, columns)
+        case .q4Groups, .q5Groups:
+            GGUFGroupQuant.dequantizeRow(matrix, row: row, into: output)
+            if scale != 1 { MiniVector.scale(output, scale, output, columns) }
         case .raw:
             guard let type = matrix.rawType,
                   (try? GGUFQuant.dequantize(type, source: matrix.data + row * matrix.rawRowBytes, count: columns, into: output)) != nil else {

@@ -13,6 +13,10 @@ enum GGUFMetalSource {
         case linearF32Batch = "linear_f32_batch"
         case linearQ8Vector = "linear_q8_vector"
         case linearF32Vector = "linear_f32_vector"
+        case linearQ4Vector = "linear_q4_vector"
+        case linearQ5Vector = "linear_q5_vector"
+        case linearQ4Batch = "linear_q4_batch"
+        case linearQ5Batch = "linear_q5_batch"
         case rmsNorm = "rms_norm"
         case rope = "rope"
         case attentionScores = "attention_scores"
@@ -229,6 +233,151 @@ enum GGUFMetalSource {
                                   uint row [[threadgroup_position_in_grid]],
                                   uint lane [[thread_index_in_simdgroup]]) {
         linear_vector((device const packed_float4 *)(weights + a.weightSkip), scales, bias, input, output, a, row, lane);
+    }
+
+    // 4・5 ビットの重み（GGUFGroupQuant）。32 個ずつの組: 下位 4 ビット 16 バイト（uint4）、5 ビット目 4 バイト（uint）、
+    // 倍率と下限（half2）。値 = q × 倍率 + 下限
+    inline float4 group_q(uint word, uint k) {
+        uint shift = k * 16u;
+        return float4(float((word >> shift) & 15u), float((word >> (shift + 4u)) & 15u),
+                      float((word >> (shift + 8u)) & 15u), float((word >> (shift + 12u)) & 15u));
+    }
+
+    inline float4 group_high(uint bits, uint e) {
+        return float4(float((bits >> e) & 1u), float((bits >> (e + 1u)) & 1u),
+                      float((bits >> (e + 2u)) & 1u), float((bits >> (e + 3u)) & 1u)) * 16.0f;
+    }
+
+    // 1 つの組の Σ q·x と Σ x
+    inline float2 group_dot(uint4 packed, uint bits, bool five, device const packed_float4 *x) {
+        float qx = 0.0f;
+        float xs = 0.0f;
+        for (uint w = 0; w < 4u; w++) {
+            uint word = packed[w];
+            for (uint k = 0; k < 2u; k++) {
+                float4 xv = float4(x[w * 2u + k]);
+                float4 q = group_q(word, k);
+                if (five) { q += group_high(bits, w * 8u + k * 4u); }
+                qx += dot(q, xv);
+                xs += sum4(xv);
+            }
+        }
+        return float2(qx, xs);
+    }
+
+    // 1 トークン: 1 つの SIMD グループ（32 スレッド）で 1 行。スレッドごとに組を受け持つ
+    inline void linear_group_vector(device const uchar *nibbles, device const half2 *params, device const float *bias,
+                                    device const float *input, device float *output, device const uint *high,
+                                    constant Args &a, uint row, uint lane, bool five) {
+        if (row >= a.rows) { return; }
+        uint groups = a.columns >> 5;
+        device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
+        device const uint4 *blocks = (device const uint4 *)nibbles;
+        float acc = 0.0f;
+        for (uint g = lane; g < groups; g += 32u) {
+            uint block = row * groups + g;
+            float2 p = float2(params[block]);
+            float2 d = group_dot(blocks[block], five ? high[block] : 0u, five, x + g * 8u);
+            acc += p.x * d.x + p.y * d.y;
+        }
+        float sum = simd_sum(acc);
+        if (lane == 0u) {
+            if ((a.flags & 2u) != 0u) { sum += bias[row]; }
+            output[a.outOffset + row] = sum;
+        }
+    }
+
+    kernel void linear_q4_vector(device const uchar *nibbles [[buffer(0)]],
+                                 device const half2 *params [[buffer(1)]],
+                                 device const float *bias [[buffer(2)]],
+                                 device const float *input [[buffer(3)]],
+                                 device float *output [[buffer(4)]],
+                                 device const uint *high [[buffer(5)]],
+                                 constant Args &a [[buffer(6)]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        linear_group_vector(nibbles, params, bias, input, output, high, a, row, lane, false);
+    }
+
+    kernel void linear_q5_vector(device const uchar *nibbles [[buffer(0)]],
+                                 device const half2 *params [[buffer(1)]],
+                                 device const float *bias [[buffer(2)]],
+                                 device const float *input [[buffer(3)]],
+                                 device float *output [[buffer(4)]],
+                                 device const uint *high [[buffer(5)]],
+                                 constant Args &a [[buffer(6)]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        linear_group_vector(nibbles, params, bias, input, output, high, a, row, lane, true);
+    }
+
+    // トークン 4 個ぶんを 1 スレッドで（重みを読み、q に直すのが 1 回で済む）。gid.x = 行、gid.y = トークン ÷ 4。1 トークンでも使える
+    inline void linear_group_batch(device const uchar *nibbles, device const half2 *params, device const float *bias,
+                                   device const float *input, device float *output, device const uint *high,
+                                   constant Args &a, uint2 gid, bool five) {
+        uint row = gid.x;
+        uint first = gid.y * 4u;
+        if (row >= a.rows || first >= a.count) { return; }
+        uint last = a.count - 1u;
+        uint n1 = min(first + 1u, last);
+        uint n2 = min(first + 2u, last);
+        uint n3 = min(first + 3u, last);
+        uint groups = a.columns >> 5;
+        device const float *base = input + a.inOffset;
+        device const packed_float4 *x0 = (device const packed_float4 *)(base + first * a.inStride);
+        device const packed_float4 *x1 = (device const packed_float4 *)(base + n1 * a.inStride);
+        device const packed_float4 *x2 = (device const packed_float4 *)(base + n2 * a.inStride);
+        device const packed_float4 *x3 = (device const packed_float4 *)(base + n3 * a.inStride);
+        device const uint4 *blocks = (device const uint4 *)nibbles;
+        float4 sums = float4(0.0f);
+        for (uint g = 0; g < groups; g++) {
+            uint block = row * groups + g;
+            uint4 packed = blocks[block];
+            uint bits = five ? high[block] : 0u;
+            float2 p = float2(params[block]);
+            float4 qx = float4(0.0f);
+            float4 xs = float4(0.0f);
+            for (uint w = 0; w < 4u; w++) {
+                uint word = packed[w];
+                for (uint k = 0; k < 2u; k++) {
+                    float4 q = group_q(word, k);
+                    if (five) { q += group_high(bits, w * 8u + k * 4u); }
+                    uint i = g * 8u + w * 2u + k;
+                    float4 v0 = float4(x0[i]), v1 = float4(x1[i]), v2 = float4(x2[i]), v3 = float4(x3[i]);
+                    qx += float4(dot(q, v0), dot(q, v1), dot(q, v2), dot(q, v3));
+                    xs += float4(sum4(v0), sum4(v1), sum4(v2), sum4(v3));
+                }
+            }
+            sums += p.x * qx + p.y * xs;
+        }
+        if ((a.flags & 2u) != 0u) { sums += bias[row]; }
+        device float *out = output + a.outOffset + row;
+        out[first * a.outStride] = sums.x;
+        if (first + 1u <= last) { out[(first + 1u) * a.outStride] = sums.y; }
+        if (first + 2u <= last) { out[(first + 2u) * a.outStride] = sums.z; }
+        if (first + 3u <= last) { out[(first + 3u) * a.outStride] = sums.w; }
+    }
+
+    kernel void linear_q4_batch(device const uchar *nibbles [[buffer(0)]],
+                                device const half2 *params [[buffer(1)]],
+                                device const float *bias [[buffer(2)]],
+                                device const float *input [[buffer(3)]],
+                                device float *output [[buffer(4)]],
+                                device const uint *high [[buffer(5)]],
+                                constant Args &a [[buffer(6)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+        linear_group_batch(nibbles, params, bias, input, output, high, a, gid, false);
+    }
+
+    kernel void linear_q5_batch(device const uchar *nibbles [[buffer(0)]],
+                                device const half2 *params [[buffer(1)]],
+                                device const float *bias [[buffer(2)]],
+                                device const float *input [[buffer(3)]],
+                                device float *output [[buffer(4)]],
+                                device const uint *high [[buffer(5)]],
+                                constant Args &a [[buffer(6)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+        linear_group_batch(nibbles, params, bias, input, output, high, a, gid, true);
     }
 
     // 正規化（RMSNorm か LayerNorm）。gid = 行（rows 行 × columns）。入力と出力は同じ場所でもよい。

@@ -90,8 +90,8 @@ final class MappedFile {
 
 /// GGUF の重みを、このアプリの推論用に変換して保存したファイル（.llw）。
 ///
-/// 行列は「1 行ごとに倍率を持つ 8 ビット整数」にして置く（1 パラメータ 1 バイト）。
-/// 4 ビットなどの量子化を毎回ほどくより速く、Float32 のまま置くより 4 倍小さい。
+/// 行列は、元の GGUF が 4 ビットなら 4 ビット、5 ビットなら 5 ビット（GGUFGroupQuant。1 パラメータ 0.625・0.75 バイト）、
+/// それ以外は「1 行ごとに倍率を持つ 8 ビット整数」（1 パラメータ 1 バイト）にして置く。
 /// 正規化の重みやバイアスなどの小さなものは Float32 のまま置く。
 struct GGUFWeightStore {
     static let magic: [UInt8] = [0x4C, 0x4C, 0x57, 0x31]   // "LLW1"
@@ -110,6 +110,10 @@ struct GGUFWeightStore {
         var scalesOffset: Int?
         /// raw のときの GGUF の量子化の形式
         var rawType: UInt32? = nil
+        /// q5Groups の 5 ビット目の面の位置
+        var highOffset: Int? = nil
+        /// q4Groups・q5Groups の倍率と下限の面の位置
+        var paramsOffset: Int? = nil
     }
 
     struct Header: Codable, Equatable, Sendable {
@@ -158,8 +162,10 @@ struct GGUFWeightStore {
         let scales = entry.scalesOffset.map { (base + $0).assumingMemoryBound(to: Float.self) }
         let rawType = entry.rawType.flatMap { GGUFTensorType(rawValue: $0) }
         if entry.storage == .raw && rawType == nil { throw GGUFError.invalid("raw tensor type of \(name)") }
+        if entry.storage.isGrouped && entry.paramsOffset == nil { throw GGUFError.invalid("group params of \(name)") }
         return GGUFMatrix(rows: entry.rows, columns: entry.columns, storage: entry.storage, data: base + entry.offset, scales: scales,
-                          rawType: rawType)
+                          rawType: rawType, highBits: entry.highOffset.map { UnsafeRawPointer(base + $0) },
+                          groupParams: entry.paramsOffset.map { UnsafeRawPointer(base + $0) })
     }
 
     /// Float32 のベクトル（正規化の重み・バイアスなど）。無ければ nil
@@ -201,11 +207,29 @@ struct GGUFWeightStore {
             if isMatrix && compact && GGUFModelConfig.isRawTensor(name) && tensor.type != nil { storage = .raw }
             let rows = isMatrix ? tensor.rows : 1
             let columns = isMatrix ? tensor.columns : tensor.elementCount
+            // 元が 4 ビットなら 4 ビット、5 ビットなら 5 ビットのまま（6 ビット以上は 8 ビット）
+            if storage == .int8Rows, columns % GGUFGroupQuant.groupSize == 0,
+               let type = tensor.type, let grouped = GGUFGroupQuant.storage(for: type) {
+                storage = grouped
+            }
             offset = aligned(offset, to: alignment)
             var entry = Entry(name: name, storage: storage, rows: rows, columns: columns, offset: offset, scalesOffset: nil)
             if storage == .raw {
                 entry.rawType = tensor.typeCode
                 offset += tensor.byteCount ?? 0
+                entries.append(entry)
+                continue
+            }
+            if storage.isGrouped {
+                offset += GGUFGroupQuant.nibbleBytes(rows: rows, columns: columns)
+                if storage == .q5Groups {
+                    offset = aligned(offset, to: alignment)
+                    entry.highOffset = offset
+                    offset += GGUFGroupQuant.highBytes(rows: rows, columns: columns)
+                }
+                offset = aligned(offset, to: alignment)
+                entry.paramsOffset = offset
+                offset += GGUFGroupQuant.paramBytes(rows: rows, columns: columns)
                 entries.append(entry)
                 continue
             }
@@ -292,6 +316,14 @@ enum GGUFConverter {
                 continue
             }
             let rowBytes = byteCount / entry.rows
+            if entry.storage.isGrouped {
+                try writeGrouped(entry, type: type, source: mapped.pointer + start, rowBytes: rowBytes, handle: handle,
+                                 written: &written, isCancelled: isCancelled) { rows in
+                    doneElements += rows * entry.columns
+                    progress?(Double(doneElements) / Double(totalElements))
+                }
+                continue
+            }
             var scales = [Float](repeating: 0, count: entry.storage == .int8Rows ? entry.rows : 0)
             var row = 0
             while row < entry.rows {
@@ -319,6 +351,78 @@ enum GGUFConverter {
         finished = true
         progress?(1)
         return config
+    }
+
+    /// 4・5 ビットの行列を書く: 下位 4 ビットの面は少しずつ書き、5 ビット目と倍率の面は（小さいので）ためてから書く
+    private static func writeGrouped(_ entry: GGUFWeightStore.Entry, type: GGUFTensorType, source: UnsafeRawPointer, rowBytes: Int,
+                                     handle: FileHandle, written: inout Int, isCancelled: (() -> Bool)?,
+                                     progress: (Int) -> Void) throws {
+        let columns = entry.columns
+        let bits = GGUFGroupQuant.bits(entry.storage)
+        let groups = columns / GGUFGroupQuant.groupSize
+        var high = [UInt8](repeating: 0, count: bits == 5 ? GGUFGroupQuant.highBytes(rows: entry.rows, columns: columns) : 0)
+        var params = [UInt16](repeating: 0, count: entry.rows * groups * 2)
+        let threads = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+        let rowsPerChunk = max(threads, min(entry.rows, (1 << 22) / max(columns, 1)))
+        let nibbles = UnsafeMutablePointer<UInt8>.allocate(capacity: rowsPerChunk * columns / 2)
+        defer { nibbles.deallocate() }
+        let scratches = (0..<threads).map { _ in GGUFGroupQuant.Scratch(columns: columns) }
+        let lock = NSLock()
+        var failure: Error?
+        var row = 0
+        while row < entry.rows {
+            if isCancelled?() == true { throw CancellationError() }
+            let count = min(rowsPerChunk, entry.rows - row)
+            let first = row
+            let perThread = (count + threads - 1) / threads
+            high.withUnsafeMutableBufferPointer { highBuffer in
+                params.withUnsafeMutableBufferPointer { paramBuffer in
+                    let highBase = highBuffer.baseAddress, paramBase = paramBuffer.baseAddress!
+                    DispatchQueue.concurrentPerform(iterations: threads) { job in
+                        let start = job * perThread
+                        let end = min(count, start + perThread)
+                        guard start < end else { return }
+                        do {
+                            for local in start..<end {
+                                let r = first + local
+                                let target = GGUFGroupQuant.RowTarget(
+                                    nibbles: nibbles + local * columns / 2,
+                                    high: highBase.map { $0 + r * columns / 8 },
+                                    params: paramBase + r * groups * 2)
+                                try GGUFGroupQuant.packRow(type: type, source: source + r * rowBytes, columns: columns, bits: bits,
+                                                           into: target, scratch: scratches[job])
+                            }
+                        } catch {
+                            lock.lock()
+                            failure = error
+                            lock.unlock()
+                        }
+                    }
+                }
+            }
+            if let failure { throw failure }
+            let bytes = count * columns / 2
+            try handle.write(contentsOf: Data(bytesNoCopy: nibbles, count: bytes, deallocator: .none))
+            written += bytes
+            row += count
+            progress(count)
+        }
+        func pad(to offset: Int) throws {
+            if offset > written {
+                try handle.write(contentsOf: Data(count: offset - written))
+                written = offset
+            }
+        }
+        if let highOffset = entry.highOffset {
+            try pad(to: highOffset)
+            try high.withUnsafeBytes { try handle.write(contentsOf: Data($0)) }
+            written += high.count
+        }
+        if let paramsOffset = entry.paramsOffset {
+            try pad(to: paramsOffset)
+            try params.withUnsafeBytes { try handle.write(contentsOf: Data($0)) }
+            written += params.count * 2
+        }
     }
 
     private static func copyRaw(from source: UnsafeRawPointer, count: Int, to handle: FileHandle, isCancelled: (() -> Bool)?) throws {

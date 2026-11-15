@@ -725,29 +725,49 @@ llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推�
 - `GGUFQuant`: 量子化された重みを Float に戻す（llama.cpp の `dequantize_row_*` と同じ計算）。
   F32 / F16 / BF16、Q4_0〜Q8_0、Q2_K〜Q6_K、IQ4_NL / IQ4_XS、IQ2_XXS / XS / S、IQ3_XXS / S。
   IQ2 / IQ3 の表は `Tools/gguf/make_quant_tables.py` が gguf パッケージから作る（`GGUFQuantTables`）。
-- `GGUFModelConfig`: メタデータから構造を決める。系列は llama / qwen2 / qwen3 / gemma / gemma2 / gemma3 / phi3。
-  違いは、RoPE の組の取り方（隣どうし / 前半と後半）、q・k のバイアス、ヘッドごとの q・k の正規化、
-  注意・FFN の出力の正規化、埋め込みの倍率、tanh での上限（soft-capping）、直近だけを見る層（sliding window）とその RoPE の底、
-  q・k・v や gate・up が 1 つの行列にまとまっているか。
+- `GGUFModelConfig`（`GGUFModelConfigReader`）: メタデータと重みの一覧から構造を決める（llama.cpp の load_hparams と graph と同じ規則）。
+  計算する側は系列の名前を見ず、ここにある値と印だけで計算する:
+  層ごとの形（ヘッドの数・大きさ・FFN の大きさ・RoPE を使うか・直近だけを見る層か・KV キャッシュを持つ層。Gemma 4・OpenELM）、
+  正規化の種類（RMSNorm / LayerNorm・バイアス・重みの無い正規化）、注意と FFN を並列に足すか（Phi-2・Falcon・Command R）、
+  FFN の形（gate あり / なし・SiLU / GELU / ReLU²・gate と up が 1 つの行列）、学習した位置の埋め込み（GPT-2）、
+  q・k の正規化（ヘッドごと・ヘッドごとに違う重み・全体・RoPE の前か後か）、v の正規化と KV の共有と層ごとの入力（Gemma 4）、
+  注意・FFN の後ろの正規化、埋め込み・残差・logits の倍率、tanh での上限、直近だけを見る層とその RoPE の底・倍率、YaRN。
+  新しく足した値は、前の版で変換したファイルに無いので、読むときに既定の値を入れる（`init(from:)`）。
+- `GGUFRope`: 全体を見る層・直近だけを見る層の周波数（rope_freqs での割り算・線形の伸ばし方・YaRN の混ぜ方と cos / sin の倍率）。
 - `GGUFConverter` → `GGUFWeightStore`（.llw）: 重みを「1 行ごとに倍率を持つ 8 ビット整数」にして保存する（1 パラメータ 1 バイト）。
   4 ビットのブロックを毎トークンほどくより速く、Float32 のまま置くより 4 倍小さい。ファイルは mmap で読むので、
   アプリのメモリ使用量（iOS が強制終了を決める量）にはほとんど数えられない。正規化の重みやバイアスは Float32 のまま。
   変換は行のまとまりごとに並列に行う。
 - `GGUFKernels`: 線形層は、行のまとまり（CPU のキャッシュに収まる大きさ）ごとに整数を Float に直して BLAS（sgemv / sgemm）に渡し、
   結果に行ごとの倍率を掛ける。行の範囲をスレッドに分けて並列に計算する。Linux のテストでは素朴なループ。
-- `GGUFModel`: 順伝播と KV キャッシュ。プロンプトは 64 トークンずつまとめて計算し、最後のトークンだけ出力層を通す。
+- `GGUFModel`（CPU）: 順伝播と KV キャッシュ。プロンプトは 64 トークンずつまとめて計算し、最後のトークンだけ出力層を通す。
   KV キャッシュは [kvHead][位置][headSize] の並びで、使った位置のページだけが実メモリになる。巻き戻しは長さを変えるだけ。
+- `GGUFMetalModel`（GPU）: 同じ流れを Metal の計算シェーダー（`GGUFMetalSource`。アプリの中でコンパイル）で行う。
+  重みは mmap したファイルを `makeBuffer(bytesNoCopy:)` でそのまま GPU から読む。1 回の計算（1 トークン、または読み込みの
+  1 まとまり）を 1 つの命令列にまとめる。埋め込み・層ごとの入力の表を引くのと RoPE の表は CPU で用意する。
+  KV キャッシュは [位置][kvHead][headSize] の並びで、k・v の線形層がキャッシュの続きに直接書く。
+- `GGUFModelFactory`: GPU で計算できれば GPU 用を作り、読み込んだ最初の 1 回だけ数トークンで CPU と結果を比べる
+  （合わなければ CPU 用にする）。`GGUFLanguageModel` は、計算の途中で GPU が失敗したら、その回を CPU で計算し直す。
+- 量子化のまま置く表: Gemma 4 の層ごとの入力の表（per_layer_token_embd。E2B で約 23 億パラメータ）は、トークンごとに 1 行引くだけなので、
+  GGUF の量子化のまま保存して、引くときに 1 行だけ戻す（変換後のファイルが小さくなり、ほとんど読まないのでメモリの見積もりにも入れない）。
 - `GGUFTokenizer`: GGUF の語彙・スコア / 結合規則・トークンの種類・チャットテンプレートから、tokenizer.json などを作る。
-  SentencePiece（"llama"）とバイト単位の BPE（"gpt2"。前処理は qwen2・llama-bpe・smollm・tekken などの系統ごと）。
+  SentencePiece（"llama"）、バイト単位の BPE（"gpt2"。前処理は qwen2・llama-bpe・smollm・tekken などの系統ごと）、
+  Gemma 4（"gemma4"。空白を ▁ にして、改行で区切った行ごとに BPE。無い文字は <0xXX>）。
+  生成を止めるトークンには、llama.cpp と同じく決まった名前のトークン（<turn|>・<end_of_turn>・<|im_end|> など）も入れる。
 - `GGUFSummary` / `GGUFNaming`: 画面に出す情報（構造・パラメータ数・変換後の大きさ・動かせない理由）と、ファイル名からの量子化の読み取り。
 
 確かめ方（`Tests/LocalLLMCoreTests/GGUF`、正解は `Tests/GGUFFixtures`）:
 
 - 量子化の復元は、形式ごとに乱数のブロックを gguf パッケージ（Python）と突き合わせる。
-- 7 系列それぞれの小さな乱数モデルで、各位置の logits が llama.cpp と一致する（SiLU の系列は 1e-3、GELU の系列は 1e-2 以内。
-  llama.cpp は GELU を半精度の表で計算するため）。まとめて読み込んだとき・巻き戻したときも同じ。
-- 本物のモデル（SmolLM2 135M の Q4_K_M / Q8_0）で、llama.cpp と同じ続きを貪欲に生成する。CI の macOS では速さも出力する。
+- 47 の構造それぞれの小さな乱数モデル（`Tools/gguf/make_fixtures.py`・`make_arch_fixtures.py`）で、各位置の logits が
+  llama.cpp と一致する（多くは 1e-5 ほど。GELU の系列は、llama.cpp が GELU を半精度の表で計算するぶん 1e-2 ほどずれる）。
+  まとめて読み込んだとき・巻き戻したときも同じ。Gemma 4 は GELU を多く使うので、同じ計算を numpy で書いたもの
+  （半精度の GELU を真似ると llama.cpp と 1e-3 で一致する）の、正確な GELU の値と 1e-4 以内で比べる。
+- GPU（Metal）は、すべての構造で CPU と同じ logits になるかを macOS の CI で確かめる（Float32 のままと 8 ビットの両方）。
+- 本物のモデル（SmolLM2 135M・Qwen2.5 0.5B / 1.5B・Qwen3 0.6B・Gemma 3 1B・Llama 3.2 1B・Gemma 4 E2B）で、
+  llama.cpp と同じ続きを貪欲に生成する（CI では SmolLM2 と Qwen2.5 1.5B。速さも出力する）。
 - トークナイザは、9 つの実在モデルの GGUF（先頭 16MB）から作ったものを、元の tokenizer.json と突き合わせる。
+  Gemma 4 は、llama.cpp が分けたトークン（`Tools/gguf/make_token_fixtures.py`）と突き合わせる。
 
 アプリ側: `ModelLibrary` がダウンロード（または「ファイル」からの取り込み）のあとに変換し、元の GGUF を消す。
 `GGUFLanguageModel`（Engine）が `LanguageModelRunner` として生成ループにつなぐ（共通の先頭部分の再利用・取り消し・メモリの確認）。
@@ -758,6 +778,10 @@ llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推�
 - `DPMSolverScheduler`: DPM-Solver++（2M）。diffusers の DPMSolverMultistepScheduler と、時刻の並びも各ステップの結果も一致する。
 - `ImageRepoLayout`: リポジトリから、TextEncoder / Unet / VAEDecoder の .mlmodelc と語彙のファイルを選ぶ（Neural Engine 向けの split_einsum を優先）。
 - `ImageGenerator`（Engine）: テキストエンコーダ → UNet（否定とプロンプトを 1 回で計算し、強さを掛けて合成）→ VAE デコーダ。
+  部品（`DiffusionText`・`DiffusionUNet`・`DiffusionDecoder`）は、動画生成でも使う。
+- `VideoFrames`（Core）/ `VideoGenerator`（Engine）: 動画。キーフレームの潜在表現を UNet で全部描いてから（変化: ノイズを球面補間し、
+  プロンプトの特徴を線形補間する。カメラ: 前のコマの潜在表現をズーム・移動・回転させ、その強さの段階までノイズを足して途中から描き直す）、
+  VAE で画像にし、キーフレームの間を混ぜたコマを挟んで、AVAssetWriter で MP4（H.264）に書き出す。モデルは 1 つずつしか読み込まない。
   3 つのモデルは同時に読み込まず、使い終わったら手放す。入力の型（Float16 / Float32）と形はモデルの記述から決める。
 - `ImageModelStore` / `ImageStudio`: モデルのダウンロード、生成の状態、作った画像の保存（Documents/Images と index.json）。
 

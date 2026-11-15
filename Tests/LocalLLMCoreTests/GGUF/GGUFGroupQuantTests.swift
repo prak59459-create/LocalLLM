@@ -131,7 +131,7 @@ final class GGUFGroupQuantTests: XCTestCase {
             let count = 3
             let input = (0..<(count * columns)).map { _ in Float.random(in: -1...1, using: &generator) }
             let workers = GGUFWorkers(chunkCount: 4, widestRow: columns)
-            try withMatrix(&packed, rows: rows, columns: columns, storage: storage) { matrix in
+            withMatrix(&packed, rows: rows, columns: columns, storage: storage) { matrix in
                 var dense = [Float](repeating: 0, count: rows * columns)
                 dense.withUnsafeMutableBufferPointer { buffer in
                     for r in 0..<rows { GGUFGroupQuant.dequantizeRow(matrix, row: r, into: buffer.baseAddress! + r * columns) }
@@ -148,6 +148,20 @@ final class GGUFGroupQuantTests: XCTestCase {
                         for c in 0..<columns { sum += dense[r * columns + c] * input[n * columns + c] }
                         XCTAssertEqual(output[n * rows + r], sum, accuracy: 1e-3 * max(1, abs(sum)), "\(storage) n\(n) r\(r)")
                     }
+                }
+                // 作業用の場所が足りないとき（とても長い行）は 1 行ずつの計算になるが、同じ結果
+                var narrow = [Float](repeating: .nan, count: count * rows)
+                var room = [Float](repeating: 0, count: columns + 8)
+                input.withUnsafeBufferPointer { x in
+                    narrow.withUnsafeMutableBufferPointer { y in
+                        room.withUnsafeMutableBufferPointer { scratch in
+                            GGUFGroupQuant.linear(matrix, 0..<rows, input: x.baseAddress!, count: count, output: y.baseAddress!,
+                                                  stride: rows, scratch: scratch.baseAddress!, capacity: scratch.count)
+                        }
+                    }
+                }
+                for index in output.indices {
+                    XCTAssertEqual(narrow[index], output[index], accuracy: 1e-3 * max(1, abs(output[index])), "\(storage) narrow \(index)")
                 }
                 // 一部の行だけ（q・k・v が 1 つの行列のときに使う）
                 let part = matrix.slice(5..<17)

@@ -73,6 +73,15 @@ final class GGUFQuantTests: XCTestCase {
 
 final class GGUFModelTests: XCTestCase {
     static let families = ["llama", "qwen2", "qwen3", "gemma", "gemma2", "gemma3", "phi3"]
+    /// Tools/gguf/make_arch_fixtures.py で作った、ほかの構造
+    static let moreFamilies = [
+        "mistral3", "internlm2", "xverse", "ernie4_5", "granite", "minicpm", "arcee", "smollm3", "maincoder",
+        "qwen", "qwen2vl", "qwen3vl", "exaone", "exaone4", "olmo", "olmo2", "seed_oss", "plamo", "openelm",
+        "phi2", "gpt2", "starcoder", "starcoder2", "stablelm", "stablelm-par", "gptneox", "gptneox-seq", "falcon",
+        "falcon-40b", "codeshell", "orion", "nemotron", "jais2", "command-r", "cohere2", "chatglm", "glm4",
+        "llama-yarn", "llama-linear", "gemma4",
+    ]
+    static var allFamilies: [String] { families + moreFamilies }
 
     private func load(_ family: String, compact: Bool, chunks: Int? = nil) throws -> (GGUFModel, URL) {
         let source = GGUFFixtures.root.appendingPathComponent("tiny-\(family).gguf")
@@ -81,11 +90,12 @@ final class GGUFModelTests: XCTestCase {
         return (try GGUFModel(store: try GGUFWeightStore(url: destination), chunkCount: chunks), destination)
     }
 
-    private func reference(_ family: String) throws -> (tokens: [Int], logits: [[Float]]) {
+    /// exact: llama.cpp の代わりに、正確な GELU で計算した numpy の値（ある構造だけ。Gemma 4）
+    private func reference(_ family: String, exact: Bool = false) throws -> (tokens: [Int], logits: [[Float]]) {
         let json = try GGUFFixtures.json("tiny-\(family).json")
         let tokens = try XCTUnwrap(json["tokens"] as? [Int])
         let vocab = try XCTUnwrap(json["vocab"] as? Int)
-        let flat = try GGUFFixtures.floats(json["logits"])
+        let flat = try GGUFFixtures.floats(exact ? json["exact"] : json["logits"])
         XCTAssertEqual(flat.count, tokens.count * vocab)
         return (tokens, (0..<tokens.count).map { Array(flat[($0 * vocab)..<(($0 + 1) * vocab)]) })
     }
@@ -110,6 +120,28 @@ final class GGUFModelTests: XCTestCase {
             }
             XCTAssertEqual(model.length, expected.tokens.count)
         }
+    }
+
+    /// ほかの構造も、llama.cpp と同じ logits になる（1 トークンずつと、まとめての読み込み）
+    func testMoreArchitecturesMatchLlamaCpp() throws {
+        var failures: [String] = []
+        for family in Self.moreFamilies {
+            let (model, file) = try load(family, compact: false)
+            defer { try? FileManager.default.removeItem(at: file) }
+            // Gemma 4 は GELU を多く使うので、llama.cpp の半精度の表との差が大きい。正確な GELU の numpy の値と比べる
+            let hasExact = (try GGUFFixtures.json("tiny-\(family).json"))["exact"] != nil
+            let expected = try reference(family, exact: hasExact)
+            let tolerance: Float = hasExact ? 1e-4 : 0.002 * max(1, expected.logits[0].map { abs($0) }.max() ?? 1)
+            var worst: Float = 0
+            for (position, token) in expected.tokens.enumerated() {
+                worst = max(worst, maxDifference(try model.evaluate([token]), expected.logits[position]))
+            }
+            model.releaseCache()
+            let batched = maxDifference(try model.evaluate(expected.tokens, batch: 5), expected.logits[expected.tokens.count - 1])
+            if worst > tolerance || batched > tolerance { failures.append("\(family): \(worst) / \(batched)") }
+            print("GGUF \(family): worst difference from llama.cpp \(worst), batched \(batched)")
+        }
+        XCTAssertEqual(failures, [])
     }
 
     /// まとめて読み込んでも（プロンプトの読み込み）、途中で巻き戻しても同じ結果になる

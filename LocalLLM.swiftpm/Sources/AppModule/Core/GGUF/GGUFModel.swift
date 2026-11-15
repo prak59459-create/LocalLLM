@@ -1,142 +1,13 @@
 import Foundation
 
-/// 必要になったら大きくする Float の作業用メモリ。
-final class GGUFBuffer {
-    private(set) var pointer: UnsafeMutablePointer<Float>
-    private(set) var capacity: Int
-
-    init(_ capacity: Int = 0) {
-        self.capacity = max(capacity, 16)
-        pointer = .allocate(capacity: self.capacity)
-    }
-
-    deinit { pointer.deallocate() }
-
-    /// count 個入るようにする（中身は引き継がない）
-    @discardableResult
-    func reserve(_ count: Int) -> UnsafeMutablePointer<Float> {
-        if count > capacity {
-            pointer.deallocate()
-            capacity = count
-            pointer = .allocate(capacity: count)
-        }
-        return pointer
-    }
-}
-
-/// 1 層ぶんの重み（保存ファイルの中身を指す）。CPU 用と GPU 用のどちらの計算でも使う。
-struct GGUFLayerWeights {
-    var attentionNorm: UnsafePointer<Float>
-    var query: GGUFMatrix
-    var key: GGUFMatrix
-    var value: GGUFMatrix
-    var queryBias: UnsafePointer<Float>?
-    var keyBias: UnsafePointer<Float>?
-    var valueBias: UnsafePointer<Float>?
-    var output: GGUFMatrix
-    var outputBias: UnsafePointer<Float>?
-    var queryNorm: UnsafePointer<Float>?
-    var keyNorm: UnsafePointer<Float>?
-    var postAttentionNorm: UnsafePointer<Float>?
-    var feedForwardNorm: UnsafePointer<Float>
-    var gate: GGUFMatrix
-    var up: GGUFMatrix
-    var down: GGUFMatrix
-    var gateBias: UnsafePointer<Float>?
-    var upBias: UnsafePointer<Float>?
-    var downBias: UnsafePointer<Float>?
-    var postFeedForwardNorm: UnsafePointer<Float>?
-
-    static func load(_ index: Int, store: GGUFWeightStore, config: GGUFModelConfig) throws -> GGUFLayerWeights {
-        let prefix = "blk.\(index)."
-        let q = config.querySize, kv = config.kvSize, ff = config.feedForwardSize
-        var query: GGUFMatrix, key: GGUFMatrix, value: GGUFMatrix
-        var queryBias: UnsafePointer<Float>?, keyBias: UnsafePointer<Float>?, valueBias: UnsafePointer<Float>?
-        if config.hasFusedQKV {
-            let fused = try store.matrix(prefix + "attn_qkv.weight")
-            query = fused.slice(0..<q)
-            key = fused.slice(q..<(q + kv))
-            value = fused.slice((q + kv)..<(q + 2 * kv))
-            if let bias = store.vector(prefix + "attn_qkv.bias") {
-                queryBias = bias
-                keyBias = bias + q
-                valueBias = bias + q + kv
-            }
-        } else {
-            query = try store.matrix(prefix + "attn_q.weight")
-            key = try store.matrix(prefix + "attn_k.weight")
-            value = try store.matrix(prefix + "attn_v.weight")
-        }
-        queryBias = queryBias ?? store.vector(prefix + "attn_q.bias")
-        keyBias = keyBias ?? store.vector(prefix + "attn_k.bias")
-        valueBias = valueBias ?? store.vector(prefix + "attn_v.bias")
-
-        var gate: GGUFMatrix, up: GGUFMatrix
-        if config.hasFusedGateUp {
-            let fused = try store.matrix(prefix + "ffn_up.weight")
-            gate = fused.slice(0..<ff)
-            up = fused.slice(ff..<(2 * ff))
-        } else {
-            gate = try store.matrix(prefix + "ffn_gate.weight")
-            up = try store.matrix(prefix + "ffn_up.weight")
-        }
-        return GGUFLayerWeights(
-            attentionNorm: try store.requiredVector(prefix + "attn_norm.weight"),
-            query: query, key: key, value: value,
-            queryBias: queryBias, keyBias: keyBias, valueBias: valueBias,
-            output: try store.matrix(prefix + "attn_output.weight"),
-            outputBias: store.vector(prefix + "attn_output.bias"),
-            queryNorm: config.hasQKNorm ? try store.requiredVector(prefix + "attn_q_norm.weight") : nil,
-            keyNorm: config.hasQKNorm ? try store.requiredVector(prefix + "attn_k_norm.weight") : nil,
-            postAttentionNorm: config.hasPostNorms ? try store.requiredVector(prefix + "post_attention_norm.weight") : nil,
-            feedForwardNorm: try store.requiredVector(prefix + "ffn_norm.weight"),
-            gate: gate, up: up,
-            down: try store.matrix(prefix + "ffn_down.weight"),
-            gateBias: config.hasFusedGateUp ? nil : store.vector(prefix + "ffn_gate.bias"),
-            upBias: config.hasFusedGateUp ? nil : store.vector(prefix + "ffn_up.bias"),
-            downBias: store.vector(prefix + "ffn_down.bias"),
-            postFeedForwardNorm: config.hasPostNorms ? try store.requiredVector(prefix + "post_ffw_norm.weight") : nil
-        )
-    }
-}
-
-/// GGUF のモデルを計算するもの（CPU 用の GGUFModel と、GPU 用の GGUFMetalModel）。
-protocol GGUFEvaluator: AnyObject {
-    var config: GGUFModelConfig { get }
-    /// 扱える最大のトークン数
-    var maxContext: Int { get }
-    /// KV キャッシュに入っているトークン数
-    var length: Int { get }
-    /// どこで計算しているか（画面に出す）
-    var computeDescription: String { get }
-    func truncate(to newLength: Int)
-    func releaseCache()
-    /// tokens を今の系列の後ろに足して計算し、最後のトークンの次の logits を返す
-    @discardableResult
-    func evaluate(_ tokens: [Int], batch: Int, progress: ((Int) throws -> Void)?) throws -> [Float]
-}
-
-extension GGUFEvaluator {
-    @discardableResult
-    func evaluate(_ tokens: [Int], batch: Int = GGUFModel.maxBatch) throws -> [Float] {
-        try evaluate(tokens, batch: batch, progress: nil)
-    }
-
-    /// evaluate に渡すトークンの確認（どの計算でも同じ）
-    func validate(_ tokens: [Int]) throws {
-        guard !tokens.isEmpty else { throw GGUFError.invalid("no tokens") }
-        guard length + tokens.count <= maxContext else {
-            throw GGUFError.invalid(L("コンテキストの上限（\(maxContext) トークン）を超えました", "context limit of \(maxContext) tokens exceeded"))
-        }
-        if let bad = tokens.first(where: { $0 < 0 || $0 >= config.vocabSize }) { throw GGUFError.invalid("token id \(bad)") }
-    }
-}
-
-/// GGUF から変換した重みで、トランスフォーマーの計算（順伝播）を行う。KV キャッシュを持つ。
+/// GGUF から変換した重みで、トランスフォーマーの計算（順伝播）を CPU で行う。KV キャッシュを持つ。
 ///
-/// llama.cpp の llama / qwen2 / qwen3 / gemma / gemma2 / gemma3 / phi3 と同じ計算の流れ。
-/// スレッドセーフではないので、1 つの場所から順番に使う。
+/// 計算の流れは llama.cpp と同じ。系列ごとの違いは GGUFModelConfig の値と印（正規化の種類・並列の残差・
+/// 層ごとの形・KV の共有・層ごとの入力など）で表す。スレッドセーフではないので、1 つの場所から順番に使う。
 final class GGUFModel: GGUFEvaluator {
+    typealias In = UnsafePointer<Float>
+    typealias Out = UnsafeMutablePointer<Float>
+
     let config: GGUFModelConfig
     /// 扱える最大のトークン数（KV キャッシュの大きさ）
     let maxContext: Int
@@ -145,27 +16,26 @@ final class GGUFModel: GGUFEvaluator {
 
     private let store: GGUFWeightStore
     private let workers: GGUFWorkers
+    private let shapes: [GGUFModelConfig.Layer]
     private let layers: [GGUFLayerWeights]
-    private let embedding: GGUFMatrix
-    private let outputMatrix: GGUFMatrix
-    private let outputNorm: UnsafePointer<Float>
-    private let outputBias: UnsafePointer<Float>?
+    private let globals: GGUFGlobalWeights
 
-    /// 層ごとの KV キャッシュ: [kvHead][位置][headSize]（使った位置のページだけが実メモリになる）
-    private var keys: [UnsafeMutablePointer<Float>] = []
-    private var values: [UnsafeMutablePointer<Float>] = []
+    /// 層ごとの KV キャッシュ: [kvHead][位置][headSize]（使った位置のページだけが実メモリになる）。借りる層は nil
+    private var keys: [Out?] = []
+    private var values: [Out?] = []
 
-    /// RoPE の周波数（位置に掛ける値）。全体を見る層用と、直近だけを見る層用
-    private let frequencies: [Float]
-    private let slidingFrequencies: [Float]
+    /// RoPE の表。全体を見る層用と、直近だけを見る層用
+    private let fullRope: GGUFRope.Table
+    private let slidingRope: GGUFRope.Table
 
     // 作業用
-    private let hidden = GGUFBuffer(), normed = GGUFBuffer()
+    private let hidden = GGUFBuffer(), normed = GGUFBuffer(), normed2 = GGUFBuffer()
     private let queries = GGUFBuffer(), newKeys = GGUFBuffer(), newValues = GGUFBuffer()
-    private let attended = GGUFBuffer(), projected = GGUFBuffer()
+    private let attended = GGUFBuffer(), projected = GGUFBuffer(), feedForwardOut = GGUFBuffer()
     private let gateBuffer = GGUFBuffer(), upBuffer = GGUFBuffer(), scratch = GGUFBuffer()
-    private let scores = GGUFBuffer()
-    private let angles = GGUFBuffer(), cosines = GGUFBuffer(), sines = GGUFBuffer(), slidingCosines = GGUFBuffer(), slidingSines = GGUFBuffer()
+    private let scores = GGUFBuffer(), perLayerInputs = GGUFBuffer(), perLayerTokens = GGUFBuffer(), perLayerWork = GGUFBuffer()
+    private let angles = GGUFBuffer()
+    private let fullCos = GGUFBuffer(), fullSin = GGUFBuffer(), slidingCos = GGUFBuffer(), slidingSin = GGUFBuffer()
 
     /// 1 回にまとめて計算するトークン数の上限
     static let maxBatch = 64
@@ -176,40 +46,39 @@ final class GGUFModel: GGUFEvaluator {
         let config = store.config
         self.config = config
         self.maxContext = max(8, min(config.contextLength, maxContext ?? config.contextLength))
-        workers = GGUFWorkers(chunkCount: chunkCount, widestRow: max(config.feedForwardSize, config.embeddingSize))
-        embedding = try store.matrix("token_embd.weight")
-        outputMatrix = try store.matrix(config.tiedOutput ? "token_embd.weight" : "output.weight")
-        outputNorm = try store.requiredVector("output_norm.weight")
-        outputBias = store.vector("output.bias")
+        shapes = config.layers
+        let widest = max(config.maxFeedForwardSize, config.embeddingSize, config.maxQuerySize, config.perLayerInputSize)
+        workers = GGUFWorkers(chunkCount: chunkCount, widestRow: widest)
+        let globals = try GGUFGlobalWeights(store: store, config: config)
+        self.globals = globals
         layers = try (0..<config.layerCount).map { try GGUFLayerWeights.load($0, store: store, config: config) }
-
-        let factors = store.vector("rope_freqs.weight")
-        frequencies = Self.ropeFrequencies(config: config, base: config.ropeBase, factors: factors)
-        slidingFrequencies = Self.ropeFrequencies(config: config, base: config.slidingRopeBase, factors: factors)
-
-        let cacheCount = config.kvSize * self.maxContext
-        for _ in 0..<config.layerCount {
-            keys.append(.allocate(capacity: cacheCount))
-            values.append(.allocate(capacity: cacheCount))
-        }
+        fullRope = GGUFRope.table(config: config, sliding: false, factors: globals.ropeFactors)
+        slidingRope = GGUFRope.table(config: config, sliding: true, factors: globals.ropeFactors)
+        allocateCache()
     }
 
-    deinit {
-        for pointer in keys { pointer.deallocate() }
-        for pointer in values { pointer.deallocate() }
-    }
+    deinit { freeCache() }
 
-    /// 位置 p の i 番目の組の角度 = p × frequencies[i]
-    static func ropeFrequencies(config: GGUFModelConfig, base: Float, factors: UnsafePointer<Float>?) -> [Float] {
-        let pairs = config.ropeDimensions / 2
-        return (0..<pairs).map { index in
-            let theta = Foundation.pow(Double(base), -2 * Double(index) / Double(config.ropeDimensions))
-            let factor = factors.map { Double($0[index]) } ?? 1
-            return Float(theta / factor) * config.ropeScale
-        }
-    }
+    var computeDescription: String { "CPU (Accelerate)" }
 
     // MARK: - KV キャッシュ
+
+    private func allocateCache() {
+        keys = []
+        values = []
+        for (index, shape) in shapes.enumerated() {
+            let owns = shape.kvLayer == index
+            keys.append(owns ? Out.allocate(capacity: shape.kvSize * maxContext) : nil)
+            values.append(owns ? Out.allocate(capacity: shape.kvSize * maxContext) : nil)
+        }
+    }
+
+    private func freeCache() {
+        for pointer in keys { pointer?.deallocate() }
+        for pointer in values { pointer?.deallocate() }
+        keys = []
+        values = []
+    }
 
     /// KV キャッシュを length トークンまで巻き戻す（それより後ろは次の計算で上書きされる）
     func truncate(to newLength: Int) {
@@ -219,16 +88,9 @@ final class GGUFModel: GGUFEvaluator {
     /// KV キャッシュを空にして、使っていたメモリを OS に返す（確保し直す。使うまで実メモリにはならない）
     func releaseCache() {
         length = 0
-        let count = config.kvSize * maxContext
-        for index in keys.indices {
-            keys[index].deallocate()
-            values[index].deallocate()
-            keys[index] = .allocate(capacity: count)
-            values[index] = .allocate(capacity: count)
-        }
+        freeCache()
+        allocateCache()
     }
-
-    var computeDescription: String { "CPU (Accelerate)" }
 
     /// KV キャッシュが今使っているメモリの目安（バイト）
     var cacheBytes: Int { length * config.kvBytesPerToken }
@@ -247,8 +109,7 @@ final class GGUFModel: GGUFEvaluator {
         while offset < tokens.count {
             let count = min(max(1, batch), tokens.count - offset)
             let isLast = offset + count == tokens.count
-            let batch = Array(tokens[offset..<(offset + count)])
-            let result = forward(batch, wantsLogits: isLast)
+            let result = forward(Array(tokens[offset..<(offset + count)]), wantsLogits: isLast)
             if isLast { logits = result }
             offset += count
             try progress?(offset)
@@ -257,123 +118,180 @@ final class GGUFModel: GGUFEvaluator {
     }
 
     private func forward(_ tokens: [Int], wantsLogits: Bool) -> [Float] {
-        let n = tokens.count
-        let d = config.embeddingSize, ff = config.feedForwardSize
-        let q = config.querySize, kv = config.kvSize
+        let n = tokens.count, d = config.embeddingSize
         let start = length
-
         let x = hidden.reserve(n * d)
-        let h = normed.reserve(n * d)
-        let work = scratch.reserve(n * max(ff, d, q) + 4 * config.headSize)
-        for (index, token) in tokens.enumerated() {
-            GGUFKernels.embeddingRow(embedding, row: token, scale: config.embeddingScale, into: x + index * d)
-        }
+        embed(tokens, start: start, into: x)
+        let inputs = preparePerLayerInputs(tokens, embedded: x)
         prepareRotations(start: start, count: n)
-
-        for (index, layer) in layers.enumerated() {
-            // 注意（self-attention）
-            GGUFKernels.rmsNorm(x, weight: layer.attentionNorm, rows: n, columns: d, epsilon: config.normEpsilon, into: h)
-            let qs = queries.reserve(n * q), ks = newKeys.reserve(n * kv), vs = newValues.reserve(n * kv)
-            linear(layer.query, bias: layer.queryBias, input: h, count: n, output: qs)
-            linear(layer.key, bias: layer.keyBias, input: h, count: n, output: ks)
-            linear(layer.value, bias: layer.valueBias, input: h, count: n, output: vs)
-            if let queryNorm = layer.queryNorm, let keyNorm = layer.keyNorm {
-                GGUFKernels.rmsNorm(qs, weight: queryNorm, rows: n * config.headCount, columns: config.headSize,
-                                    epsilon: config.normEpsilon, into: qs)
-                GGUFKernels.rmsNorm(ks, weight: keyNorm, rows: n * config.kvHeadCount, columns: config.headSize,
-                                    epsilon: config.normEpsilon, into: ks)
-            }
-            rotate(qs, heads: config.headCount, count: n, sliding: config.isSliding(index), scratch: work)
-            rotate(ks, heads: config.kvHeadCount, count: n, sliding: config.isSliding(index), scratch: work)
-            MiniVector.scale(qs, config.attentionScale, qs, n * q)
-            store(ks, vs, layer: index, start: start, count: n)
-
-            let attention = attended.reserve(n * q)
-            attend(layer: index, queries: qs, start: start, count: n, into: attention)
-            let out = projected.reserve(n * max(d, ff))
-            linear(layer.output, bias: layer.outputBias, input: attention, count: n, output: out)
-            if let norm = layer.postAttentionNorm {
-                GGUFKernels.rmsNorm(out, weight: norm, rows: n, columns: d, epsilon: config.normEpsilon, into: out)
-            }
-            MiniVector.add(x, out, x, n * d)
-
-            // FFN
-            GGUFKernels.rmsNorm(x, weight: layer.feedForwardNorm, rows: n, columns: d, epsilon: config.normEpsilon, into: h)
-            let gate = gateBuffer.reserve(n * ff), up = upBuffer.reserve(n * ff)
-            linear(layer.gate, bias: layer.gateBias, input: h, count: n, output: gate)
-            linear(layer.up, bias: layer.upBias, input: h, count: n, output: up)
-            GGUFKernels.gatedActivation(config.activation, gate: gate, up: up, count: n * ff, scratch: work)
-            linear(layer.down, bias: layer.downBias, input: gate, count: n, output: out)
-            if let norm = layer.postFeedForwardNorm {
-                GGUFKernels.rmsNorm(out, weight: norm, rows: n, columns: d, epsilon: config.normEpsilon, into: out)
-            }
-            MiniVector.add(x, out, x, n * d)
+        for index in layers.indices {
+            runLayer(index, x: x, start: start, count: n, perLayerInputs: inputs)
         }
         length = start + n
-
         guard wantsLogits else { return [] }
-        // 最後のトークンだけ、出力層を計算する
-        GGUFKernels.rmsNorm(x + (n - 1) * d, weight: outputNorm, rows: 1, columns: d, epsilon: config.normEpsilon, into: h)
-        var result = [Float](repeating: 0, count: config.vocabSize)
-        result.withUnsafeMutableBufferPointer { buffer in
-            guard let base = buffer.baseAddress else { return }
-            GGUFKernels.linear(outputMatrix, input: h, count: 1, output: base, workers: workers)
-            if let outputBias { MiniMath.add(outputBias, into: base, count: config.vocabSize) }
-            if config.finalSoftcap > 0 { GGUFKernels.softcap(base, count: config.vocabSize, cap: config.finalSoftcap) }
-        }
-        return result
+        return logits(from: x + (n - 1) * d)
     }
 
-    private func linear(_ matrix: GGUFMatrix, bias: UnsafePointer<Float>?, input: UnsafePointer<Float>, count: Int,
-                        output: UnsafeMutablePointer<Float>) {
+    private func embed(_ tokens: [Int], start: Int, into x: Out) {
+        let d = config.embeddingSize
+        for (index, token) in tokens.enumerated() {
+            GGUFKernels.embeddingRow(globals.embedding, row: token, scale: config.embeddingScale, into: x + index * d)
+        }
+        guard let positions = globals.positions else { return }
+        let row = scratch.reserve(d)
+        for index in tokens.indices {
+            GGUFKernels.embeddingRow(positions, row: start + index, scale: 1, into: row)
+            MiniVector.add(x + index * d, row, x + index * d, d)
+        }
+    }
+
+    /// 層ごとの入力（Gemma 4）: [トークン][層][perLayerInputSize]
+    private func preparePerLayerInputs(_ tokens: [Int], embedded x: Out) -> In? {
+        let size = config.perLayerInputSize
+        guard size > 0, let table = globals.perLayerEmbedding, let projection = globals.perLayerProjection else { return nil }
+        let n = tokens.count, d = config.embeddingSize, total = size * config.layerCount
+        let inputs = perLayerInputs.reserve(n * total)
+        // 埋め込みからの射影 × 1/√d を、層ごとに正規化する
+        GGUFKernels.linear(projection, input: x, count: n, output: inputs, workers: workers)
+        MiniVector.scale(inputs, 1 / Float(d).squareRoot(), inputs, n * total)
+        GGUFKernels.rmsNorm(inputs, weight: globals.perLayerProjectionNorm, rows: n * config.layerCount, columns: size,
+                            epsilon: config.normEpsilon, into: inputs)
+        // トークンごとの表 × √size を足して、1/√2 を掛ける
+        let rows = perLayerTokens.reserve(n * total)
+        for (index, token) in tokens.enumerated() {
+            GGUFKernels.embeddingRow(table, row: token, scale: Float(size).squareRoot(), into: rows + index * total)
+        }
+        MiniVector.add(inputs, rows, inputs, n * total)
+        MiniVector.scale(inputs, 1 / Float(2).squareRoot(), inputs, n * total)
+        return In(inputs)
+    }
+
+    private func runLayer(_ index: Int, x: Out, start: Int, count n: Int, perLayerInputs: In?) {
+        let layer = layers[index]
+        let d = config.embeddingSize
+        // 注意
+        var attentionInput = In(x)
+        if config.hasPreNorms {
+            let h = normed.reserve(n * d)
+            normalize(x, weight: layer.attentionNorm, bias: layer.attentionNormBias, rows: n, columns: d, into: h)
+            attentionInput = In(h)
+        }
+        let out = projected.reserve(n * d)
+        attention(index, input: attentionInput, start: start, count: n, into: out)
+        finishBranch(out, postNorm: layer.postAttentionNorm, count: n)
+
+        // FFN
+        let ffn = feedForwardOut.reserve(n * d)
+        if config.parallelResidual {
+            var input = attentionInput
+            if let norm = layer.feedForwardNorm {
+                let h = normed2.reserve(n * d)
+                normalize(x, weight: norm, bias: layer.feedForwardNormBias, rows: n, columns: d, into: h)
+                input = In(h)
+            }
+            feedForward(index, input: input, count: n, into: ffn)
+            finishBranch(ffn, postNorm: layer.postFeedForwardNorm, count: n)
+            MiniVector.add(x, out, x, n * d)
+            MiniVector.add(x, ffn, x, n * d)
+        } else {
+            MiniVector.add(x, out, x, n * d)
+            var input = In(x)
+            if config.hasPreNorms {
+                let h = normed.reserve(n * d)
+                normalize(x, weight: layer.feedForwardNorm, bias: layer.feedForwardNormBias, rows: n, columns: d, into: h)
+                input = In(h)
+            }
+            feedForward(index, input: input, count: n, into: ffn)
+            finishBranch(ffn, postNorm: layer.postFeedForwardNorm, count: n)
+            MiniVector.add(x, ffn, x, n * d)
+        }
+        if let perLayerInputs { addPerLayerInput(index, x: x, inputs: perLayerInputs, count: n) }
+        if layer.outputScale != 1 { MiniVector.scale(x, layer.outputScale, x, n * d) }
+    }
+
+    /// 注意・FFN の出力の仕上げ（後ろの正規化と倍率）
+    private func finishBranch(_ out: Out, postNorm: In?, count n: Int) {
+        let d = config.embeddingSize
+        if let postNorm { normalize(out, weight: postNorm, bias: nil, rows: n, columns: d, into: out) }
+        if config.residualScale != 1 { MiniVector.scale(out, config.residualScale, out, n * d) }
+    }
+
+    private func normalize(_ x: In, weight: In?, bias: In?, rows: Int, columns: Int, into output: Out, weightStride: Int = 0) {
+        switch config.norm {
+        case .rms:
+            GGUFKernels.rmsNorm(x, weight: weight, rows: rows, columns: columns, epsilon: config.normEpsilon, into: output,
+                                weightStride: weightStride)
+        case .layer:
+            GGUFKernels.layerNorm(x, weight: weight, bias: bias, rows: rows, columns: columns, epsilon: config.normEpsilon,
+                                  into: output, weightStride: weightStride)
+        }
+    }
+
+    private func linear(_ matrix: GGUFMatrix, bias: In?, input: In, count: Int, output: Out) {
         GGUFKernels.linear(matrix, input: input, count: count, output: output, workers: workers)
         if let bias { MiniMath.addBias(bias, to: output, rows: count, columns: matrix.rows) }
     }
 
-    // MARK: - RoPE
-
-    /// 位置 start ..< start + count の cos / sin を用意する
-    private func prepareRotations(start: Int, count: Int) {
-        let pairs = frequencies.count
-        guard pairs > 0 else { return }
-        let angle = angles.reserve(pairs)
-        func fill(_ source: [Float], _ cosBuffer: GGUFBuffer, _ sinBuffer: GGUFBuffer) {
-            let cos = cosBuffer.reserve(count * pairs), sin = sinBuffer.reserve(count * pairs)
-            source.withUnsafeBufferPointer { frequency in
-                guard let base = frequency.baseAddress else { return }
-                for index in 0..<count {
-                    MiniVector.scale(base, Float(start + index), angle, pairs)
-                    GGUFKernels.cosSin(angle, count: pairs, cos: cos + index * pairs, sin: sin + index * pairs)
-                }
-            }
-        }
-        fill(frequencies, cosines, sines)
-        if config.slidingWindow > 0 { fill(slidingFrequencies, slidingCosines, slidingSines) }
-    }
-
-    /// [count][heads][headSize] の各ヘッドを、その位置の角度で回転させる
-    private func rotate(_ vectors: UnsafeMutablePointer<Float>, heads: Int, count: Int, sliding: Bool,
-                        scratch: UnsafeMutablePointer<Float>) {
-        let pairs = frequencies.count
-        guard pairs > 0 else { return }
-        let cos = (sliding ? slidingCosines : cosines).pointer
-        let sin = (sliding ? slidingSines : sines).pointer
-        let size = config.headSize
-        for index in 0..<count {
-            for head in 0..<heads {
-                GGUFKernels.rotate(vectors + (index * heads + head) * size, pairs: pairs, split: config.ropePairsAreSplit,
-                                   cos: cos + index * pairs, sin: sin + index * pairs, scratch: scratch)
-            }
-        }
-    }
-
     // MARK: - 注意
 
-    private func store(_ newKeys: UnsafePointer<Float>, _ newValues: UnsafePointer<Float>, layer: Int, start: Int, count: Int) {
-        let size = config.headSize, groups = config.kvHeadCount
+    private func attention(_ index: Int, input: In, start: Int, count n: Int, into out: Out) {
+        let layer = layers[index], shape = shapes[index]
+        let q = shape.querySize, kv = shape.kvSize
+        let qs = queries.reserve(n * q)
+        linear(layer.query, bias: layer.queryBias, input: input, count: n, output: qs)
+        if config.qkNormAfterRope { rotate(qs, heads: shape.headCount, layer: index, count: n) }
+        if let norm = layer.queryNorm {
+            normalizeHeads(qs, weight: norm, perHead: layer.queryNormPerHead, heads: shape.headCount, size: shape.headSize, count: n)
+        }
+        if !config.qkNormAfterRope { rotate(qs, heads: shape.headCount, layer: index, count: n) }
+        MiniVector.scale(qs, config.attentionScale, qs, n * q)
+
+        if shape.kvLayer == index, let keyMatrix = layer.key {
+            let ks = newKeys.reserve(n * kv), vs = newValues.reserve(n * kv)
+            linear(keyMatrix, bias: layer.keyBias, input: input, count: n, output: ks)
+            if let value = layer.value {
+                linear(value, bias: layer.valueBias, input: input, count: n, output: vs)
+            } else {
+                // Gemma 4: v が無ければ、正規化する前の k を使う
+                vs.update(from: ks, count: n * kv)
+            }
+            if config.qkNormAfterRope { rotate(ks, heads: shape.kvHeadCount, layer: index, count: n) }
+            if let norm = layer.keyNorm {
+                normalizeHeads(ks, weight: norm, perHead: layer.keyNormPerHead, heads: shape.kvHeadCount, size: shape.headSize, count: n)
+            }
+            if config.hasValueNorm {
+                GGUFKernels.rmsNorm(vs, weight: nil, rows: n * shape.kvHeadCount, columns: shape.headSize,
+                                    epsilon: config.normEpsilon, into: vs)
+            }
+            if !config.qkNormAfterRope { rotate(ks, heads: shape.kvHeadCount, layer: index, count: n) }
+            store(ks, vs, layer: index, start: start, count: n)
+        }
+        let attention = attended.reserve(n * q)
+        attend(index, queries: qs, start: start, count: n, into: attention)
+        linear(layer.output, bias: layer.outputBias, input: attention, count: n, output: out)
+    }
+
+    /// q / k の正規化: 全体（OLMo 2）、ヘッドごとに同じ重み、ヘッドごとに違う重み（StableLM・Command R）
+    private func normalizeHeads(_ x: Out, weight: In, perHead: Bool, heads: Int, size: Int, count n: Int) {
+        if config.qkNormIsFull {
+            normalize(x, weight: weight, bias: nil, rows: n, columns: heads * size, into: x)
+        } else if perHead {
+            for token in 0..<n {
+                let row = x + token * heads * size
+                normalize(row, weight: weight, bias: nil, rows: heads, columns: size, into: row, weightStride: size)
+            }
+        } else {
+            normalize(x, weight: weight, bias: nil, rows: n * heads, columns: size, into: x)
+        }
+    }
+
+    private func store(_ newKeys: In, _ newValues: In, layer: Int, start: Int, count: Int) {
+        guard let keyCache = keys[layer], let valueCache = values[layer] else { return }
+        let shape = shapes[layer]
+        let size = shape.headSize, groups = shape.kvHeadCount
         for group in 0..<groups {
-            let keyBase = keys[layer] + (group * maxContext + start) * size
-            let valueBase = values[layer] + (group * maxContext + start) * size
+            let keyBase = keyCache + (group * maxContext + start) * size
+            let valueBase = valueCache + (group * maxContext + start) * size
             for index in 0..<count {
                 (keyBase + index * size).update(from: newKeys + (index * groups + group) * size, count: size)
                 (valueBase + index * size).update(from: newValues + (index * groups + group) * size, count: size)
@@ -381,16 +299,21 @@ final class GGUFModel: GGUFEvaluator {
         }
     }
 
-    private func attend(layer: Int, queries: UnsafePointer<Float>, start: Int, count: Int, into output: UnsafeMutablePointer<Float>) {
-        let size = config.headSize, q = config.querySize
+    private func attend(_ layer: Int, queries: In, start: Int, count: Int, into output: Out) {
+        let shape = shapes[layer]
+        guard let keyCache = keys[shape.kvLayer], let valueCache = values[shape.kvLayer] else {
+            output.update(repeating: 0, count: count * shape.querySize)
+            return
+        }
+        let size = shape.headSize, q = shape.querySize
         let total = start + count
-        let groupSize = config.headCount / config.kvHeadCount
-        let window = config.isSliding(layer) ? config.slidingWindow : 0
+        let groupSize = shape.headCount / shape.kvHeadCount
+        let window = shape.sliding ? config.slidingWindow : 0
         let score = scores.reserve(count * total)
-        for head in 0..<config.headCount {
+        for head in 0..<shape.headCount {
             let group = head / groupSize
-            let keyBase = keys[layer] + group * maxContext * size
-            let valueBase = values[layer] + group * maxContext * size
+            let keyBase = keyCache + group * maxContext * size
+            let valueBase = valueCache + group * maxContext * size
             // スコア [count × total] = Q · Kᵀ
             MiniMath.gemm(transA: false, transB: true, m: count, n: total, k: size, alpha: 1,
                           a: queries + head * size, lda: q, b: keyBase, ldb: size, beta: 0, c: score, ldc: total)
@@ -408,6 +331,103 @@ final class GGUFModel: GGUFEvaluator {
             // 出力 [count × size] = 重み · V
             MiniMath.gemm(transA: false, transB: false, m: count, n: size, k: total, alpha: 1,
                           a: score, lda: total, b: valueBase, ldb: size, beta: 0, c: output + head * size, ldc: q)
+        }
+    }
+
+    // MARK: - FFN
+
+    private func feedForward(_ index: Int, input: In, count n: Int, into out: Out) {
+        let layer = layers[index]
+        let ff = shapes[index].feedForwardSize
+        let work = scratch.reserve(n * ff)
+        let up = upBuffer.reserve(n * ff)
+        linear(layer.up, bias: layer.upBias, input: input, count: n, output: up)
+        if let gateMatrix = layer.gate {
+            let gate = gateBuffer.reserve(n * ff)
+            linear(gateMatrix, bias: layer.gateBias, input: input, count: n, output: gate)
+            GGUFKernels.gatedActivation(config.activation, gate: gate, up: up, count: n * ff, scratch: work)
+            linear(layer.down, bias: layer.downBias, input: gate, count: n, output: out)
+        } else {
+            GGUFKernels.activate(config.activation, up, count: n * ff, scratch: work)
+            linear(layer.down, bias: layer.downBias, input: up, count: n, output: out)
+        }
+    }
+
+    /// 層ごとの入力を足す（Gemma 4）
+    private func addPerLayerInput(_ index: Int, x: Out, inputs: In, count n: Int) {
+        let layer = layers[index]
+        guard let inputGate = layer.inputGate, let projection = layer.projection else { return }
+        let size = config.perLayerInputSize, total = size * config.layerCount, d = config.embeddingSize
+        let gate = perLayerWork.reserve(n * size)
+        linear(inputGate, bias: nil, input: x, count: n, output: gate)
+        GGUFKernels.activate(.gelu, gate, count: n * size, scratch: scratch.reserve(n * size))
+        for token in 0..<n {
+            MiniVector.multiply(gate + token * size, inputs + token * total + index * size, gate + token * size, size)
+        }
+        let out = feedForwardOut.reserve(n * d)
+        linear(projection, bias: nil, input: gate, count: n, output: out)
+        GGUFKernels.rmsNorm(out, weight: layer.perLayerPostNorm, rows: n, columns: d, epsilon: config.normEpsilon, into: out)
+        MiniVector.add(x, out, x, n * d)
+    }
+
+    // MARK: - 出力
+
+    private func logits(from last: Out) -> [Float] {
+        let d = config.embeddingSize
+        let h = normed.reserve(d)
+        normalize(last, weight: globals.outputNorm, bias: globals.outputNormBias, rows: 1, columns: d, into: h)
+        var result = [Float](repeating: 0, count: max(config.vocabSize, globals.output.rows))
+        result.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            GGUFKernels.linear(globals.output, input: h, count: 1, output: base, workers: workers)
+            GGUFLogits.finish(base, computedRows: globals.output.rows, config: config, bias: globals.outputBias)
+        }
+        if result.count > config.vocabSize { result.removeLast(result.count - config.vocabSize) }
+        return result
+    }
+
+    // MARK: - RoPE
+
+    /// 位置 start ..< start + count の cos / sin を用意する
+    private func prepareRotations(start: Int, count: Int) {
+        fill(fullRope, cos: fullCos, sin: fullSin, start: start, count: count)
+        fill(slidingRope, cos: slidingCos, sin: slidingSin, start: start, count: count)
+    }
+
+    private func fill(_ table: GGUFRope.Table, cos cosBuffer: GGUFBuffer, sin sinBuffer: GGUFBuffer, start: Int, count: Int) {
+        let pairs = table.pairs
+        guard pairs > 0 else { return }
+        let angle = angles.reserve(pairs)
+        let cos = cosBuffer.reserve(count * pairs), sin = sinBuffer.reserve(count * pairs)
+        table.frequencies.withUnsafeBufferPointer { frequency in
+            guard let base = frequency.baseAddress else { return }
+            for index in 0..<count {
+                MiniVector.scale(base, Float(start + index), angle, pairs)
+                GGUFKernels.cosSin(angle, count: pairs, cos: cos + index * pairs, sin: sin + index * pairs)
+            }
+        }
+        if table.magnitude != 1 {
+            MiniVector.scale(cos, table.magnitude, cos, count * pairs)
+            MiniVector.scale(sin, table.magnitude, sin, count * pairs)
+        }
+    }
+
+    /// [count][heads][headSize] の各ヘッドを、その位置の角度で回転させる（その層で RoPE を使わなければ何もしない）
+    private func rotate(_ vectors: Out, heads: Int, layer: Int, count: Int) {
+        let shape = shapes[layer]
+        guard shape.usesRope else { return }
+        let table = shape.sliding ? slidingRope : fullRope
+        let pairs = table.pairs
+        guard pairs > 0 else { return }
+        let cos = (shape.sliding ? slidingCos : fullCos).pointer
+        let sin = (shape.sliding ? slidingSin : fullSin).pointer
+        let size = shape.headSize
+        let work = scratch.reserve(2 * pairs)
+        for index in 0..<count {
+            for head in 0..<heads {
+                GGUFKernels.rotate(vectors + (index * heads + head) * size, pairs: pairs, split: config.ropePairsAreSplit,
+                                   cos: cos + index * pairs, sin: sin + index * pairs, scratch: work)
+            }
         }
     }
 }

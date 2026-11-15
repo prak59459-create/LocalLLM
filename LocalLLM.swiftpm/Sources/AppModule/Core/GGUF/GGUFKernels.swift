@@ -10,6 +10,8 @@ struct GGUFMatrix {
         case float32
         /// 1 行ごとに倍率を持つ 8 ビット整数（値 = 整数 × その行の倍率）
         case int8Rows
+        /// GGUF の量子化のまま（行を取り出すだけの大きな表に使う。掛け算には使えない）
+        case raw
     }
 
     var rows: Int
@@ -18,13 +20,26 @@ struct GGUFMatrix {
     var data: UnsafeRawPointer
     /// int8Rows のときの、行ごとの倍率
     var scales: UnsafePointer<Float>?
+    /// raw のときの量子化の形式
+    var rawType: GGUFTensorType? = nil
+
+    /// raw のときの 1 行のバイト数
+    var rawRowBytes: Int {
+        guard let rawType else { return 0 }
+        return columns / rawType.block.elements * rawType.block.bytes
+    }
 
     /// 一部の行だけの行列（q・k・v がまとまった行列を分けるときなど）
     func slice(_ range: Range<Int>) -> GGUFMatrix {
-        let elementSize = storage == .float32 ? MemoryLayout<Float>.size : 1
+        let rowBytes: Int
+        switch storage {
+        case .float32: rowBytes = columns * MemoryLayout<Float>.size
+        case .int8Rows: rowBytes = columns
+        case .raw: rowBytes = rawRowBytes
+        }
         return GGUFMatrix(rows: range.count, columns: columns, storage: storage,
-                          data: data + range.lowerBound * columns * elementSize,
-                          scales: scales.map { $0 + range.lowerBound })
+                          data: data + range.lowerBound * rowBytes,
+                          scales: scales.map { $0 + range.lowerBound }, rawType: rawType)
     }
 }
 
@@ -136,6 +151,9 @@ enum GGUFKernels {
             let weights = matrix.data.assumingMemoryBound(to: Float.self) + range.lowerBound * columns
             multiply(input: input, count: count, weights: weights, rows: range.count, columns: columns,
                      output: output + range.lowerBound, stride: stride)
+        case .raw:
+            // 掛け算には使わない（変換のときに raw にするのは、行を取り出すだけの表）
+            output.update(repeating: 0, count: count * stride)
         case .int8Rows:
             let weights = matrix.data.assumingMemoryBound(to: Int8.self)
             let blockRows = workers.blockRows(columns: columns)
@@ -178,41 +196,78 @@ enum GGUFKernels {
         case .int8Rows:
             int8ToFloat(matrix.data.assumingMemoryBound(to: Int8.self) + row * columns, output, count: columns)
             MiniVector.scale(output, scale * (matrix.scales?[row] ?? 1), output, columns)
+        case .raw:
+            guard let type = matrix.rawType,
+                  (try? GGUFQuant.dequantize(type, source: matrix.data + row * matrix.rawRowBytes, count: columns, into: output)) != nil else {
+                output.update(repeating: 0, count: columns)
+                return
+            }
+            if scale != 1 { MiniVector.scale(output, scale, output, columns) }
         }
     }
 
     // MARK: - 正規化と活性化
 
-    /// RMSNorm: out = x / sqrt(mean(x²) + eps) × weight（rows 行 × columns。x と out は同じ場所でもよい）
-    static func rmsNorm(_ x: In, weight: In, rows: Int, columns: Int, epsilon: Float, into output: Out) {
+    /// RMSNorm: out = x / sqrt(mean(x²) + eps) × weight（rows 行 × columns。x と out は同じ場所でもよい。weight が無ければ掛けない）
+    /// weightStride: 行ごとに違う重みを使うときの、次の行の重みまでの間隔（0 なら全部の行で同じ重み）
+    static func rmsNorm(_ x: In, weight: In?, rows: Int, columns: Int, epsilon: Float, into output: Out, weightStride: Int = 0) {
         for row in 0..<rows {
             let source = x + row * columns
             let target = output + row * columns
             let mean = MiniMath.sumOfSquares(source, count: columns) / Float(columns)
             MiniVector.scale(source, 1 / (mean + epsilon).squareRoot(), target, columns)
-            MiniVector.multiply(target, weight, target, columns)
+            if let weight { MiniVector.multiply(target, weight + row * weightStride, target, columns) }
+        }
+    }
+
+    /// LayerNorm: out = (x − mean) / sqrt(var + eps) × weight + bias（weight・bias は無ければ使わない）
+    static func layerNorm(_ x: In, weight: In?, bias: In?, rows: Int, columns: Int, epsilon: Float, into output: Out,
+                          weightStride: Int = 0) {
+        for row in 0..<rows {
+            let source = x + row * columns
+            let target = output + row * columns
+            let mean = MiniVector.sum(source, columns) / Float(columns)
+            MiniVector.shift(source, -mean, target, columns)
+            let variance = MiniMath.sumOfSquares(target, count: columns) / Float(columns)
+            MiniVector.scale(target, 1 / (variance + epsilon).squareRoot(), target, columns)
+            if let weight { MiniVector.multiply(target, weight + row * weightStride, target, columns) }
+            if let bias { MiniVector.add(target, bias + row * weightStride, target, columns) }
+        }
+    }
+
+    /// その場で活性化関数を掛ける（scratch は count 個以上）
+    static func activate(_ activation: GGUFModelConfig.Activation, _ x: Out, count: Int, scratch: Out) {
+        switch activation {
+        case .silu:
+            // x / (1 + exp(-x))
+            MiniVector.scale(x, -1, scratch, count)
+            MiniVector.exp(scratch, scratch, count)
+            MiniVector.shift(scratch, 1, scratch, count)
+            MiniVector.divide(x, scratch, x, count)
+        case .gelu:
+            // 0.5 x (1 + tanh(√(2/π) x (1 + 0.044715 x²)))
+            MiniVector.multiply(x, x, scratch, count)
+            MiniVector.scaleShift(scratch, 0.044715, 1, scratch, count)
+            MiniVector.multiply(scratch, x, scratch, count)
+            MiniVector.scale(scratch, 0.7978845608028654, scratch, count)
+            MiniVector.tanh(scratch, scratch, count)
+            MiniVector.scaleShift(scratch, 0.5, 0.5, scratch, count)
+            MiniVector.multiply(scratch, x, x, count)
+        case .reluSquared:
+            // max(x, 0)²
+            #if canImport(Accelerate)
+            var zero: Float = 0
+            vDSP_vthres(x, 1, &zero, x, 1, vDSP_Length(count))
+            #else
+            for index in 0..<count where x[index] < 0 { x[index] = 0 }
+            #endif
+            MiniVector.multiply(x, x, x, count)
         }
     }
 
     /// gate を活性化して up と掛ける: gate = act(gate) × up（scratch は count 個以上）
     static func gatedActivation(_ activation: GGUFModelConfig.Activation, gate: Out, up: In, count: Int, scratch: Out) {
-        switch activation {
-        case .silu:
-            // x / (1 + exp(-x))
-            MiniVector.scale(gate, -1, scratch, count)
-            MiniVector.exp(scratch, scratch, count)
-            MiniVector.shift(scratch, 1, scratch, count)
-            MiniVector.divide(gate, scratch, gate, count)
-        case .gelu:
-            // 0.5 x (1 + tanh(√(2/π) x (1 + 0.044715 x²)))
-            MiniVector.multiply(gate, gate, scratch, count)
-            MiniVector.scaleShift(scratch, 0.044715, 1, scratch, count)
-            MiniVector.multiply(scratch, gate, scratch, count)
-            MiniVector.scale(scratch, 0.7978845608028654, scratch, count)
-            MiniVector.tanh(scratch, scratch, count)
-            MiniVector.scaleShift(scratch, 0.5, 0.5, scratch, count)
-            MiniVector.multiply(scratch, gate, gate, count)
-        }
+        activate(activation, gate, count: count, scratch: scratch)
         MiniVector.multiply(gate, up, gate, count)
     }
 

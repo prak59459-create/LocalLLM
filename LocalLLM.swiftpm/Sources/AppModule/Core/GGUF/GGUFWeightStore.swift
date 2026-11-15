@@ -45,6 +45,8 @@ struct GGUFWeightStore {
         var offset: Int
         /// 行ごとの倍率（Float32 × rows）の位置。int8Rows のときだけ
         var scalesOffset: Int?
+        /// raw のときの GGUF の量子化の形式
+        var rawType: UInt32? = nil
     }
 
     struct Header: Codable, Equatable, Sendable {
@@ -91,7 +93,10 @@ struct GGUFWeightStore {
         let entry = header.entries[position]
         let base = file.pointer + dataStart
         let scales = entry.scalesOffset.map { (base + $0).assumingMemoryBound(to: Float.self) }
-        return GGUFMatrix(rows: entry.rows, columns: entry.columns, storage: entry.storage, data: base + entry.offset, scales: scales)
+        let rawType = entry.rawType.flatMap { GGUFTensorType(rawValue: $0) }
+        if entry.storage == .raw && rawType == nil { throw GGUFError.invalid("raw tensor type of \(name)") }
+        return GGUFMatrix(rows: entry.rows, columns: entry.columns, storage: entry.storage, data: base + entry.offset, scales: scales,
+                          rawType: rawType)
     }
 
     /// Float32 のベクトル（正規化の重み・バイアスなど）。無ければ nil
@@ -100,6 +105,12 @@ struct GGUFWeightStore {
         let entry = header.entries[position]
         guard entry.storage == .float32 else { return nil }
         return (file.pointer + dataStart + entry.offset).assumingMemoryBound(to: Float.self)
+    }
+
+    /// 重みの要素数（無ければ nil）
+    func length(_ name: String) -> Int? {
+        guard let position = index[name] else { return nil }
+        return header.entries[position].rows * header.entries[position].columns
     }
 
     func requiredVector(_ name: String) throws -> UnsafePointer<Float> {
@@ -122,12 +133,19 @@ struct GGUFWeightStore {
         var offset = 0
         for name in config.tensorNames(in: file) {
             guard let tensor = file.tensor(name) else { continue }
-            let isMatrix = tensor.dimensions.count >= 2
-            let storage: GGUFMatrix.Storage = (isMatrix && compact) ? .int8Rows : .float32
+            let isMatrix = tensor.dimensions.count >= 2 && !GGUFModelConfig.isVectorTensor(name)
+            var storage: GGUFMatrix.Storage = (isMatrix && compact) ? .int8Rows : .float32
+            if isMatrix && compact && GGUFModelConfig.isRawTensor(name) && tensor.type != nil { storage = .raw }
             let rows = isMatrix ? tensor.rows : 1
             let columns = isMatrix ? tensor.columns : tensor.elementCount
             offset = aligned(offset, to: alignment)
             var entry = Entry(name: name, storage: storage, rows: rows, columns: columns, offset: offset, scalesOffset: nil)
+            if storage == .raw {
+                entry.rawType = tensor.typeCode
+                offset += tensor.byteCount ?? 0
+                entries.append(entry)
+                continue
+            }
             offset += rows * columns * (storage == .float32 ? 4 : 1)
             if storage == .int8Rows {
                 offset = aligned(offset, to: alignment)
@@ -165,7 +183,7 @@ enum GGUFConverter {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         let temporary = destination.deletingLastPathComponent().appendingPathComponent(".converting-\(UUID().uuidString)")
-        fileManager.createFile(atPath: temporary.path, contents: nil)
+        _ = fileManager.createFile(atPath: temporary.path, contents: nil)
         let handle = try FileHandle(forWritingTo: temporary)
         var finished = false
         defer {
@@ -202,6 +220,14 @@ enum GGUFConverter {
             let start = file.fileOffset(of: tensor)
             guard start + byteCount <= mapped.count else { throw GGUFError.truncated(needed: start + byteCount) }
             try pad(to: entry.offset)
+            if entry.storage == .raw {
+                // 量子化のまま写す
+                try copyRaw(from: mapped.pointer + start, count: byteCount, to: handle, isCancelled: isCancelled)
+                written += byteCount
+                doneElements += entry.rows * entry.columns
+                progress?(Double(doneElements) / Double(totalElements))
+                continue
+            }
             let rowBytes = byteCount / entry.rows
             var scales = [Float](repeating: 0, count: entry.storage == .int8Rows ? entry.rows : 0)
             var row = 0
@@ -230,6 +256,17 @@ enum GGUFConverter {
         finished = true
         progress?(1)
         return config
+    }
+
+    private static func copyRaw(from source: UnsafeRawPointer, count: Int, to handle: FileHandle, isCancelled: (() -> Bool)?) throws {
+        let step = 16 << 20
+        var done = 0
+        while done < count {
+            if isCancelled?() == true { throw CancellationError() }
+            let length = min(step, count - done)
+            try handle.write(contentsOf: Data(bytes: source + done, count: length))
+            done += length
+        }
     }
 
     /// 何行かずつ Float に戻して（必要なら 8 ビットにして）書き出す。行のまとまりごとに並列に計算する。

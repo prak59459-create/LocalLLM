@@ -488,7 +488,11 @@ enum TextDiff { static func diff(old:new:) -> [DiffLine]; static func hunks(old:
 struct Roadmap { nodes: [RoadmapNode], edges: [RoadmapEdge]   // 丸（#番号・状態・種類・位置）と、親 → 子の線
     mutating func add(title:detail:kind:status:parent:at:) -> RoadmapNode   // 親の周りの空いた場所に置く
     mutating func autoLayout(); func summary(maxNodes:) -> String }
-enum WorkspaceToolbox { static func definitions(profile:javaScript:) -> [ToolDefinition] }   // minimal / standard / full
+enum WorkspaceToolbox { static func definitions(profile:javaScript:) -> [ToolDefinition] }   // code（かんたん）/ minimal / standard / full
+enum CodeReply {                    // かんたん方式: 返答の「ファイル名 + コードブロック」と 1 行のコマンド（READ/LIST/FIND/DELETE/MOVE/RUN）を読む
+    static func parse(_:knownFiles:openFile:) -> Result   // files / skipped（途中を省いたもの）/ commands。プロンプトの書き写しが始まったらそこまで
+    static func keepMainPage(_:knownFiles:request:), condensed(_:written:) }
+enum SimpleCodingPrompt { static func contextFiles(all:openFile:read:budget:request:), system(...), userMessage(_:) }   // 日本語の依頼には英語の言葉を添える
 struct WorkspaceToolExecutor { func execute(_:roadmap:) -> WorkspaceToolResult; func preview(_:) -> ProposedChange? }
 enum CodingAgentPrompt { static func system(...), implement(_:), brainstorm(from:count:), planRoadmap(goal:) }
 enum SyntaxHighlighter { static func tokens(in:language:) -> [HighlightToken] }   // UTF-16 の位置

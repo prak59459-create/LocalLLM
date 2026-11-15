@@ -126,8 +126,10 @@ final class WorkspaceSession {
         didSet { UserDefaults.standard.set(approvalMode.rawValue, forKey: "cdws.approvalMode") }
     }
     var toolProfile: WorkspaceToolbox.Profile {
-        didSet { UserDefaults.standard.set(toolProfile.rawValue, forKey: "cdws.toolProfile") }
+        didSet { UserDefaults.standard.set(toolProfile.rawValue, forKey: Self.profileKey) }
     }
+    /// 版 0.8 から「コードを書くだけ」が標準（前の設定は引き継がない。小さいモデルではツールの呼び出しが崩れやすいため）
+    private static let profileKey = "cdws.toolProfile.v2"
     var useWebTools: Bool {
         didSet { UserDefaults.standard.set(useWebTools, forKey: "cdws.useWebTools") }
     }
@@ -146,7 +148,7 @@ final class WorkspaceSession {
         fileSystem = WorkspaceFileSystem(root: root)
         let defaults = UserDefaults.standard
         approvalMode = defaults.string(forKey: "cdws.approvalMode").flatMap(AgentApprovalMode.init(rawValue:)) ?? .ask
-        toolProfile = defaults.string(forKey: "cdws.toolProfile").flatMap(WorkspaceToolbox.Profile.init(rawValue:)) ?? .standard
+        toolProfile = defaults.string(forKey: Self.profileKey).flatMap(WorkspaceToolbox.Profile.init(rawValue:)) ?? .code
         useWebTools = defaults.object(forKey: "cdws.useWebTools") as? Bool ?? false
         loadState()
         if let initialRoadmap, roadmap.nodes.isEmpty {
@@ -521,6 +523,10 @@ final class WorkspaceSession {
         messages.append(AgentMessage(role: .user, content: trimmed, batchID: batchID))
         saveMessages()
 
+        if toolProfile == .code {
+            sendCodeRequest(trimmed, batchID: batchID, chat: chat, settings: settings, info: info)
+            return
+        }
         var parameters = settings.generation
         parameters.temperature = min(parameters.temperature, 0.4)
         parameters.repetitionPenalty = 1.0
@@ -566,6 +572,122 @@ final class WorkspaceSession {
             guard agentRunID == runID else { return }
             finishAgentRun()
         }
+    }
+
+    // MARK: - かんたん方式（小さいモデル向け）
+
+    /// JSON のツール呼び出しを使わずに依頼する。今のファイルの中身をプロンプトに入れ、
+    /// 返ってきた「ファイル名 + コードブロック」をファイルに書き、「READ index.html」のような 1 行のコマンドを実行する。
+    /// 前の依頼への返答（コード）は渡さない（小さいモデルは、それをまねて同じものを書き続けてしまうため）。
+    private func sendCodeRequest(_ request: String, batchID: UUID, chat: ChatController, settings: AppSettings, info: LoadedModelInfo) {
+        // 文脈が短いモデルでは、入れるファイルの中身を少なめに（返答のファイル全体の分も残す）
+        let budget = info.maxContext <= 4096 ? 5000 : (info.maxContext <= 8192 ? 10_000 : 20_000)
+        let earlier = Array(messages.dropLast().filter { $0.role == .user }.suffix(3).map(\.content))
+        let notes = try? fileSystem.read("CDWS.md")
+        var parameters = settings.generation
+        parameters.temperature = min(parameters.temperature, 0.3)
+        parameters.repetitionPenalty = 1.0
+        parameters.maxNewTokens = max(parameters.maxNewTokens, 3072)
+        isAgentRunning = true
+        agentStatus = L("考えています…", "Thinking…")
+        notice = nil
+        let loop = AgentLoop(engine: chat.engine)
+        let runID = UUID()
+        agentRunID = runID
+        agentTask = Task {
+            do {
+                try await runSimpleRounds(request, earlier: earlier, notes: notes, budget: budget, parameters: parameters,
+                                          enableThinking: settings.thinkingMode.enableThinking, loop: loop,
+                                          batchID: batchID, runID: runID)
+            } catch is CancellationError {
+            } catch {
+                if agentRunID == runID { notice = error.localizedDescription }
+            }
+            guard agentRunID == runID else { return }
+            finishAgentRun()
+        }
+    }
+
+    /// 生成 → コードを書く・コマンドを実行 →（READ などがあれば）結果を渡してもう一度、を数回まで
+    private func runSimpleRounds(_ request: String, earlier: [String], notes: String?, budget: Int, parameters: GenerationParameters,
+                                 enableThinking: Bool?, loop: AgentLoop, batchID: UUID, runID: UUID) async throws {
+        var transcript = [ChatMessage(role: .user, content: SimpleCodingPrompt.userMessage(request))]
+        for _ in 0..<4 {
+            // 毎回、いまのファイルの中身で作り直す（前の往復で書いたものも見えるように）
+            let all = (try? fileSystem.find("*", limit: 400)) ?? []
+            let context = SimpleCodingPrompt.contextFiles(all: all, openFile: selectedPath,
+                                                          read: { try? self.fileSystem.read($0) }, budget: budget,
+                                                          request: request)
+            let system = SimpleCodingPrompt.system(projectName: project.name, files: context.files, others: context.others,
+                                                   earlier: earlier, notes: notes)
+            let configuration = AgentLoop.Configuration(systemPrompt: system, parameters: parameters,
+                                                        enableThinking: enableThinking, tools: [], maxRounds: 0)
+            var reply = ""
+            var stopped = false
+            try await loop.run(history: transcript, configuration: configuration,
+                               execute: { _ in ToolOutcome(text: "", isError: true) },
+                               onEvent: { event in
+                                   if case .assistantFinished(let content, _, let stats) = event {
+                                       reply = content
+                                       stopped = stats.stopReason == .cancelled || stats.stopReason == .lowMemory
+                                   }
+                                   self.handle(event, batchID: batchID, runID: runID)
+                               })
+            guard agentRunID == runID, !stopped else { return }
+            let step = await applyCodeReply(reply, request: request, batchID: batchID, runID: runID, all: all)
+            guard let results = step.results, agentRunID == runID else { return }
+            transcript.append(ChatMessage(role: .assistant, content: CodeReply.condensed(reply, written: step.written)))
+            transcript.append(ChatMessage(role: .user, content: "Results:\n" + results
+                                          + "\n\nContinue with the request: write the files, or reply in one sentence if it is done."))
+        }
+    }
+
+    /// 返答を実行する: コードブロックをファイルに書き（確認つき・変更履歴に残るのでまとめて元に戻せる）、1 行のコマンドを実行する。
+    /// - Returns: 書いたファイルと、モデルに返す結果（READ などが無ければ nil = ここで終わり）
+    private func applyCodeReply(_ reply: String, request: String, batchID: UUID, runID: UUID,
+                                all: [String]) async -> (written: [String], results: String?) {
+        let result = CodeReply.keepMainPage(CodeReply.parse(reply, knownFiles: all, openFile: selectedPath),
+                                            knownFiles: all, request: request)
+        var written: [String] = []
+        var report: [String] = []
+        var needsReply = false
+        let writes = result.files.map { file in
+            ToolCall(name: WorkspaceToolbox.Name.writeFile,
+                     arguments: .object([("path", .string(file.path)), ("content", .string(file.content))]))
+        }
+        // 書く → 消す・移動 → 読む の順（書いたあとの中身を読めるように）
+        let commands = result.commands.filter { !$0.needsReply } + result.commands.filter(\.needsReply)
+        var calls: [(call: ToolCall, command: CodeReply.Command?)] = writes.map { (call: $0, command: nil) }
+        for command in commands {
+            if let call = command.toolCall { calls.append((call: call, command: command)) }
+        }
+        for (call, command) in calls {
+            guard agentRunID == runID else { break }
+            agentStatus = L("実行中: ", "Running: ") + (command?.line ?? call.summary)
+            var outcome = ToolOutcome(text: L("ユーザーがこの操作を許可しませんでした。", "The user declined this action."), isError: true)
+            if await approve(call, runID: runID) {
+                outcome = await executeTool(call, batchID: batchID, runID: runID, connectors: nil)
+            }
+            messages.append(AgentMessage(role: .tool, content: outcome.text, toolName: call.name, toolCallID: call.id,
+                                         isError: outcome.isError, batchID: batchID))
+            if command == nil, !outcome.isError, let path = WorkspaceToolExecutor.path(call) { written.append(path) }
+            if let command {
+                needsReply = needsReply || command.needsReply
+                report.append(command.line + "\n" + String(outcome.text.prefix(4500)))
+            }
+        }
+        for skip in result.skipped {
+            messages.append(AgentMessage(role: .tool, content: skip.reason, toolName: WorkspaceToolbox.Name.writeFile,
+                                         isError: true, batchID: batchID))
+        }
+        if result.files.isEmpty && result.skipped.isEmpty && result.commands.isEmpty && !reply.isEmpty && written.isEmpty {
+            notice = L("返答にファイルのコードがありませんでした。「index.html を全部書いて」のように、ファイルを指定して頼んでみてください。",
+                       "The reply had no file code. Try naming the file, for example \"write the whole index.html\".")
+        }
+        saveMessages()
+        guard needsReply else { return (written, nil) }
+        if !written.isEmpty { report.insert("Written: " + written.joined(separator: ", "), at: 0) }
+        return (written, report.joined(separator: "\n\n"))
     }
 
     /// エージェントの実行を終わった状態にする（入力欄などをまた使えるようにする）
@@ -645,7 +767,7 @@ final class WorkspaceSession {
         }
     }
 
-    private func executeTool(_ call: ToolCall, batchID: UUID, runID: UUID, connectors: ConnectorStore) async -> ToolOutcome {
+    private func executeTool(_ call: ToolCall, batchID: UUID, runID: UUID, connectors: ConnectorStore?) async -> ToolOutcome {
         // 止めたあとの古い実行には、ファイルを触らせない
         guard agentRunID == runID else { return ToolOutcome(text: L("止めました。", "Stopped."), isError: true) }
         if WorkspaceToolbox.isWorkspaceTool(call.name) {
@@ -678,6 +800,7 @@ final class WorkspaceSession {
             appendConsole("▶︎ run_javascript\n" + result.output)
             return ToolOutcome(text: result.output, isError: result.isError)
         }
+        guard let connectors else { return ToolOutcome(text: L("ツール \(call.name) はありません", "Unknown tool \(call.name)"), isError: true) }
         return await connectors.execute(call)
     }
 

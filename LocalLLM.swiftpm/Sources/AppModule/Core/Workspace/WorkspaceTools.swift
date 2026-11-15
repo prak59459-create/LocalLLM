@@ -4,6 +4,8 @@ import Foundation
 enum WorkspaceToolbox {
     /// 渡すツールの数（小さいモデルはコンテキストが短いので、少なくもできる）
     enum Profile: String, CaseIterable, Codable, Identifiable, Sendable {
+        /// コードブロックで書き、ほかは 1 行のコマンド（READ index.html など）で呼ぶ（小さいモデル向け）
+        case code
         case minimal
         case standard
         case full
@@ -12,6 +14,7 @@ enum WorkspaceToolbox {
 
         var label: String {
             switch self {
+            case .code: return L("かんたん（コードブロック＋1行コマンド・小さいモデル向け）", "Simple (code blocks + one-line commands, best for small models)")
             case .minimal: return L("最小（読む・書く・直す）", "Minimal (read, write, edit)")
             case .standard: return L("標準（＋探す・ロードマップ）", "Standard (+ search, roadmap)")
             case .full: return L("すべて（＋消す・移動・JS）", "All (+ delete, move, JS)")
@@ -57,7 +60,7 @@ enum WorkspaceToolbox {
             ToolDefinition(name: Name.editFile, description: L("old_string（1 か所だけ）を new_string に置き換える", "Replace old_string (unique) with new_string"),
                            arguments: [("path", path.0, true), ("old_string", "old", true), ("new_string", "new", true)]),
         ]
-        if profile != .minimal {
+        if profile == .standard || profile == .full {
             tools.append(ToolDefinition(name: Name.searchFiles, description: L("文字列を探す（空ならファイル一覧）", "Search text (empty: list files)"),
                                         arguments: [("pattern", L("探す文字列", "text"), false)]))
             tools.append(ToolDefinition(name: Name.roadmap,

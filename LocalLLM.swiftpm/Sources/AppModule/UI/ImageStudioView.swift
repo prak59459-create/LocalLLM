@@ -12,14 +12,22 @@ struct ImageStudioView: View {
             Form {
                 ImageModelSection()
                 if !store.completedModels.isEmpty {
+                    StudioModeSection()
                     ImagePromptSection()
                     ImageOptionsSection()
+                    if studio.mode == .video { VideoOptionsSection() }
                     ImageGenerateSection()
-                    ImageResultSection()
-                    ImageGallerySection()
+                    if studio.mode == .video {
+                        VideoProgressPreview()
+                        VideoResultSection()
+                        VideoGallerySection()
+                    } else {
+                        ImageResultSection()
+                        ImageGallerySection()
+                    }
                 }
             }
-            .navigationTitle(L("画像生成", "Image Generation"))
+            .navigationTitle(studio.mode == .video ? L("動画生成", "Video Generation") : L("画像生成", "Image Generation"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -173,6 +181,11 @@ private struct ImagePromptSection: View {
         Section {
             TextField(L("描いてほしいもの（英語）", "What to draw (English)"), text: $studio.prompt, axis: .vertical)
                 .lineLimit(3...8)
+            if studio.mode == .video {
+                TextField(L("最後のコマで描いてほしいもの（任意。だんだん変わる）", "What to draw at the end (optional; changes gradually)"),
+                          text: $studio.endPrompt, axis: .vertical)
+                    .lineLimit(1...4)
+            }
             TextField(L("描いてほしくないもの（任意）", "What to avoid (optional)"), text: $studio.negativePrompt, axis: .vertical)
                 .lineLimit(1...4)
             ImageTranslateButton()
@@ -268,6 +281,15 @@ private struct ImageGenerateSection: View {
                 } label: {
                     Label(L("止める", "Stop"), systemImage: "stop.fill")
                 }
+            } else if studio.mode == .video {
+                Button {
+                    studio.generateVideo(store: store, chat: chat)
+                } label: {
+                    Label(L("動画を作る", "Generate video"), systemImage: "film")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!studio.canGenerate)
             } else {
                 Button {
                     studio.generate(store: store, chat: chat)

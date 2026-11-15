@@ -99,12 +99,6 @@ actor ImageGenerator {
 
     // MARK: - 生成
 
-    private static func loadModel(_ url: URL, computeUnits: MLComputeUnits) async throws -> MLModel {
-        let configuration = MLModelConfiguration()
-        configuration.computeUnits = computeUnits
-        return try await MLModel.load(contentsOf: url, configuration: configuration)
-    }
-
     private static func run(files: ImageModelFiles, request: ImageRequest, computeUnits: MLComputeUnits,
                             report: @escaping @Sendable (ImageEvent) -> Void) async throws -> CGImage {
         let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -112,34 +106,67 @@ actor ImageGenerator {
 
         // 1. プロンプト → 特徴
         report(.status(L("プロンプトを読み込んでいます…", "Encoding the prompt…")))
-        let tokenizer = try CLIPTextTokenizer(vocabJSON: try Data(contentsOf: files.vocabulary),
-                                              mergesText: try String(contentsOf: files.merges, encoding: .utf8))
-        let embeddings = try await encodePrompts(files: files, tokenizer: tokenizer, prompt: prompt,
-                                                 negative: request.negativePrompt, computeUnits: computeUnits)
+        let embeddings = try await DiffusionText.encode(files: files, prompts: [request.negativePrompt, prompt], computeUnits: computeUnits)
         try Task.checkCancellation()
 
         // 2. ノイズ除去
         report(.status(L("画像モデルを読み込んでいます…（初回は数分かかることがあります）",
                          "Loading the image model… (the first time can take a few minutes)")))
-        let latents = try await denoise(files: files, embeddings: embeddings, request: request,
-                                        computeUnits: computeUnits, report: report)
+        let unet = try await DiffusionUNet(url: files.unet, computeUnits: computeUnits)
+        var scheduler = DPMSolverScheduler(stepCount: request.stepCount)
+        var noise = DiffusionNoise(seed: request.seed)
+        let start = noise.normals(unet.latentCount).map { $0 * scheduler.initialNoiseScale }
+        let hidden = try unet.hiddenStates(negative: embeddings.arranged(0), positive: embeddings.arranged(1))
+        report(.step(0, scheduler.timesteps.count))
+        let latents = try await unet.denoise(start, scheduler: &scheduler, hidden: hidden, guidance: request.guidanceScale) { done, total in
+            report(.step(done, total))
+        }
         try Task.checkCancellation()
 
         // 3. 潜在表現 → 画像
         report(.status(L("画像に仕上げています…", "Decoding the image…")))
-        return try await decode(files: files, latents: latents, computeUnits: computeUnits)
+        let decoder = try await DiffusionDecoder(url: files.vaeDecoder, computeUnits: computeUnits)
+        return try await decoder.decode(latents, shape: unet.latentShape)
     }
+}
 
-    /// テキストエンコーダの出力（[否定, プロンプト] の順。それぞれ 長さ × 次元）
-    private struct PromptEmbeddings {
-        var values: [Float]
-        var length: Int
-        var dimension: Int
+/// 画像モデルを読み込む
+enum DiffusionModels {
+    static func load(_ url: URL, computeUnits: MLComputeUnits) async throws -> MLModel {
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = computeUnits
+        return try await MLModel.load(contentsOf: url, configuration: configuration)
     }
+}
 
-    private static func encodePrompts(files: ImageModelFiles, tokenizer: CLIPTextTokenizer, prompt: String, negative: String,
-                                      computeUnits: MLComputeUnits) async throws -> PromptEmbeddings {
-        let model = try await loadModel(files.textEncoder, computeUnits: computeUnits)
+/// テキストエンコーダの出力（プロンプトごとに 長さ × 次元）
+struct DiffusionEmbeddings: Sendable {
+    var values: [Float]
+    var length: Int
+    var dimension: Int
+
+    var count: Int { values.count / max(length * dimension, 1) }
+
+    /// index 番目のプロンプトの特徴を、UNet が求める [次元][長さ] の並びにする
+    func arranged(_ index: Int) -> [Float] {
+        let perPrompt = length * dimension
+        var result = [Float](repeating: 0, count: perPrompt)
+        let base = index * perPrompt
+        for position in 0..<length {
+            for channel in 0..<dimension {
+                result[channel * length + position] = values[base + position * dimension + channel]
+            }
+        }
+        return result
+    }
+}
+
+/// プロンプトを、CLIP のテキストエンコーダで特徴に変える（使い終わったらモデルを手放す）
+enum DiffusionText {
+    static func encode(files: ImageModelFiles, prompts: [String], computeUnits: MLComputeUnits) async throws -> DiffusionEmbeddings {
+        let tokenizer = try CLIPTextTokenizer(vocabJSON: try Data(contentsOf: files.vocabulary),
+                                              mergesText: try String(contentsOf: files.merges, encoding: .utf8))
+        let model = try await DiffusionModels.load(files.textEncoder, computeUnits: computeUnits)
         guard let input = model.modelDescription.inputDescriptionsByName["input_ids"]?.multiArrayConstraint else {
             throw ImageGenerationError.missingInput("input_ids")
         }
@@ -147,7 +174,7 @@ actor ImageGenerator {
         var combined: [Float] = []
         var dimension = 0
         // 埋め草は、まず「終わりの印」で試す（Stable Diffusion 2 系は 0 で埋めるので、次元を見て決め直す）
-        for (index, text) in [negative, prompt].enumerated() {
+        for (index, text) in prompts.enumerated() {
             var hidden = try await encode(text, tokenizer: tokenizer, padID: nil, length: length, dataType: input.dataType, model: model)
             if hidden.dimension == 1024 {
                 hidden = try await encode(text, tokenizer: tokenizer, padID: 0, length: length, dataType: input.dataType, model: model)
@@ -155,16 +182,17 @@ actor ImageGenerator {
             if index == 0 { dimension = hidden.dimension }
             combined.append(contentsOf: hidden.values)
         }
-        return PromptEmbeddings(values: combined, length: length, dimension: dimension)
+        return DiffusionEmbeddings(values: combined, length: length, dimension: dimension)
     }
 
     private static func encode(_ text: String, tokenizer: CLIPTextTokenizer, padID: Int?, length: Int,
-                               dataType: MLMultiArrayDataType, model: MLModel) async throws -> PromptEmbeddings {
+                               dataType: MLMultiArrayDataType, model: MLModel) async throws -> DiffusionEmbeddings {
         let ids = tokenizer.encode(text, length: length, padID: padID).map { Float($0) }
         let array = try ImageTensors.array(shape: [1, length], dataType: dataType, values: ids)
         let provider = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: array)])
+        let box = UncheckedSendable(model)
         return try await InferenceQueue.run {
-            let output = try model.prediction(from: provider, options: MLPredictionOptions())
+            let output = try box.value.prediction(from: provider, options: MLPredictionOptions())
             guard let hidden = output.featureValue(for: "last_hidden_state")?.multiArrayValue else {
                 throw ImageGenerationError.missingOutput("last_hidden_state")
             }
@@ -172,19 +200,33 @@ actor ImageGenerator {
             guard shape.count == 3, shape[1] == length else {
                 throw ImageGenerationError.unexpectedShape("last_hidden_state", shape)
             }
-            return PromptEmbeddings(values: ImageTensors.floats(hidden), length: length, dimension: shape[2])
+            return DiffusionEmbeddings(values: ImageTensors.floats(hidden), length: length, dimension: shape[2])
         }
     }
+}
 
-    /// 潜在表現（1 × チャンネル × 高さ × 幅）
-    private struct Latents {
-        var values: [Float]
-        var shape: [Int]
+/// UNet を読み込んだもの。何回でもノイズ除去ができる（動画では、同じ UNet で何コマも描く）。
+final class DiffusionUNet: @unchecked Sendable {
+    /// テキストの特徴（UNet の入力の形にしたもの）
+    struct HiddenStates: @unchecked Sendable {
+        var both: MLMultiArray
+        var negative: MLMultiArray
+        var positive: MLMultiArray
     }
 
-    private static func denoise(files: ImageModelFiles, embeddings: PromptEmbeddings, request: ImageRequest,
-                                computeUnits: MLComputeUnits, report: @escaping @Sendable (ImageEvent) -> Void) async throws -> Latents {
-        let model = try await loadModel(files.unet, computeUnits: computeUnits)
+    private let model: MLModel
+    private let sampleType: MLMultiArrayDataType
+    private let timeType: MLMultiArrayDataType
+    private let hiddenType: MLMultiArrayDataType
+    private let hiddenShape: [Int]
+    /// 否定とプロンプトを 1 回でまとめて計算できるか（バッチ 2）
+    private let batch: Int
+    /// 潜在表現の形（1 × チャンネル × 高さ × 幅）
+    let latentShape: [Int]
+    var latentCount: Int { latentShape.reduce(1, *) }
+
+    init(url: URL, computeUnits: MLComputeUnits) async throws {
+        let model = try await DiffusionModels.load(url, computeUnits: computeUnits)
         let inputs = model.modelDescription.inputDescriptionsByName
         guard let sample = inputs["sample"]?.multiArrayConstraint else { throw ImageGenerationError.missingInput("sample") }
         guard let time = inputs["timestep"]?.multiArrayConstraint else { throw ImageGenerationError.missingInput("timestep") }
@@ -195,91 +237,98 @@ actor ImageGenerator {
         guard sampleShape.count == 4, sampleShape[0] == 1 || sampleShape[0] == 2 else {
             throw ImageGenerationError.unexpectedShape("sample", sampleShape)
         }
-        let batch = sampleShape[0]
-        let latentShape = [1] + Array(sampleShape[1...])
-        let latentCount = latentShape.reduce(1, *)
+        self.model = model
+        sampleType = sample.dataType
+        timeType = time.dataType
+        hiddenType = hidden.dataType
+        hiddenShape = hidden.shape.map(\.intValue)
+        batch = sampleShape[0]
+        latentShape = [1] + Array(sampleShape[1...])
+    }
 
-        // テキストの特徴を [バッチ, 次元, 1, 長さ] に並べ替える（モデルが求める並び）
-        let hiddenShape = hidden.shape.map(\.intValue)
-        guard hiddenShape.count == 4, hiddenShape[1] == embeddings.dimension, hiddenShape[3] == embeddings.length else {
+    /// 否定とプロンプトの特徴（[次元][長さ] の並び）を、UNet の入力にする
+    func hiddenStates(negative: [Float], positive: [Float]) throws -> HiddenStates {
+        guard hiddenShape.count == 4 else { throw ImageGenerationError.unexpectedShape("encoder_hidden_states", hiddenShape) }
+        let dimension = hiddenShape[1], length = hiddenShape[3]
+        guard negative.count == dimension * length, positive.count == dimension * length else {
             throw ImageGenerationError.unexpectedShape("encoder_hidden_states", hiddenShape)
         }
-        let perPrompt = embeddings.length * embeddings.dimension
-        func arranged(_ promptIndex: Int) -> [Float] {
-            var result = [Float](repeating: 0, count: perPrompt)
-            let base = promptIndex * perPrompt
-            for position in 0..<embeddings.length {
-                for channel in 0..<embeddings.dimension {
-                    result[channel * embeddings.length + position] = embeddings.values[base + position * embeddings.dimension + channel]
-                }
-            }
-            return result
-        }
-        let negative = arranged(0), positive = arranged(1)
-        let hiddenBoth = try ImageTensors.array(shape: [2, embeddings.dimension, 1, embeddings.length], dataType: hidden.dataType,
-                                                values: negative + positive)
-        let hiddenNegative = try ImageTensors.array(shape: [1, embeddings.dimension, 1, embeddings.length], dataType: hidden.dataType,
-                                                    values: negative)
-        let hiddenPositive = try ImageTensors.array(shape: [1, embeddings.dimension, 1, embeddings.length], dataType: hidden.dataType,
-                                                    values: positive)
+        return HiddenStates(
+            both: try ImageTensors.array(shape: [2, dimension, 1, length], dataType: hiddenType, values: negative + positive),
+            negative: try ImageTensors.array(shape: [1, dimension, 1, length], dataType: hiddenType, values: negative),
+            positive: try ImageTensors.array(shape: [1, dimension, 1, length], dataType: hiddenType, values: positive))
+    }
 
-        var scheduler = DPMSolverScheduler(stepCount: request.stepCount)
-        var noise = DiffusionNoise(seed: request.seed)
-        var latents = noise.normals(latentCount).map { $0 * scheduler.initialNoiseScale }
+    /// scheduler の今の段階から最後まで、ノイズを取り除く
+    func denoise(_ start: [Float], scheduler: inout DPMSolverScheduler, hidden: HiddenStates, guidance: Float,
+                 onStep: (Int, Int) -> Void) async throws -> [Float] {
+        var latents = start
         let total = scheduler.timesteps.count
-        report(.step(0, total))
-
-        func predict(_ latentValues: [Float], _ timestep: Int, _ hiddenStates: MLMultiArray, copies: Int) async throws -> [Float] {
-            var values = latentValues
-            if copies == 2 { values.append(contentsOf: latentValues) }
-            let sampleArray = try ImageTensors.array(shape: [copies] + Array(latentShape[1...]), dataType: sample.dataType, values: values)
-            let timeArray = try ImageTensors.array(shape: [copies], dataType: time.dataType,
-                                                   values: [Float](repeating: Float(timestep), count: copies))
-            let provider = try MLDictionaryFeatureProvider(dictionary: [
-                "sample": MLFeatureValue(multiArray: sampleArray),
-                "timestep": MLFeatureValue(multiArray: timeArray),
-                "encoder_hidden_states": MLFeatureValue(multiArray: hiddenStates),
-            ])
-            return try await InferenceQueue.run {
-                let output = try model.prediction(from: provider, options: MLPredictionOptions())
-                guard let prediction = output.featureValue(for: "noise_pred")?.multiArrayValue else {
-                    throw ImageGenerationError.missingOutput("noise_pred")
-                }
-                return ImageTensors.floats(prediction)
-            }
-        }
-
-        for (index, timestep) in scheduler.timesteps.enumerated() {
+        while !scheduler.isFinished {
             try Task.checkCancellation()
+            let timestep = scheduler.timesteps[scheduler.stepIndex]
             let unconditional: [Float], conditional: [Float]
             if batch == 2 {
                 // 否定とプロンプトを 1 回でまとめて計算する
-                let both = try await predict(latents, timestep, hiddenBoth, copies: 2)
+                let both = try await predict(latents, timestep, hidden.both, copies: 2)
                 guard both.count == latentCount * 2 else { throw ImageGenerationError.unexpectedShape("noise_pred", [both.count]) }
                 unconditional = Array(both[0..<latentCount])
                 conditional = Array(both[latentCount...])
             } else {
-                unconditional = try await predict(latents, timestep, hiddenNegative, copies: 1)
-                conditional = try await predict(latents, timestep, hiddenPositive, copies: 1)
+                unconditional = try await predict(latents, timestep, hidden.negative, copies: 1)
+                conditional = try await predict(latents, timestep, hidden.positive, copies: 1)
             }
-            let guided = DiffusionGuidance.combine(unconditional: unconditional, conditional: conditional, scale: request.guidanceScale)
+            let guided = DiffusionGuidance.combine(unconditional: unconditional, conditional: conditional, scale: guidance)
             latents = scheduler.step(output: guided, sample: latents)
-            report(.step(index + 1, total))
+            onStep(scheduler.stepIndex, total)
         }
-        return Latents(values: latents, shape: latentShape)
+        return latents
     }
 
-    /// 潜在表現の倍率（Stable Diffusion 1.x / 2.x の VAE）
-    private static let latentScale: Float = 0.18215
+    private func predict(_ latentValues: [Float], _ timestep: Int, _ hiddenStates: MLMultiArray, copies: Int) async throws -> [Float] {
+        var values = latentValues
+        if copies == 2 { values.append(contentsOf: latentValues) }
+        let sampleArray = try ImageTensors.array(shape: [copies] + Array(latentShape[1...]), dataType: sampleType, values: values)
+        let timeArray = try ImageTensors.array(shape: [copies], dataType: timeType,
+                                               values: [Float](repeating: Float(timestep), count: copies))
+        let provider = try MLDictionaryFeatureProvider(dictionary: [
+            "sample": MLFeatureValue(multiArray: sampleArray),
+            "timestep": MLFeatureValue(multiArray: timeArray),
+            "encoder_hidden_states": MLFeatureValue(multiArray: hiddenStates),
+        ])
+        let model = self.model
+        return try await InferenceQueue.run {
+            let output = try model.prediction(from: provider, options: MLPredictionOptions())
+            guard let prediction = output.featureValue(for: "noise_pred")?.multiArrayValue else {
+                throw ImageGenerationError.missingOutput("noise_pred")
+            }
+            return ImageTensors.floats(prediction)
+        }
+    }
+}
 
-    private static func decode(files: ImageModelFiles, latents: Latents, computeUnits: MLComputeUnits) async throws -> CGImage {
-        let model = try await loadModel(files.vaeDecoder, computeUnits: computeUnits)
+/// VAE デコーダを読み込んだもの（潜在表現 → 画像）
+final class DiffusionDecoder: @unchecked Sendable {
+    /// 潜在表現の倍率（Stable Diffusion 1.x / 2.x の VAE）
+    static let latentScale: Float = 0.18215
+
+    private let model: MLModel
+    private let inputType: MLMultiArrayDataType
+
+    init(url: URL, computeUnits: MLComputeUnits) async throws {
+        let model = try await DiffusionModels.load(url, computeUnits: computeUnits)
         guard let input = model.modelDescription.inputDescriptionsByName["z"]?.multiArrayConstraint else {
             throw ImageGenerationError.missingInput("z")
         }
-        let scaled = latents.values.map { $0 / latentScale }
-        let array = try ImageTensors.array(shape: latents.shape, dataType: input.dataType, values: scaled)
+        self.model = model
+        inputType = input.dataType
+    }
+
+    func decode(_ latents: [Float], shape: [Int]) async throws -> CGImage {
+        let scaled = latents.map { $0 / Self.latentScale }
+        let array = try ImageTensors.array(shape: shape, dataType: inputType, values: scaled)
         let provider = try MLDictionaryFeatureProvider(dictionary: ["z": MLFeatureValue(multiArray: array)])
+        let model = self.model
         return try await InferenceQueue.run {
             let output = try model.prediction(from: provider, options: MLPredictionOptions())
             guard let image = output.featureValue(for: "image")?.multiArrayValue else {

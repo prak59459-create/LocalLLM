@@ -17,10 +17,33 @@ struct GeneratedImage: Codable, Identifiable, Hashable, Sendable {
     var seconds: Double
 }
 
+/// 作った動画 1 本の記録（動画のフォルダの index.json に保存する）。
+struct GeneratedVideo: Codable, Identifiable, Hashable, Sendable {
+    var id: UUID
+    var fileName: String
+    var prompt: String
+    var endPrompt: String
+    var seed: UInt64
+    var settings: VideoSettings
+    var modelTitle: String
+    var createdAt: Date
+    var seconds: Double
+
+    static func == (lhs: GeneratedVideo, rhs: GeneratedVideo) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+/// 画像を作るか、動画を作るか
+enum StudioMode: String, CaseIterable, Identifiable {
+    case image, video
+    var id: String { rawValue }
+}
+
 /// 画像生成の画面の状態と操作。
 @MainActor
 @Observable
 final class ImageStudio {
+    var mode: StudioMode = .image
     var prompt = ""
     var negativePrompt = ""
     var stepCount = 20
@@ -30,27 +53,43 @@ final class ImageStudio {
     var seed: UInt64 = 42
     var selectedRepoID: String?
 
-    private(set) var isGenerating = false
-    private(set) var status: String?
+    var isGenerating = false
+    var status: String?
     /// ノイズ除去の進み具合
-    private(set) var step: (done: Int, total: Int)?
-    private(set) var errorMessage: String?
+    var step: (done: Int, total: Int)?
+    var errorMessage: String?
     private(set) var images: [GeneratedImage] = []
     /// いま表示している画像
     var currentID: UUID?
     /// 画像生成の画面を出しているか
     var isPresented = false
 
+    // 動画
+    /// 動画の最後のコマのプロンプト（空なら同じプロンプト）
+    var endPrompt = ""
+    var videoSettings = VideoSettings()
+    var videos: [GeneratedVideo] = []
+    var currentVideoID: UUID?
+    /// 動画を作っている途中に、できたキーフレーム
+    var videoPreview: UIImage?
+    /// 描き終えたキーフレームの数と全体
+    var keyframeProgress: (done: Int, total: Int)?
+
     @ObservationIgnored private let generator = ImageGenerator()
-    @ObservationIgnored private var task: Task<Void, Never>?
-    @ObservationIgnored private let fileManager = FileManager.default
+    @ObservationIgnored let videoGenerator = VideoGenerator()
+    @ObservationIgnored var task: Task<Void, Never>?
+    @ObservationIgnored let fileManager = FileManager.default
     let directory: URL
+    let videoDirectory: URL
 
     init() {
         let base = (try? FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
             ?? FileManager.default.temporaryDirectory
         directory = base.appendingPathComponent("Images", isDirectory: true)
+        videoDirectory = base.appendingPathComponent("Videos", isDirectory: true)
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: videoDirectory, withIntermediateDirectories: true)
+        loadVideos()
         if let data = try? Data(contentsOf: indexURL), let saved = try? JSONDecoder().decode([GeneratedImage].self, from: data) {
             images = saved.filter { fileManager.fileExists(atPath: directory.appendingPathComponent($0.fileName).path) }
         }

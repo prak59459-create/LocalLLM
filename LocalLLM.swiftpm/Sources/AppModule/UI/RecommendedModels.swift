@@ -123,6 +123,13 @@ enum RecommendedModels {
             category: .gguf, isGGUF: true
         ),
         RecommendedModel(
+            repoID: "ggml-org/gemma-4-E2B-it-GGUF", title: "Gemma 4 E2B (GGUF)",
+            approximateBytes: 2_841_000_000, japanese: .good, isExperimental: true,
+            note: L("Google の新しいモデル。賢いが大きめ（変換後は約 3.6GB。メモリには約 2.3GB）。メモリの多い iPad 向け。",
+                    "Google's new model. Smart but large (about 3.6 GB after conversion, about 2.3 GB in memory). For iPads with more memory."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
             repoID: "bartowski/SmolLM2-135M-Instruct-GGUF", title: "SmolLM2 135M (GGUF)",
             approximateBytes: 105_000_000, japanese: .none, isExperimental: false,
             note: L("一番小さい GGUF。動作確認に。", "The smallest GGUF, good for testing."),

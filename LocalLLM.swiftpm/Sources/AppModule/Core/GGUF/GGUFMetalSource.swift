@@ -16,7 +16,7 @@ enum GGUFMetalSource {
         case attentionScores = "attention_scores"
         case attentionSoftmax = "attention_softmax"
         case attentionCombine = "attention_combine"
-        case addRows = "add_rows"
+        case scaleAdd = "scale_add"
         case gatedActivation = "gated_activation"
     }
 
@@ -26,6 +26,15 @@ enum GGUFMetalSource {
         static let bias: UInt32 = 2
         static let splitPairs: UInt32 = 4
         static let gelu: UInt32 = 8
+        /// 正規化: 重みを掛ける・バイアスを足す・LayerNorm（平均も引く）
+        static let normWeight: UInt32 = 16
+        static let normBias: UInt32 = 32
+        static let layerNorm: UInt32 = 64
+        /// 活性化: up と掛けない（gate の無い FFN）・ReLU²
+        static let noUp: UInt32 = 128
+        static let reluSquared: UInt32 = 256
+        /// scale_add: 2 つ目の入力を足す
+        static let second: UInt32 = 512
     }
 
     static let code = """
@@ -175,22 +184,39 @@ enum GGUFMetalSource {
         linear_four((device const packed_float4 *)(weights + a.weightSkip), scales, bias, input, output, a, gid);
     }
 
-    // RMSNorm。gid = 行（rows 行 × columns）。入力と出力は同じ場所でもよい
+    // 正規化（RMSNorm か LayerNorm）。gid = 行（rows 行 × columns）。入力と出力は同じ場所でもよい。
+    // heads > 1 なら、行ごとに (行 % heads) 番目の重みを使う（ヘッドごとに違う重み）
     kernel void rms_norm(device const float *input [[buffer(0)]],
                          device const float *weight [[buffer(1)]],
-                         device float *output [[buffer(2)]],
-                         constant Args &a [[buffer(3)]],
+                         device const float *bias [[buffer(2)]],
+                         device float *output [[buffer(3)]],
+                         constant Args &a [[buffer(4)]],
                          uint gid [[thread_position_in_grid]]) {
         if (gid >= a.rows) { return; }
         device const float *x = input + a.inOffset + gid * a.columns;
         device float *y = output + a.outOffset + gid * a.columns;
+        uint w = (a.heads > 1u) ? (gid % a.heads) * a.columns : 0u;
+        bool layer = (a.flags & 64u) != 0u;
+        float mean = 0.0f;
+        if (layer) {
+            for (uint i = 0; i < a.columns; i++) {
+                mean += x[i];
+            }
+            mean /= float(a.columns);
+        }
         float sum = 0.0f;
         for (uint i = 0; i < a.columns; i++) {
-            sum += x[i] * x[i];
+            float v = x[i] - mean;
+            sum += v * v;
         }
         float factor = 1.0f / sqrt(sum / float(a.columns) + a.epsilon);
+        bool hasWeight = (a.flags & 16u) != 0u;
+        bool hasBias = (a.flags & 32u) != 0u;
         for (uint i = 0; i < a.columns; i++) {
-            y[i] = x[i] * factor * weight[i];
+            float v = (x[i] - mean) * factor;
+            if (hasWeight) { v *= weight[w + i]; }
+            if (hasBias) { v += bias[w + i]; }
+            y[i] = v;
         }
     }
 
@@ -290,16 +316,21 @@ enum GGUFMetalSource {
         out[gid.x] = sum;
     }
 
-    // x += y。gid = 要素
-    kernel void add_rows(device float *x [[buffer(0)]],
-                         device const float *y [[buffer(1)]],
-                         constant Args &a [[buffer(2)]],
-                         uint gid [[thread_position_in_grid]]) {
+    // out = scale × x + softcap × y（y は flags に 512 があるときだけ）。gid = 要素。
+    // x は inOffset、y は total、out は outOffset から。out は x と同じ場所でもよい
+    kernel void scale_add(device const float *x [[buffer(0)]],
+                          device const float *y [[buffer(1)]],
+                          device float *out [[buffer(2)]],
+                          constant Args &a [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
         if (gid >= a.count) { return; }
-        x[gid] += y[gid];
+        float v = a.scale * x[a.inOffset + gid];
+        if ((a.flags & 512u) != 0u) { v += a.softcap * y[a.total + gid]; }
+        out[a.outOffset + gid] = v;
     }
 
-    // gate = act(gate) × up。gid = 要素
+    // gate = act(gate) × up（flags に 128 があれば up と掛けない）。gid = 要素。
+    // inStride > 0 なら、up は columns 個ごとに inStride ずつ進む（層ごとの入力の 1 層ぶん）
     kernel void gated_activation(device float *gate [[buffer(0)]],
                                  device const float *up [[buffer(1)]],
                                  constant Args &a [[buffer(2)]],
@@ -309,10 +340,18 @@ enum GGUFMetalSource {
         float value;
         if ((a.flags & 8u) != 0u) {
             value = 0.5f * g * (1.0f + safe_tanh(0.7978845608028654f * g * (1.0f + 0.044715f * g * g)));
+        } else if ((a.flags & 256u) != 0u) {
+            float r = max(g, 0.0f);
+            value = r * r;
         } else {
             value = g / (1.0f + exp(min(-g, 80.0f)));
         }
-        gate[gid] = value * up[gid];
+        if ((a.flags & 128u) == 0u) {
+            uint index = gid;
+            if (a.inStride > 0u) { index = (gid / a.columns) * a.inStride + gid % a.columns; }
+            value *= up[a.inOffset + index];
+        }
+        gate[gid] = value;
     }
     """
 }

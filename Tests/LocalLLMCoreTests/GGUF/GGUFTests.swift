@@ -221,8 +221,13 @@ final class GGUFModelTests: XCTestCase {
     func testRealModelsMatchLlamaCpp() throws {
         guard let directory = GGUFFixtures.realModels else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
         // 正解のある本物のモデルのうち、フォルダに置いてあるものを確かめる（CI では SmolLM2 だけ）
-        let names = ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0", "qwen2.5-0.5b-q4_k_m", "qwen3-0.6b-q4_k_m",
-                     "gemma-3-1b-q4_k_m", "llama-3.2-1b-q4_k_m"]
+        var names = ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0", "qwen2.5-0.5b-q4_k_m", "qwen3-0.6b-q4_k_m",
+                     "gemma-3-1b-q4_k_m", "llama-3.2-1b-q4_k_m", "qwen2.5-1.5b-q4_k_m", "gemma-4-e2b-q4_0"]
+        // LOCALLLM_GGUF_ONLY で、確かめるモデルを絞れる（カンマ区切り）
+        if let only = ProcessInfo.processInfo.environment["LOCALLLM_GGUF_ONLY"] {
+            let wanted = Set(only.split(separator: ",").map(String.init))
+            names = names.filter { wanted.contains($0) }
+        }
         var checked = 0
         defer { print("GGUF real models checked: \(checked)") }
         for name in names {

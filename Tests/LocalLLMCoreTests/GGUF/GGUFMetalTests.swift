@@ -96,6 +96,32 @@ final class GGUFMetalTests: XCTestCase {
         }
     }
 
+    /// ほかの構造も、GPU と CPU で同じ logits になる（CPU は llama.cpp と一致することを GGUFModelTests で確かめている）
+    func testMoreArchitecturesMatchCPU() throws {
+        try requireDevice()
+        var failures: [String] = []
+        for family in GGUFModelTests.moreFamilies {
+            for compact in [false, true] {
+                let file = try convert(family, compact: compact)
+                defer { try? FileManager.default.removeItem(at: file) }
+                let store = try GGUFWeightStore(url: file)
+                let gpu = try GGUFMetalModel(store: store)
+                let cpu = try GGUFModel(store: store)
+                let tokens = try reference(family).tokens
+                var worst: Float = 0
+                for token in tokens {
+                    worst = max(worst, GGUFModelFactory.relativeDifference(try gpu.evaluate([token]), try cpu.evaluate([token])))
+                }
+                gpu.releaseCache()
+                cpu.releaseCache()
+                let batched = GGUFModelFactory.relativeDifference(try gpu.evaluate(tokens, batch: 6), try cpu.evaluate(tokens, batch: 6))
+                print("GGUF Metal \(family)\(compact ? " (8-bit)" : ""): relative difference from CPU \(worst), batched \(batched)")
+                if worst > 0.002 || batched > 0.002 { failures.append("\(family) \(compact): \(worst) / \(batched)") }
+            }
+        }
+        XCTAssertEqual(failures, [])
+    }
+
     /// 読み込みの入口は、GPU が使えれば GPU 用を返す。CPU だけの設定なら CPU 用を返す
     func testFactoryPicksTheGPU() throws {
         try requireDevice()

@@ -56,6 +56,15 @@ struct DPMSolverScheduler {
 
     var isFinished: Bool { stepIndex >= timesteps.count }
 
+    /// index 番目の時刻のノイズの大きさ σ
+    func noiseLevel(at index: Int) -> Double { sigmas[max(0, min(index, sigmas.count - 1))] }
+
+    /// 途中の段階から始める（画像から画像を描き直すとき。それまでの見積もりは捨てる）
+    mutating func start(at index: Int) {
+        stepIndex = max(0, min(index, timesteps.count))
+        estimates = []
+    }
+
     /// σ から、画像に掛かる倍率 α とノイズに掛かる倍率
     private static func scales(_ sigma: Double) -> (alpha: Double, sigma: Double) {
         let alpha = 1 / (sigma * sigma + 1).squareRoot()

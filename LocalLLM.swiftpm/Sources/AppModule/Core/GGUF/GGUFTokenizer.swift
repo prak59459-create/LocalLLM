@@ -35,6 +35,8 @@ enum GGUFTokenizer {
             root = sentencePiece(file: file, tokens: tokens, types: types)
         case "gpt2":
             root = byteLevel(file: file, tokens: tokens, types: types)
+        case "gemma4":
+            root = gemma4(file: file, tokens: tokens, types: types)
         default:
             throw TokenizerError.unsupported(L("GGUF のトークナイザ「\(model)」", "the GGUF tokenizer \"\(model)\""))
         }
@@ -159,6 +161,60 @@ enum GGUFTokenizer {
         return root
     }
 
+    // MARK: - Gemma 4
+
+    /// Gemma 4: 空白を ▁ にしてから、改行で区切った行ごとに BPE をかける（UTF-8 のまま。無い文字は <0xXX> のバイト）。
+    /// llama.cpp の LLAMA_VOCAB_PRE_TYPE_GEMMA4 と同じ。
+    private static func gemma4(file: GGUFFile, tokens: [String], types: [Int]) -> [String: Any] {
+        var vocab: [String: Int] = [:]
+        vocab.reserveCapacity(tokens.count)
+        for (index, token) in tokens.enumerated() where vocab[token] == nil { vocab[token] = index }
+        // "a b" を、2 文字目より後ろの最初の空白で分ける（llama.cpp の word.find(' ', 1) と同じ）
+        let merges: [[String]] = (file.metadata["tokenizer.ggml.merges"]?.stringArray ?? []).compactMap { merge in
+            let scalars = Array(merge.unicodeScalars)
+            guard scalars.count > 2, let space = scalars[1...].firstIndex(of: " ") else { return nil }
+            var left = String.UnicodeScalarView(), right = String.UnicodeScalarView()
+            left.append(contentsOf: scalars[..<space])
+            right.append(contentsOf: scalars[(space + 1)...])
+            return [String(left), String(right)]
+        }
+        var added: [[String: Any]] = []
+        for (index, token) in tokens.enumerated() where index < types.count {
+            guard let type = TokenType(rawValue: types[index]), type == .control || type == .userDefined else { continue }
+            added.append(TokenizerSynthesizer.AddedToken(id: index, content: token, special: type == .control).json)
+        }
+        var root: [String: Any] = [
+            "version": "1.0",
+            "truncation": NSNull(),
+            "padding": NSNull(),
+            "added_tokens": added,
+            "normalizer": ["type": "Replace", "pattern": ["String": " "], "content": "▁"],
+            "pre_tokenizer": ["type": "Split", "pattern": ["Regex": "[^\\n]+|[\\n]+"], "behavior": "Isolated", "invert": false],
+            "post_processor": NSNull(),
+            "decoder": ["type": "Sequence", "decoders": [
+                ["type": "Replace", "pattern": ["String": "▁"], "content": " "],
+                ["type": "ByteFallback"], ["type": "Fuse"],
+            ]],
+            "model": [
+                "type": "BPE", "dropout": NSNull(), "unk_token": NSNull(), "continuing_subword_prefix": "",
+                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": true, "ignore_merges": false,
+                "vocab": vocab, "merges": merges,
+            ] as [String: Any],
+        ]
+        // llama.cpp は Gemma 4 では必ず先頭に BOS を付ける
+        if let bos = file.int("tokenizer.ggml.bos_token_id"), bos >= 0, bos < tokens.count {
+            let token = tokens[bos]
+            root["post_processor"] = [
+                "type": "TemplateProcessing",
+                "single": [["SpecialToken": ["id": token, "type_id": 0]], ["Sequence": ["id": "A", "type_id": 0]]],
+                "pair": [["SpecialToken": ["id": token, "type_id": 0]], ["Sequence": ["id": "A", "type_id": 0]],
+                         ["Sequence": ["id": "B", "type_id": 1]]],
+                "special_tokens": [token: ["id": token, "ids": [bos], "tokens": [token]]],
+            ] as [String: Any]
+        }
+        return root
+    }
+
     // MARK: - 付属の設定
 
     /// tokenizer_config.json に当たるもの（BOS / EOS の文字列とチャットテンプレート）
@@ -186,6 +242,18 @@ enum GGUFTokenizer {
         for key in ["eos_token_id", "eot_token_id", "eom_token_id"] {
             if let id = file.int("tokenizer.ggml.\(key)"), id >= 0, !ids.contains(id) { ids.append(id) }
         }
+        // llama.cpp と同じく、ターンの終わりを表す決まったトークンでも止める（Gemma 4 の <turn|> など）
+        let tokens = file.metadata["tokenizer.ggml.tokens"]?.stringArray ?? []
+        for (index, token) in tokens.enumerated() where endOfGenerationTokens.contains(token) && !ids.contains(index) {
+            ids.append(index)
+        }
         return try JSONSerialization.data(withJSONObject: ["eos_token_id": ids])
     }
+
+    /// llama.cpp（llama-vocab.cpp）が生成の終わりと見なすトークン
+    static let endOfGenerationTokens: Set<String> = [
+        "<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>", "<|calls|>", "<end_of_turn>",
+        "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]", "<|end_of_text|>", "<end_of_utterance>",
+        "<eos>", "<turn|>", "<|tool_response>", "<｜end▁of▁sentence｜>", "[e~[",
+    ]
 }

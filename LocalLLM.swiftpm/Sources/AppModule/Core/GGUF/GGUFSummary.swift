@@ -16,6 +16,9 @@ struct GGUFSummary: Codable, Hashable, Sendable {
     var storeBytes: Int64
     /// KV キャッシュの 1 トークンあたりのバイト数
     var kvBytesPerToken: Int
+    /// 変換後のファイルのうち、トークンごとに 1 行引くだけの表（Gemma 4 の層ごとの入力）のバイト数。
+    /// ほとんど読まないので、メモリの見積もりには入れない
+    var lookupBytes: Int64?
     var hasChatTemplate: Bool
     /// 動かせない理由（動かせるなら nil）
     var unsupportedReason: String?
@@ -41,6 +44,8 @@ struct GGUFSummary: Codable, Hashable, Sendable {
             vocabSize = config.vocabSize
             storeBytes = Int64(GGUFWeightStore.estimatedBytes(file: file, config: config, compact: true))
             kvBytesPerToken = config.kvBytesPerToken
+            lookupBytes = Int64(config.tensorNames(in: file).filter(GGUFModelConfig.isRawTensor)
+                .compactMap { file.tensor($0)?.byteCount }.reduce(0, +))
             unsupportedReason = nil
         } catch {
             contextLength = file.archInt("context_length") ?? 0
@@ -65,7 +70,7 @@ struct GGUFSummary: Codable, Hashable, Sendable {
 
     /// 動かすのに要るメモリの目安（変換後の重み + コンテキスト分の KV キャッシュ）
     func memoryBytes(context: Int) -> Int64 {
-        storeBytes + Int64(kvBytesPerToken) * Int64(context) + 64 << 20
+        storeBytes - (lookupBytes ?? 0) + Int64(kvBytesPerToken) * Int64(context) + 64 << 20
     }
 }
 
@@ -80,6 +85,8 @@ enum GGUFNaming {
         let name = (path as NSString).lastPathComponent.lowercased()
         guard name.hasSuffix(".gguf") else { return false }
         if name.contains("mmproj") || name.contains("imatrix") { return false }
+        // 先読みの補助モデル（MTP / ドラフト）は、単体の会話モデルではない
+        if name.hasPrefix("mtp-") || name.contains("-draft") { return false }
         return name.range(of: #"-\d{5}-of-\d{5}\.gguf$"#, options: .regularExpression) == nil
     }
 

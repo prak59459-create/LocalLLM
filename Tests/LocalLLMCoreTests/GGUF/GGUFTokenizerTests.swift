@@ -62,9 +62,40 @@ final class GGUFTokenizerTests: XCTestCase {
         print("GGUF tokenizers checked: \(checked)")
     }
 
+    /// Gemma 4（"gemma4" 形式の BPE）: llama.cpp が分けたトークンと同じになる（Tools/gguf/make_token_fixtures.py が作った正解）
+    func testGemma4TokenizerMatchesLlamaCpp() throws {
+        guard let file = header("ggml-org__gemma-4-E2B-it-GGUF") else {
+            throw XCTSkip("GGUF header fixtures missing (run ./Tools/fetch_fixtures.sh)")
+        }
+        let reference = try GGUFFixtures.json("tokens-gemma4.json")
+        let texts = try XCTUnwrap(reference["texts"] as? [String])
+        let expected = try XCTUnwrap(reference["tokens"] as? [[Int]])
+        let files = try GGUFTokenizer.files(from: file)
+        let tokenizer = try HFTokenizer(tokenizerJSON: files.tokenizerJSON, tokenizerConfigJSON: files.tokenizerConfigJSON)
+        for (text, ids) in zip(texts, expected) {
+            XCTAssertEqual(tokenizer.encode(text, addSpecialTokens: true), ids, text)
+            // 戻すと元の文になる（先頭の BOS を除く）
+            XCTAssertEqual(tokenizer.decode(Array(ids.dropFirst()), skipSpecialTokens: false), text, text)
+        }
+        // ターンの終わり（<turn|>）で止まる
+        let stops = try XCTUnwrap(JSONSerialization.jsonObject(with: files.generationConfigJSON) as? [String: Any])["eos_token_id"] as? [Int]
+        let turnEnd = try XCTUnwrap(file.metadata["tokenizer.ggml.tokens"]?.stringArray?.firstIndex(of: "<turn|>"))
+        XCTAssertTrue(stops?.contains(turnEnd) ?? false)
+        // 構造: 35 層、15 層目から KV を借りる、層ごとの入力 256
+        let config = try GGUFModelConfig(file: file)
+        XCTAssertEqual(config.family, .gemma4)
+        XCTAssertEqual(config.layers.count, 35)
+        XCTAssertEqual(config.layers[0].headSize, 256)
+        XCTAssertEqual(config.layers[4].headSize, 512)
+        XCTAssertEqual(config.layers[15].kvLayer, 13)
+        XCTAssertEqual(config.layers[19].kvLayer, 14)
+        XCTAssertEqual(config.perLayerInputSize, 256)
+        XCTAssertEqual(config.attentionScale, 1)
+    }
+
     func testModelConfigsOfRealFiles() throws {
         var checked = 0
-        for pair in pairs + [("bartowski__google_gemma-3-1b-it-GGUF", "", "")] {
+        for pair in pairs + [("bartowski__google_gemma-3-1b-it-GGUF", "", ""), ("ggml-org__gemma-4-E2B-it-GGUF", "", "")] {
             guard let file = header(pair.header) else { continue }
             let config = try GGUFModelConfig(file: file)
             XCTAssertGreaterThan(config.layerCount, 0, pair.header)
@@ -93,6 +124,7 @@ final class GGUFRepositoryTests: XCTestCase {
         XCTAssertNil(GGUFNaming.quantization(of: "model.gguf"))
         XCTAssertTrue(GGUFNaming.isStandaloneModel("a/Model-Q4_K_M.gguf"))
         XCTAssertFalse(GGUFNaming.isStandaloneModel("mmproj-model-f16.gguf"))
+        XCTAssertFalse(GGUFNaming.isStandaloneModel("mtp-gemma-4-E2B-it-Q4_0.gguf"))
         XCTAssertFalse(GGUFNaming.isStandaloneModel("Model-Q4_K_M-00001-of-00003.gguf"))
         XCTAssertFalse(GGUFNaming.isStandaloneModel("Model.imatrix"))
         XCTAssertTrue(GGUFNaming.isReadable(quantization: "Q4_K_M"))

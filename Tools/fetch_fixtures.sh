@@ -121,6 +121,7 @@ GGUF_HEADERS=(
   "bartowski/gemma-2-2b-it-GGUF|gemma-2-2b-it-Q4_K_M.gguf"
   "bartowski/Mistral-7B-Instruct-v0.3-GGUF|Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
   "bartowski/google_gemma-3-1b-it-GGUF|google_gemma-3-1b-it-Q4_K_M.gguf"
+  "ggml-org/gemma-4-E2B-it-GGUF|gemma-4-E2B-it-Q4_0.gguf"
 )
 mkdir -p "$OUT/gguf-headers"
 for entry in "${GGUF_HEADERS[@]}"; do

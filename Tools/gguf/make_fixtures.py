@@ -188,12 +188,15 @@ REAL = [
     ("llama-3.2-1b-q4_k_m", "Llama-3.2-1B-Instruct-Q4_K_M.gguf", "The capital of France is"),
     # 速さの目標にしているモデル（macOS の CI で GPU の計算を確かめるのに使う）
     ("qwen2.5-1.5b-q4_k_m", "qwen2.5-1.5b-instruct-q4_k_m.gguf", "The capital of France is"),
+    ("gemma-4-e2b-q4_0", "gemma-4-E2B-it-Q4_0.gguf", "The capital of France is"),
 ]
 
 
-def make_real(directory):
+def make_real(directory, only=None):
     import llama_cpp
     for name, filename, prompt in REAL:
+        if only and name not in only:
+            continue
         path = os.path.join(directory, filename)
         if not os.path.exists(path):
             print("missing", path)
@@ -226,13 +229,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--real", help="本物の GGUF を置いたフォルダ")
     parser.add_argument("--skip-tiny", action="store_true")
+    parser.add_argument("--only", nargs="*", help="作る本物のモデルの名前")
     args = parser.parse_args()
     os.makedirs(OUT, exist_ok=True)
     make_quant_blocks()
     if not args.skip_tiny:
         make_tiny_models()
     if args.real:
-        make_real(args.real)
+        make_real(args.real, args.only)
 
 
 if __name__ == "__main__":

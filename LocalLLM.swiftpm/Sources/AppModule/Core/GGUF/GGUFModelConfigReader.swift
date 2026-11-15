@@ -116,39 +116,12 @@ extension GGUFModelConfig {
         (slidingWindow, slidingLayers) = Self.sliding(family: family, file: file, layers: layerCount)
 
         // 層ごとの形
-        let heads = try Self.perLayer(file, "attention.head_count", layers: layerCount)
-        let kvHeads = Self.perLayerOptional(file, "attention.head_count_kv", layers: layerCount) ?? heads
-        let fullHead = file.archInt("attention.key_length") ?? (embeddingSize / max(heads[0], 1))
-        let slidingHead = file.archInt("attention.key_length_swa") ?? fullHead
-        if let value = file.archInt("attention.value_length"), value != fullHead {
-            throw GGUFError.unsupportedArchitecture("\(arch) (key_length != value_length)")
-        }
-        if let value = file.archInt("attention.value_length_swa"), value != slidingHead {
-            throw GGUFError.unsupportedArchitecture("\(arch) (key_length_swa != value_length_swa)")
-        }
-        let shared = family == .gemma4 ? (file.archInt("attention.shared_kv_layers") ?? 0) : 0
-        let ownCache = layerCount - shared
-        var shapes: [Layer] = []
-        for index in 0..<layerCount {
-            let sliding = slidingWindow > 0 && slidingLayers[index]
-            let usesRope = Self.usesRope(family: family, file: file, layer: index, sliding: sliding, hasSliding: slidingWindow > 0)
-            var kvLayer = index
-            if index >= ownCache { kvLayer = ownCache - (sliding ? 2 : 1) }
-            let ff = try Self.feedForwardSize(file, layer: index, fused: hasFusedGateUp)
-            shapes.append(Layer(headCount: heads[index], kvHeadCount: kvHeads[index], headSize: sliding ? slidingHead : fullHead,
-                                feedForwardSize: ff, usesRope: rules.rope && usesRope, sliding: sliding, kvLayer: kvLayer))
-        }
-        for (index, shape) in shapes.enumerated() {
-            guard shape.headCount > 0, shape.kvHeadCount > 0, shape.headCount % shape.kvHeadCount == 0,
-                  shape.kvLayer >= 0, shape.kvLayer <= index else { throw GGUFError.invalid("head counts") }
-            let source = shapes[shape.kvLayer]
-            guard source.kvLayer == shape.kvLayer, source.kvSize == shape.kvSize, source.sliding == shape.sliding else {
-                throw GGUFError.invalid("shared KV layer \(index)")
-            }
-        }
+        let read = try Self.readShapes(file, family: family, rules: rules, layers: layerCount, embeddingSize: embeddingSize,
+                                       slidingWindow: slidingWindow, slidingLayers: slidingLayers)
+        let shapes = read.shapes, fullHead = read.fullHead, slidingHead = read.slidingHead
         layerShapes = shapes
-        headCount = heads.max() ?? 1
-        kvHeadCount = kvHeads.max() ?? 1
+        headCount = shapes.map(\.headCount).max() ?? 1
+        kvHeadCount = shapes.map(\.kvHeadCount).max() ?? 1
         headSize = max(fullHead, slidingHead)
         feedForwardSize = shapes.map(\.feedForwardSize).max() ?? 0
 
@@ -162,43 +135,25 @@ extension GGUFModelConfig {
         ropeFactorsOnSlidingLayers = family != .gemma4
         (ropeScale, yarn) = Self.ropeScaling(file)
         // llama.cpp: 直近だけを見る層は、系列によって全体と同じ倍率か、伸ばさない（1）
-        switch family {
-        case .gemma2, .cohere2, .exaone4: slidingRopeScale = ropeScale
-        default: slidingRopeScale = 1
-        }
-        if yarn == nil, let original = file.archInt("rope.scaling.original_context_length"), original > 0 {
-            // 学習時より長い文脈に伸ばす仕組みのうち、YaRN 以外は使わないので、学習時の長さまでにする
-            contextLength = min(contextLength, original)
-        }
-        if family == .mistral3, (file.archDouble("attention.temperature_scale") ?? 0) != 0 {
-            // 長い文脈で q を強める仕組みは、元の長さの中では効かないので、その長さまでにする
-            contextLength = min(contextLength, yarn?.originalContext ?? contextLength)
-        }
-        if rules.learnedPositions {
-            guard let positions = file.tensor("position_embd.weight") else { throw GGUFError.missingTensor("position_embd.weight") }
-            contextLength = min(contextLength, positions.rows)
-        }
+        let scalesSliding: Set<Family> = [.gemma2, .cohere2, .exaone4]
+        slidingRopeScale = scalesSliding.contains(family) ? ropeScale : 1
+        contextLength = try Self.usableContext(file, family: family, trained: contextLength, yarn: yarn,
+                                               learnedPositions: rules.learnedPositions)
 
-        // 倍率
-        attentionScale = 1 / Float(fullHead).squareRoot()
-        if let scale = file.archDouble("attention.scale"), scale != 0 { attentionScale = Float(scale) }
-        if family == .gemma4 { attentionScale = 1 }
-        embeddingScale = rules.gemmaEmbedding ? Float(embeddingSize).squareRoot() : 1
+        // 倍率（あとで applyScales が系列ごとに決める）
+        attentionScale = 1
+        embeddingScale = 1
         residualScale = 1
         logitScale = 1
         attentionSoftcap = 0
         finalSoftcap = 0
 
         // 正規化
-        hasPostNorms = family != .seedOSS && file.has("blk.0.post_attention_norm.weight") && file.has("blk.0.post_ffw_norm.weight")
-        let qNorm = file.tensor("blk.0.attn_q_norm.weight")
-        hasQKNorm = qNorm != nil
-        qkNormIsFull = (qNorm?.dimensions.count ?? 0) == 1 && (qNorm?.elementCount ?? 0) == shapes[0].querySize
-            && shapes[0].headCount > 1
+        (hasPostNorms, hasQKNorm, qkNormIsFull) = Self.normalization(file, family: family, first: shapes[0])
         hasValueNorm = family == .gemma4
         qkNormAfterRope = family == .maincoder
         perLayerInputSize = file.has("per_layer_token_embd.weight") ? (file.archInt("embedding_length_per_layer_input") ?? 0) : 0
-        applyScales(family: family, file: file)
+        applyScales(family: family, file: file, headSize: fullHead, gemmaEmbedding: rules.gemmaEmbedding)
 
         if family == .baichuan && layerCount != 32 {
             // llama.cpp は 7B（32 層）だけ RoPE、それ以外は ALiBi
@@ -208,6 +163,65 @@ extension GGUFModelConfig {
             throw GGUFError.unsupportedArchitecture("olmo (clamp_kqv)")
         }
         try validateTensors(file)
+    }
+
+    /// 層ごとの形（ヘッドの数・大きさ・FFN・RoPE を使うか・KV キャッシュを持つ層）
+    private static func readShapes(_ file: GGUFFile, family: Family, rules: Rules, layers: Int, embeddingSize: Int,
+                                   slidingWindow: Int, slidingLayers: [Bool]) throws
+        -> (shapes: [Layer], fullHead: Int, slidingHead: Int) {
+        let arch = file.architecture
+        let heads = try perLayer(file, "attention.head_count", layers: layers)
+        let kvHeads = perLayerOptional(file, "attention.head_count_kv", layers: layers) ?? heads
+        let fullHead = file.archInt("attention.key_length") ?? (embeddingSize / max(heads[0], 1))
+        let slidingHead = file.archInt("attention.key_length_swa") ?? fullHead
+        if let value = file.archInt("attention.value_length"), value != fullHead {
+            throw GGUFError.unsupportedArchitecture("\(arch) (key_length != value_length)")
+        }
+        if let value = file.archInt("attention.value_length_swa"), value != slidingHead {
+            throw GGUFError.unsupportedArchitecture("\(arch) (key_length_swa != value_length_swa)")
+        }
+        let shared = family == .gemma4 ? (file.archInt("attention.shared_kv_layers") ?? 0) : 0
+        let ownCache = layers - shared
+        var shapes: [Layer] = []
+        for index in 0..<layers {
+            let sliding = slidingWindow > 0 && slidingLayers[index]
+            let rope = rules.rope && usesRope(family: family, file: file, layer: index, sliding: sliding, hasSliding: slidingWindow > 0)
+            let kvLayer = index >= ownCache ? ownCache - (sliding ? 2 : 1) : index
+            let ff = try feedForwardSize(file, layer: index)
+            shapes.append(Layer(headCount: heads[index], kvHeadCount: kvHeads[index], headSize: sliding ? slidingHead : fullHead,
+                                feedForwardSize: ff, usesRope: rope, sliding: sliding, kvLayer: kvLayer))
+        }
+        try validateShapes(shapes)
+        return (shapes, fullHead, slidingHead)
+    }
+
+    private static func validateShapes(_ shapes: [Layer]) throws {
+        for (index, shape) in shapes.enumerated() {
+            guard shape.headCount > 0, shape.kvHeadCount > 0, shape.headCount % shape.kvHeadCount == 0,
+                  shape.kvLayer >= 0, shape.kvLayer <= index else { throw GGUFError.invalid("head counts") }
+            let source = shapes[shape.kvLayer]
+            guard source.kvLayer == shape.kvLayer, source.kvSize == shape.kvSize, source.sliding == shape.sliding else {
+                throw GGUFError.invalid("shared KV layer \(index)")
+            }
+        }
+    }
+
+    /// 使える文脈の長さ（伸ばす仕組みのうち使わないものがあれば、その元の長さまで）
+    private static func usableContext(_ file: GGUFFile, family: Family, trained: Int, yarn: YaRN?, learnedPositions: Bool) throws -> Int {
+        var context = trained
+        if yarn == nil, let original = file.archInt("rope.scaling.original_context_length"), original > 0 {
+            // 学習時より長い文脈に伸ばす仕組みのうち、YaRN 以外は使わないので、学習時の長さまでにする
+            context = min(context, original)
+        }
+        if family == .mistral3, (file.archDouble("attention.temperature_scale") ?? 0) != 0 {
+            // 長い文脈で q を強める仕組みは、元の長さの中では効かないので、その長さまでにする
+            context = min(context, yarn?.originalContext ?? context)
+        }
+        if learnedPositions {
+            guard let positions = file.tensor("position_embd.weight") else { throw GGUFError.missingTensor("position_embd.weight") }
+            context = min(context, positions.rows)
+        }
+        return context
     }
 
     private static func require(_ file: GGUFFile, _ suffix: String) throws -> Int {
@@ -230,7 +244,7 @@ extension GGUFModelConfig {
         return values
     }
 
-    private static func feedForwardSize(_ file: GGUFFile, layer: Int, fused: Bool) throws -> Int {
+    private static func feedForwardSize(_ file: GGUFFile, layer: Int) throws -> Int {
         if let down = file.tensor("blk.\(layer).ffn_down.weight") { return down.columns }
         if let sizes = perLayerOptional(file, "feed_forward_length", layers: layer + 1) { return sizes[layer] }
         throw GGUFError.missingMetadata("\(file.architecture).feed_forward_length")
@@ -304,8 +318,20 @@ extension GGUFModelConfig {
         return (scale, yarn)
     }
 
-    /// 系列ごとの倍率（埋め込み・FFN の出力・logits・tanh の上限）
-    private mutating func applyScales(family: Family, file: GGUFFile) {
+    /// 後ろの正規化・q / k の正規化（全体か、ヘッドごとか）
+    private static func normalization(_ file: GGUFFile, family: Family, first: Layer) -> (Bool, Bool, Bool) {
+        let post = family != .seedOSS && file.has("blk.0.post_attention_norm.weight") && file.has("blk.0.post_ffw_norm.weight")
+        guard let qNorm = file.tensor("blk.0.attn_q_norm.weight") else { return (post, false, false) }
+        let full = qNorm.dimensions.count == 1 && qNorm.elementCount == first.querySize && first.headCount > 1
+        return (post, true, full)
+    }
+
+    /// 系列ごとの倍率（注意・埋め込み・FFN の出力・logits・tanh の上限）
+    private mutating func applyScales(family: Family, file: GGUFFile, headSize: Int, gemmaEmbedding: Bool) {
+        attentionScale = 1 / Float(headSize).squareRoot()
+        if let scale = file.archDouble("attention.scale"), scale != 0 { attentionScale = Float(scale) }
+        if family == .gemma4 { attentionScale = 1 }
+        if gemmaEmbedding { embeddingScale = Float(embeddingSize).squareRoot() }
         switch family {
         case .gemma2:
             attentionSoftcap = Float(file.archDouble("attn_logit_softcapping") ?? 50)

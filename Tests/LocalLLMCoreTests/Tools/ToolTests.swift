@@ -328,6 +328,9 @@ final class WebLiveTests: XCTestCase {
             XCTAssertFalse(results.isEmpty)
         } catch WebToolError.blocked {
             throw XCTSkip("DuckDuckGo refused this runner")
+        } catch let error as URLError where error.code == .timedOut {
+            // 共有の IP からだと、断る代わりに返事をしないことがある（結果の読み取りは testDuckDuckGoParser で確かめている）
+            throw XCTSkip("DuckDuckGo did not answer this runner")
         }
     }
 }

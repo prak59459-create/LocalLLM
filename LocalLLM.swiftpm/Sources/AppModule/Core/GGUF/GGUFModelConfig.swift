@@ -11,7 +11,7 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         case gemma4, mistral3, internlm2, xverse, baichuan, ernie45 = "ernie4_5", granite, minicpm, arcee, smollm3
         case maincoder, qwen, qwen2vl, qwen3vl, exaone, exaone4, olmo, olmo2, seedOSS = "seed_oss", plamo, openelm
         case phi2, gpt2, starcoder, starcoder2, stablelm, gptneox, falcon, codeshell, orion, nemotron, jais2
-        case commandR = "command-r", cohere2, chatglm, glm4
+        case commandR = "command-r", cohere2, chatglm, glm4, lfm2
     }
 
     enum Activation: String, Codable, Sendable { case silu, gelu, reluSquared }
@@ -32,9 +32,39 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         var sliding: Bool
         /// KV キャッシュを持つ層の番号（自分の番号なら自分で持つ。違えば、その層のキャッシュを使う: Gemma 4）
         var kvLayer: Int
+        /// 注意の代わりに、短い畳み込みを使う層（LFM2）
+        var convolution = false
 
         var querySize: Int { headCount * headSize }
         var kvSize: Int { kvHeadCount * headSize }
+
+        init(headCount: Int, kvHeadCount: Int, headSize: Int, feedForwardSize: Int, usesRope: Bool, sliding: Bool, kvLayer: Int,
+             convolution: Bool = false) {
+            self.headCount = headCount
+            self.kvHeadCount = kvHeadCount
+            self.headSize = headSize
+            self.feedForwardSize = feedForwardSize
+            self.usesRope = usesRope
+            self.sliding = sliding
+            self.kvLayer = kvLayer
+            self.convolution = convolution
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case headCount, kvHeadCount, headSize, feedForwardSize, usesRope, sliding, kvLayer, convolution
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            headCount = try c.decode(Int.self, forKey: .headCount)
+            kvHeadCount = try c.decode(Int.self, forKey: .kvHeadCount)
+            headSize = try c.decode(Int.self, forKey: .headSize)
+            feedForwardSize = try c.decode(Int.self, forKey: .feedForwardSize)
+            usesRope = try c.decode(Bool.self, forKey: .usesRope)
+            sliding = try c.decode(Bool.self, forKey: .sliding)
+            kvLayer = try c.decode(Int.self, forKey: .kvLayer)
+            convolution = try c.decodeIfPresent(Bool.self, forKey: .convolution) ?? false
+        }
     }
 
     /// YaRN（学習時より長い文脈に伸ばす仕組み）の値
@@ -123,6 +153,8 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
     var slidingRopeScale: Float
     /// q / k の正規化を、RoPE の後に掛ける（Maincoder）
     var qkNormAfterRope: Bool
+    /// 短い畳み込みの長さ（LFM2。0 なら使わない）
+    var convolutionLength: Int
     var yarn: YaRN?
 
     var kvSize: Int { kvHeadCount * headSize }
@@ -147,9 +179,14 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
     /// 1 トークンあたりの KV キャッシュのバイト数（キャッシュを持つ層だけ）
     var kvBytesPerToken: Int {
         layers.enumerated().reduce(0) { total, item in
-            item.element.kvLayer == item.offset ? total + item.element.kvSize * 2 * MemoryLayout<Float>.size : total
+            // 畳み込みの層は、位置ごとに 1 つ（埋め込みの大きさ）を覚えておく
+            if item.element.convolution { return total + embeddingSize * MemoryLayout<Float>.size }
+            return item.element.kvLayer == item.offset ? total + item.element.kvSize * 2 * MemoryLayout<Float>.size : total
         }
     }
+
+    /// 注意を使う層の、いちばん大きいヘッドの数
+    var maxAttentionHeads: Int { layers.filter { !$0.convolution }.map(\.headCount).max() ?? headCount }
 
     func isSliding(_ layer: Int) -> Bool {
         slidingWindow > 0 && layer < slidingLayers.count && slidingLayers[layer]
@@ -185,7 +222,7 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         case hasFusedGateUp, tiedOutput, slidingWindow, slidingLayers, slidingRopeBase, name, quantization
         case layerShapes, norm, feedForward, parallelResidual, hasPreNorms, qkNormIsFull, hasValueNorm
         case learnedPositions, residualScale, logitScale, perLayerInputSize, slidingRopeDimensions
-        case ropeFactorsOnSlidingLayers, slidingRopeScale, qkNormAfterRope, yarn
+        case ropeFactorsOnSlidingLayers, slidingRopeScale, qkNormAfterRope, convolutionLength, yarn
     }
 
     init(from decoder: Decoder) throws {
@@ -235,6 +272,7 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         ropeFactorsOnSlidingLayers = try c.decodeIfPresent(Bool.self, forKey: .ropeFactorsOnSlidingLayers) ?? true
         slidingRopeScale = try c.decodeIfPresent(Float.self, forKey: .slidingRopeScale) ?? (family == .gemma3 ? 1 : ropeScale)
         qkNormAfterRope = try c.decodeIfPresent(Bool.self, forKey: .qkNormAfterRope) ?? false
+        convolutionLength = try c.decodeIfPresent(Int.self, forKey: .convolutionLength) ?? 0
         yarn = try c.decodeIfPresent(YaRN.self, forKey: .yarn)
     }
 }

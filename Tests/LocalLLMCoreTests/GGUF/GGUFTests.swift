@@ -79,7 +79,7 @@ final class GGUFModelTests: XCTestCase {
         "qwen", "qwen2vl", "qwen3vl", "exaone", "exaone4", "olmo", "olmo2", "seed_oss", "plamo", "openelm",
         "phi2", "gpt2", "starcoder", "starcoder2", "stablelm", "stablelm-par", "gptneox", "gptneox-seq", "falcon",
         "falcon-40b", "codeshell", "orion", "nemotron", "jais2", "command-r", "cohere2", "chatglm", "glm4",
-        "llama-yarn", "llama-linear", "gemma4",
+        "llama-yarn", "llama-linear", "gemma4", "lfm2",
     ]
     static var allFamilies: [String] { families + moreFamilies }
 

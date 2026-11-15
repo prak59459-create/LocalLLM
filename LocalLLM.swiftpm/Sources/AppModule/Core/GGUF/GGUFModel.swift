@@ -48,6 +48,7 @@ final class GGUFModel: GGUFEvaluator {
         self.maxContext = max(8, min(config.contextLength, maxContext ?? config.contextLength))
         shapes = config.layers
         let widest = max(config.maxFeedForwardSize, config.embeddingSize, config.maxQuerySize, config.perLayerInputSize)
+        // 畳み込みの層の入力の射影は 3 × 埋め込みの大きさ
         workers = GGUFWorkers(chunkCount: chunkCount, widestRow: widest)
         let globals = try GGUFGlobalWeights(store: store, config: config)
         self.globals = globals
@@ -67,6 +68,12 @@ final class GGUFModel: GGUFEvaluator {
         keys = []
         values = []
         for (index, shape) in shapes.enumerated() {
+            if shape.convolution {
+                // 畳み込みの層は、位置ごとの b × x を覚えておく（巻き戻しても、その位置から続けられる）
+                keys.append(Out.allocate(capacity: config.embeddingSize * maxContext))
+                values.append(nil)
+                continue
+            }
             let owns = shape.kvLayer == index
             keys.append(owns ? Out.allocate(capacity: shape.kvSize * maxContext) : nil)
             values.append(owns ? Out.allocate(capacity: shape.kvSize * maxContext) : nil)
@@ -236,6 +243,10 @@ final class GGUFModel: GGUFEvaluator {
 
     private func attention(_ index: Int, input: In, start: Int, count n: Int, into out: Out) {
         let layer = layers[index], shape = shapes[index]
+        if shape.convolution {
+            convolve(index, input: input, start: start, count: n, into: out)
+            return
+        }
         let q = shape.querySize, kv = shape.kvSize
         let qs = queries.reserve(n * q)
         linear(layer.query, bias: layer.queryBias, input: input, count: n, output: qs)
@@ -269,6 +280,35 @@ final class GGUFModel: GGUFEvaluator {
         let attention = attended.reserve(n * q)
         attend(index, queries: qs, start: start, count: n, into: attention)
         linear(layer.output, bias: layer.outputBias, input: attention, count: n, output: out)
+    }
+
+    /// 短い畳み込み（LFM2）: [b, c, x] = 射影、bx = b × x を位置ごとに覚え、
+    /// 出力 = c × Σ_j 重み[j] × bx[位置 − (長さ − 1) + j] → 出力の射影
+    private func convolve(_ index: Int, input: In, start: Int, count n: Int, into out: Out) {
+        let layer = layers[index]
+        guard let kernel = layer.convolutionKernel, let history = keys[index] else { return }
+        let d = config.embeddingSize, length = config.convolutionLength
+        let projected = queries.reserve(n * 3 * d)
+        linear(layer.query, bias: nil, input: input, count: n, output: projected)
+        for token in 0..<n {
+            let row = projected + token * 3 * d
+            MiniVector.multiply(row, row + 2 * d, history + (start + token) * d, d)
+        }
+        let mixed = attended.reserve(n * d)
+        for token in 0..<n {
+            let position = start + token
+            let target = mixed + token * d
+            for channel in 0..<d {
+                var sum: Float = 0
+                for offset in 0..<length {
+                    let source = position - (length - 1) + offset
+                    if source >= 0 { sum += kernel[channel * length + offset] * history[source * d + channel] }
+                }
+                target[channel] = sum
+            }
+            MiniVector.multiply(target, projected + token * 3 * d + d, target, d)
+        }
+        linear(layer.output, bias: nil, input: mixed, count: n, output: out)
     }
 
     /// q / k の正規化: 全体（OLMo 2）、ヘッドごとに同じ重み、ヘッドごとに違う重み（StableLM・Command R）

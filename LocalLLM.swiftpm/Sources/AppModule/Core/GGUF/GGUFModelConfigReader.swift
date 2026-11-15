@@ -34,7 +34,7 @@ extension GGUFModelConfig {
         case .olmo:
             rules.splitPairs = false
             rules.norm = .layer
-        case .qwen, .qwen2, .qwen2vl, .qwen3, .qwen3vl, .phi3, .exaone, .seedOSS, .openelm:
+        case .qwen, .qwen2, .qwen2vl, .qwen3, .qwen3vl, .phi3, .exaone, .seedOSS, .openelm, .lfm2:
             break
         case .plamo:
             rules.parallel = true
@@ -109,7 +109,8 @@ extension GGUFModelConfig {
         learnedPositions = rules.learnedPositions
         ropePairsAreSplit = rules.splitPairs
         tiedOutput = !file.has("output.weight")
-        hasFusedQKV = file.has("blk.0.attn_qkv.weight")
+        let firstAttention = (0..<layerCount).first { file.has("blk.\($0).attn_q.weight") || file.has("blk.\($0).attn_qkv.weight") } ?? 0
+        hasFusedQKV = file.has("blk.\(firstAttention).attn_qkv.weight")
         hasFusedGateUp = rules.feedForward == .gated && !file.has("blk.0.ffn_gate.weight")
 
         // 直近だけを見る層
@@ -149,7 +150,9 @@ extension GGUFModelConfig {
         finalSoftcap = 0
 
         // 正規化
-        (hasPostNorms, hasQKNorm, qkNormIsFull) = Self.normalization(file, family: family, first: shapes[0])
+        (hasPostNorms, hasQKNorm, qkNormIsFull) = Self.normalization(file, family: family, layer: firstAttention,
+                                                                     shape: shapes[firstAttention])
+        convolutionLength = family == .lfm2 ? (file.archInt("shortconv.l_cache") ?? 3) : 0
         hasValueNorm = family == .gemma4
         qkNormAfterRope = family == .maincoder
         perLayerInputSize = file.has("per_layer_token_embd.weight") ? (file.archInt("embedding_length_per_layer_input") ?? 0) : 0
@@ -184,19 +187,22 @@ extension GGUFModelConfig {
         let ownCache = layers - shared
         var shapes: [Layer] = []
         for index in 0..<layers {
-            let sliding = slidingWindow > 0 && slidingLayers[index]
+            // LFM2: KV のヘッドが 0 の層は、注意の代わりに短い畳み込み
+            let convolution = family == .lfm2 && kvHeads[index] == 0
+            let sliding = slidingWindow > 0 && slidingLayers[index] && !convolution
             let rope = rules.rope && usesRope(family: family, file: file, layer: index, sliding: sliding, hasSliding: slidingWindow > 0)
             let kvLayer = index >= ownCache ? ownCache - (sliding ? 2 : 1) : index
             let ff = try feedForwardSize(file, layer: index)
-            shapes.append(Layer(headCount: heads[index], kvHeadCount: kvHeads[index], headSize: sliding ? slidingHead : fullHead,
-                                feedForwardSize: ff, usesRope: rope, sliding: sliding, kvLayer: kvLayer))
+            shapes.append(Layer(headCount: heads[index], kvHeadCount: convolution ? heads[index] : kvHeads[index],
+                                headSize: sliding ? slidingHead : fullHead, feedForwardSize: ff, usesRope: rope && !convolution,
+                                sliding: sliding, kvLayer: kvLayer, convolution: convolution))
         }
         try validateShapes(shapes)
         return (shapes, fullHead, slidingHead)
     }
 
     private static func validateShapes(_ shapes: [Layer]) throws {
-        for (index, shape) in shapes.enumerated() {
+        for (index, shape) in shapes.enumerated() where !shape.convolution {
             guard shape.headCount > 0, shape.kvHeadCount > 0, shape.headCount % shape.kvHeadCount == 0,
                   shape.kvLayer >= 0, shape.kvLayer <= index else { throw GGUFError.invalid("head counts") }
             let source = shapes[shape.kvLayer]
@@ -259,6 +265,10 @@ extension GGUFModelConfig {
         case .gemma3: period = 6
         case .gemma4: period = 5
         case .cohere2, .olmo2: period = 4
+        case .lfm2:
+            // 注意の層はすべて直近だけを見る
+            guard window > 0 else { return (0, []) }
+            return (window, [Bool](repeating: true, count: layers))
         case .exaone4:
             // llama.cpp は 32B（64 層）だけ直近を見る層を使う
             guard layers == 64 else { return (0, []) }
@@ -319,10 +329,11 @@ extension GGUFModelConfig {
     }
 
     /// 後ろの正規化・q / k の正規化（全体か、ヘッドごとか）
-    private static func normalization(_ file: GGUFFile, family: Family, first: Layer) -> (Bool, Bool, Bool) {
-        let post = family != .seedOSS && file.has("blk.0.post_attention_norm.weight") && file.has("blk.0.post_ffw_norm.weight")
-        guard let qNorm = file.tensor("blk.0.attn_q_norm.weight") else { return (post, false, false) }
-        let full = qNorm.dimensions.count == 1 && qNorm.elementCount == first.querySize && first.headCount > 1
+    private static func normalization(_ file: GGUFFile, family: Family, layer: Int, shape: Layer) -> (Bool, Bool, Bool) {
+        let prefix = "blk.\(layer)."
+        let post = family != .seedOSS && file.has(prefix + "post_attention_norm.weight") && file.has(prefix + "post_ffw_norm.weight")
+        guard let qNorm = file.tensor(prefix + "attn_q_norm.weight") else { return (post, false, false) }
+        let full = qNorm.dimensions.count == 1 && qNorm.elementCount == shape.querySize && shape.headCount > 1
         return (post, true, full)
     }
 
@@ -362,7 +373,8 @@ extension GGUFModelConfig {
 
     /// 必要な重みがそろっていて、形が合っているかを確かめる
     private func validateTensors(_ file: GGUFFile) throws {
-        try check(file, "output_norm.weight", rows: 1, columns: embeddingSize, optional: family == .olmo)
+        try check(file, family == .lfm2 ? "token_embd_norm.weight" : "output_norm.weight", rows: 1, columns: embeddingSize,
+                  optional: family == .olmo)
         if let output = file.tensor("output.weight") {
             guard output.columns == embeddingSize, output.rows <= vocabSize else { throw GGUFError.invalid("output.weight shape") }
         }
@@ -380,6 +392,17 @@ extension GGUFModelConfig {
         let prefix = "blk.\(layer)."
         let d = embeddingSize, q = shape.querySize, kv = shape.kvSize, ff = shape.feedForwardSize
         let ownsCache = shape.kvLayer == layer
+        if shape.convolution {
+            try check(file, prefix + "attn_norm.weight", rows: 1, columns: d)
+            try check(file, prefix + "shortconv.in_proj.weight", rows: 3 * d, columns: d)
+            try check(file, prefix + "shortconv.out_proj.weight", rows: d, columns: d)
+            try check(file, prefix + "shortconv.conv.weight", rows: d, columns: convolutionLength)
+            try check(file, prefix + "ffn_norm.weight", rows: 1, columns: d)
+            try check(file, prefix + "ffn_gate.weight", rows: ff, columns: d)
+            try check(file, prefix + "ffn_up.weight", rows: ff, columns: d)
+            try check(file, prefix + "ffn_down.weight", rows: d, columns: ff)
+            return
+        }
         if hasPreNorms && family != .olmo {
             try check(file, prefix + (family == .falcon && file.has(prefix + "attn_norm_2.weight") ? "attn_norm_2.weight" : "attn_norm.weight"),
                       rows: 1, columns: d)
@@ -447,7 +470,7 @@ extension GGUFModelConfig {
     /// 実行に使う重みの名前（この順に変換して保存する）
     func tensorNames(in file: GGUFFile) -> [String] {
         var names = ["token_embd.weight"]
-        let optional = ["output_norm.weight", "output_norm.bias", "output.weight", "output.bias", "rope_freqs.weight",
+        let optional = ["output_norm.weight", "output_norm.bias", "token_embd_norm.weight", "output.weight", "output.bias", "rope_freqs.weight",
                         "position_embd.weight", "per_layer_token_embd.weight", "per_layer_model_proj.weight",
                         "per_layer_proj_norm.weight"]
         names.append(contentsOf: optional.filter { file.has($0) })
@@ -459,6 +482,7 @@ extension GGUFModelConfig {
             "ffn_norm.weight", "ffn_norm.bias", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
             "ffn_gate.bias", "ffn_up.bias", "ffn_down.bias", "post_ffw_norm.weight",
             "inp_gate.weight", "proj.weight", "post_norm.weight", "layer_output_scale.weight",
+            "shortconv.conv.weight", "shortconv.in_proj.weight", "shortconv.out_proj.weight",
         ]
         for layer in 0..<layerCount {
             for suffix in perLayer where file.has("blk.\(layer).\(suffix)") { names.append("blk.\(layer).\(suffix)") }
@@ -469,6 +493,7 @@ extension GGUFModelConfig {
     /// 行列でも、Float32 のベクトルとして置く重み（正規化の重み・層ごとの倍率）
     static func isVectorTensor(_ name: String) -> Bool {
         name.hasSuffix("norm.weight") || name.hasSuffix("norm.bias") || name.hasSuffix("layer_output_scale.weight")
+            || name.hasSuffix("shortconv.conv.weight")
     }
 
     /// 量子化したまま置く重み（行ごとに取り出すだけで、掛け算には使わない大きな表）

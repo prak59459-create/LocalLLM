@@ -297,6 +297,63 @@ def build_gemma4(path, seed):
     w.close()
 
 
+def build_lfm2(path, seed):
+    """LFM2: 注意の層と、短い畳み込みの層が混ざる（KV のヘッドが 0 の層が畳み込み）"""
+    rng = np.random.default_rng(seed)
+    layers, length = 4, 3
+    kv_heads = [0, 0, KV_HEADS, 0]
+    head_dim = DIM // HEADS
+
+    def mat(rows, cols, scale=0.35):
+        return (rng.standard_normal((rows, cols)) * scale / np.sqrt(cols) * 4).astype(np.float32)
+
+    def norm(size):
+        return (1.0 + 0.2 * rng.standard_normal(size)).astype(np.float32)
+
+    arch = "lfm2"
+    w = gguf.GGUFWriter(path, arch)
+    w.add_name(f"tiny test model {seed}")
+    w.add_context_length(CONTEXT)
+    w.add_embedding_length(DIM)
+    w.add_block_count(layers)
+    w.add_feed_forward_length(FF)
+    w.add_head_count(HEADS)
+    w.add_array(f"{arch}.attention.head_count_kv", kv_heads)
+    w.add_layer_norm_rms_eps(1e-5)
+    w.add_rope_freq_base(1000000.0)
+    w.add_uint32(f"{arch}.shortconv.l_cache", length)
+    w.add_file_type(0)
+    tiny_vocab(w)
+    w.add_tensor("token_embd.weight", mat(VOCAB, DIM, 1.0))
+    w.add_tensor("token_embd_norm.weight", norm(DIM))
+    for i in range(layers):
+        p = f"blk.{i}."
+        w.add_tensor(p + "attn_norm.weight", norm(DIM))
+        if kv_heads[i] == 0:
+            w.add_tensor(p + "shortconv.conv.weight", (0.5 * rng.standard_normal((DIM, length))).astype(np.float32))
+            w.add_tensor(p + "shortconv.in_proj.weight", mat(3 * DIM, DIM))
+            w.add_tensor(p + "shortconv.out_proj.weight", mat(DIM, DIM))
+        else:
+            kv = kv_heads[i] * head_dim
+            w.add_tensor(p + "attn_q.weight", mat(DIM, DIM))
+            w.add_tensor(p + "attn_k.weight", mat(kv, DIM))
+            w.add_tensor(p + "attn_v.weight", mat(kv, DIM))
+            w.add_tensor(p + "attn_q_norm.weight", norm(head_dim))
+            w.add_tensor(p + "attn_k_norm.weight", norm(head_dim))
+            w.add_tensor(p + "attn_output.weight", mat(DIM, DIM))
+        w.add_tensor(p + "ffn_norm.weight", norm(DIM))
+        w.add_tensor(p + "ffn_gate.weight", mat(FF, DIM))
+        w.add_tensor(p + "ffn_up.weight", mat(FF, DIM))
+        w.add_tensor(p + "ffn_down.weight", mat(DIM, FF))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+SPECIAL = {"gemma4": build_gemma4, "lfm2": build_lfm2}
+
+
 def reference_or_error(path, tokens):
     """llama.cpp で読めなければ、その理由（読み込みのログ）を返す"""
     try:
@@ -310,16 +367,17 @@ def reference_or_error(path, tokens):
 
 
 def main():
-    names = sys.argv[1:] or (list(SPECS) + ["gemma4"])
+    every = list(SPECS) + list(SPECIAL)
+    names = sys.argv[1:] or every
     rng = np.random.default_rng(7)
     failed = []
-    for index, name in enumerate(list(SPECS) + ["gemma4"]):
+    for index, name in enumerate(every):
         tokens = [1] + [int(t) for t in rng.integers(3, VOCAB, size=13)]
         if name not in names:
             continue
         path = os.path.join(OUT, f"tiny-{name}.gguf")
-        if name == "gemma4":
-            build_gemma4(path, seed=2000 + index)
+        if name in SPECIAL:
+            SPECIAL[name](path, seed=2000 + index)
         else:
             build(name, SPECS[name], path, seed=2000 + index)
         logits, error = reference_or_error(path, tokens)

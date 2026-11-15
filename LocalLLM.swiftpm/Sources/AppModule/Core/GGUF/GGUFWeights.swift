@@ -60,12 +60,15 @@ struct GGUFLayerWeights {
     var perLayerPostNorm: UnsafePointer<Float>?
     /// 層の出力に掛ける倍率（Gemma 4）
     var outputScale: Float = 1
+    /// 短い畳み込みの層（LFM2）: 重み [チャンネル][長さ]。このとき query は入力の射影（b・c・x の 3 つ分）、output は出力の射影
+    var convolutionKernel: UnsafePointer<Float>?
 
     static func load(_ index: Int, store: GGUFWeightStore, config: GGUFModelConfig) throws -> GGUFLayerWeights {
         let prefix = "blk.\(index)."
         let shape = config.layers[index]
         let q = shape.querySize, kv = shape.kvSize, ff = shape.feedForwardSize
         let ownsCache = shape.kvLayer == index
+        if shape.convolution { return try loadConvolution(prefix: prefix, store: store, config: config) }
         var query: GGUFMatrix, key: GGUFMatrix?, value: GGUFMatrix?
         var queryBias: UnsafePointer<Float>?, keyBias: UnsafePointer<Float>?, valueBias: UnsafePointer<Float>?
         if store.has(prefix + "attn_qkv.weight") {
@@ -103,6 +106,20 @@ struct GGUFLayerWeights {
             weights.perLayerPostNorm = try store.requiredVector(prefix + "post_norm.weight")
         }
         if let scale = store.vector(prefix + "layer_output_scale.weight") { weights.outputScale = scale[0] }
+        return weights
+    }
+
+    /// 短い畳み込みの層（LFM2）
+    private static func loadConvolution(prefix: String, store: GGUFWeightStore, config: GGUFModelConfig) throws -> GGUFLayerWeights {
+        var weights = GGUFLayerWeights(
+            query: try store.matrix(prefix + "shortconv.in_proj.weight"),
+            output: try store.matrix(prefix + "shortconv.out_proj.weight"),
+            up: try store.matrix(prefix + "ffn_up.weight"),
+            down: try store.matrix(prefix + "ffn_down.weight"))
+        weights.attentionNorm = try store.requiredVector(prefix + "attn_norm.weight")
+        weights.feedForwardNorm = try store.requiredVector(prefix + "ffn_norm.weight")
+        weights.gate = try store.matrix(prefix + "ffn_gate.weight")
+        weights.convolutionKernel = try store.requiredVector(prefix + "shortconv.conv.weight")
         return weights
     }
 
@@ -173,7 +190,8 @@ struct GGUFGlobalWeights {
         positions = config.learnedPositions ? try store.matrix("position_embd.weight") : nil
         output = try store.matrix(config.tiedOutput ? "token_embd.weight" : "output.weight")
         outputBias = store.vector("output.bias")
-        outputNorm = store.vector("output_norm.weight")
+        // LFM2 は出力の前の正規化を token_embd_norm という名前で持つ
+        outputNorm = store.vector("output_norm.weight") ?? store.vector("token_embd_norm.weight")
         outputNormBias = store.vector("output_norm.bias")
         ropeFactors = store.vector("rope_freqs.weight")
         if config.perLayerInputSize > 0 {

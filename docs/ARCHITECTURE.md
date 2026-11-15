@@ -731,7 +731,8 @@ llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推�
   正規化の種類（RMSNorm / LayerNorm・バイアス・重みの無い正規化）、注意と FFN を並列に足すか（Phi-2・Falcon・Command R）、
   FFN の形（gate あり / なし・SiLU / GELU / ReLU²・gate と up が 1 つの行列）、学習した位置の埋め込み（GPT-2）、
   q・k の正規化（ヘッドごと・ヘッドごとに違う重み・全体・RoPE の前か後か）、v の正規化と KV の共有と層ごとの入力（Gemma 4）、
-  注意・FFN の後ろの正規化、埋め込み・残差・logits の倍率、tanh での上限、直近だけを見る層とその RoPE の底・倍率、YaRN。
+  注意・FFN の後ろの正規化、埋め込み・残差・logits の倍率、tanh での上限、直近だけを見る層とその RoPE の底・倍率、YaRN、
+  注意の代わりの短い畳み込み（LFM2。位置ごとの b × x を KV キャッシュのように覚えるので、巻き戻しもそのままできる）。
   新しく足した値は、前の版で変換したファイルに無いので、読むときに既定の値を入れる（`init(from:)`）。
 - `GGUFRope`: 全体を見る層・直近だけを見る層の周波数（rope_freqs での割り算・線形の伸ばし方・YaRN の混ぜ方と cos / sin の倍率）。
 - `GGUFConverter` → `GGUFWeightStore`（.llw）: 重みを「1 行ごとに倍率を持つ 8 ビット整数」にして保存する（1 パラメータ 1 バイト）。
@@ -759,7 +760,7 @@ llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推�
 確かめ方（`Tests/LocalLLMCoreTests/GGUF`、正解は `Tests/GGUFFixtures`）:
 
 - 量子化の復元は、形式ごとに乱数のブロックを gguf パッケージ（Python）と突き合わせる。
-- 47 の構造それぞれの小さな乱数モデル（`Tools/gguf/make_fixtures.py`・`make_arch_fixtures.py`）で、各位置の logits が
+- 48 の構造それぞれの小さな乱数モデル（`Tools/gguf/make_fixtures.py`・`make_arch_fixtures.py`）で、各位置の logits が
   llama.cpp と一致する（多くは 1e-5 ほど。GELU の系列は、llama.cpp が GELU を半精度の表で計算するぶん 1e-2 ほどずれる）。
   まとめて読み込んだとき・巻き戻したときも同じ。Gemma 4 は GELU を多く使うので、同じ計算を numpy で書いたもの
   （半精度の GELU を真似ると llama.cpp と 1e-3 で一致する）の、正確な GELU の値と 1e-4 以内で比べる。

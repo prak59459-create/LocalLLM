@@ -18,6 +18,8 @@ enum GGUFMetalSource {
         case attentionCombine = "attention_combine"
         case scaleAdd = "scale_add"
         case gatedActivation = "gated_activation"
+        case convolutionPrepare = "convolution_prepare"
+        case convolutionApply = "convolution_apply"
     }
 
     /// Args.flags の意味
@@ -327,6 +329,38 @@ enum GGUFMetalSource {
         float v = a.scale * x[a.inOffset + gid];
         if ((a.flags & 512u) != 0u) { v += a.softcap * y[a.total + gid]; }
         out[a.outOffset + gid] = v;
+    }
+
+    // 短い畳み込み（LFM2）の 1: bx = b × x を、位置ごとの記録（history）に書く。gid.x = チャンネル、gid.y = トークン。
+    // projected は [トークン][b, c, x]（それぞれ columns 個）
+    kernel void convolution_prepare(device const float *projected [[buffer(0)]],
+                                    device float *history [[buffer(1)]],
+                                    constant Args &a [[buffer(2)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= a.columns || gid.y >= a.count) { return; }
+        device const float *row = projected + gid.y * 3u * a.columns;
+        history[(a.start + gid.y) * a.columns + gid.x] = row[gid.x] * row[2u * a.columns + gid.x];
+    }
+
+    // 短い畳み込みの 2: out = c × Σ_j 重み[j] × bx[位置 − (長さ − 1) + j]。gid.x = チャンネル、gid.y = トークン
+    kernel void convolution_apply(device const float *projected [[buffer(0)]],
+                                  device const float *history [[buffer(1)]],
+                                  device const float *kernel_weights [[buffer(2)]],
+                                  device float *output [[buffer(3)]],
+                                  constant Args &a [[buffer(4)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= a.columns || gid.y >= a.count) { return; }
+        uint length = a.size;
+        int position = int(a.start + gid.y);
+        float sum = 0.0f;
+        for (uint j = 0; j < length; j++) {
+            int source = position - int(length - 1u) + int(j);
+            if (source >= 0) {
+                sum += kernel_weights[gid.x * length + j] * history[uint(source) * a.columns + gid.x];
+            }
+        }
+        device const float *row = projected + gid.y * 3u * a.columns;
+        output[gid.y * a.columns + gid.x] = sum * row[a.columns + gid.x];
     }
 
     // gate = act(gate) × up（flags に 128 があれば up と掛けない）。gid = 要素。

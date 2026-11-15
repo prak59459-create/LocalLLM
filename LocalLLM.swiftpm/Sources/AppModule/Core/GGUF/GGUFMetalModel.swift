@@ -93,6 +93,8 @@ final class GGUFMetalModel: GGUFEvaluator {
         var projection: Weights?
         var perLayerPostNorm: Norm?
         var outputScale: Float
+        /// 短い畳み込みの重み（LFM2。vectors の中の位置）
+        var convolutionKernel: Int?
     }
 
     /// GPU に渡したメモリの範囲（同じ範囲を二重に渡さないため）
@@ -182,10 +184,10 @@ final class GGUFMetalModel: GGUFEvaluator {
         normed = try Self.floats(device, capacity * d)
         normed2 = try Self.floats(device, capacity * d)
         queries = try Self.floats(device, capacity * q)
-        attended = try Self.floats(device, capacity * q)
+        attended = try Self.floats(device, capacity * max(q, d))
         projected = try Self.floats(device, capacity * d)
         feedForwardOut = try Self.floats(device, capacity * d)
-        gateBuffer = try Self.floats(device, capacity * ff)
+        gateBuffer = try Self.floats(device, capacity * max(ff, 3 * d))
         upBuffer = try Self.floats(device, capacity * ff)
         logits = try Self.floats(device, max(config.vocabSize, globals.output.rows))
         rotation = try Self.floats(device, capacity * max(fullRope.pairs, 1) * 2)
@@ -287,7 +289,8 @@ final class GGUFMetalModel: GGUFEvaluator {
             inputGate: try source.inputGate.map { try weights($0, bias: nil) },
             projection: try source.projection.map { try weights($0, bias: nil) },
             perLayerPostNorm: source.perLayerPostNorm.map { norm($0, bias: nil, count: d) },
-            outputScale: source.outputScale)
+            outputScale: source.outputScale,
+            convolutionKernel: source.convolutionKernel.map { pooled($0, d * config.convolutionLength) })
     }
 
     private func norm(_ weight: UnsafePointer<Float>?, bias: UnsafePointer<Float>?, count: Int) -> Norm {
@@ -351,13 +354,15 @@ final class GGUFMetalModel: GGUFEvaluator {
                 newValues.append(nil)
                 continue
             }
-            let key = try Self.floats(device, capacity * shape.kvSize)
-            let value = try Self.floats(device, capacity * shape.kvSize)
+            // 畳み込みの層（LFM2）は、位置ごとの b × x を keys に覚える
+            let width = shape.convolution ? config.embeddingSize : shape.kvSize
+            let key = try Self.floats(device, capacity * width)
+            let value = try Self.floats(device, shape.convolution ? 4 : capacity * width)
             // 今入っている分は引き継ぐ
-            let used = min(length, cacheCapacity, capacity) * shape.kvSize * MemoryLayout<Float>.size
+            let used = min(length, cacheCapacity, capacity) * width * MemoryLayout<Float>.size
             if used > 0, index < keys.count, let oldKey = keys[index], let oldValue = values[index] {
                 key.contents().copyMemory(from: oldKey.contents(), byteCount: used)
-                value.contents().copyMemory(from: oldValue.contents(), byteCount: used)
+                if !shape.convolution { value.contents().copyMemory(from: oldValue.contents(), byteCount: used) }
             }
             newKeys.append(key)
             newValues.append(value)
@@ -693,8 +698,30 @@ final class GGUFMetalModel: GGUFEvaluator {
         return arguments
     }
 
+    /// 短い畳み込み（LFM2）: 射影 → bx を記録 → 畳み込み × c → 出力の射影
+    private func encodeConvolution(_ encoder: MTLComputeCommandEncoder, layer index: Int, input: MTLBuffer, start: Int, count n: Int) {
+        let layer = layers[index]
+        guard let history = keys[index], let kernel = layer.convolutionKernel else { return }
+        let d = config.embeddingSize
+        linear(encoder, layer.query, input: input, inStride: d, count: n, output: gateBuffer, outStride: 3 * d)
+        var arguments = GGUFMetalArgs()
+        arguments.columns = UInt32(d)
+        arguments.count = UInt32(n)
+        arguments.start = UInt32(start)
+        arguments.size = UInt32(config.convolutionLength)
+        let prepare: [Binding] = [(gateBuffer, 0), (history, 0)]
+        run(.convolutionPrepare, encoder, prepare, arguments, width: d, height: n)
+        let apply: [Binding] = [(gateBuffer, 0), (history, 0), vector(kernel), (attended, 0)]
+        run(.convolutionApply, encoder, apply, arguments, width: d, height: n)
+        linear(encoder, layer.output, input: attended, inStride: d, count: n, output: projected, outStride: d)
+    }
+
     private func encodeAttention(_ encoder: MTLComputeCommandEncoder, layer index: Int, input: MTLBuffer, start: Int, count n: Int) {
         let layer = layers[index], shape = shapes[index]
+        if shape.convolution {
+            encodeConvolution(encoder, layer: index, input: input, start: start, count: n)
+            return
+        }
         let d = config.embeddingSize, q = shape.querySize, kv = shape.kvSize, size = shape.headSize
         let heads = shape.headCount, kvHeads = shape.kvHeadCount
         guard let keyBuffer = keys[shape.kvLayer], let valueBuffer = values[shape.kvLayer] else { return }

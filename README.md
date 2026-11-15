@@ -18,7 +18,7 @@ Swift Playgrounds（iPad）でそのまま開いて実行できます。
 - **アプリの更新**: このアプリの .swiftpm と GitHub を 1 ファイルずつ比べ、変わったファイルだけをダウンロードして書き換え、版を上げる（差分の確認・取り消し付き）
 - **コンテキスト長の拡張**: ダウンロードしたモデルの最大コンテキスト長を、端末の中で最大 128k まで広げる
 - **GGUF**: llama.cpp 形式（Ollama・LM Studio で使われている形式）のモデルを、端末の中で変換して GPU（Metal）で動かす。
-  Gemma 4・Qwen・Llama・Phi・Mistral など 40 以上の構造に対応
+  Gemma 4・Qwen・Llama・Phi・Mistral・LFM2 など 40 以上の構造に対応
 - **画像・動画の生成**: Core ML 版の Stable Diffusion で、文章から画像や短い動画（MP4）を作る
 - **音声**: 音声入力、返答の読み上げ、声だけの会話、音声ファイルの文字起こし
 - 外部ライブラリなし（トークナイザ、チャットテンプレート、ダウンローダまで純 Swift で実装）
@@ -126,7 +126,7 @@ GPU が使えないときは CPU（Accelerate）で行います。
   gemma・gemma2・gemma3・**gemma4**（E2B / E4B など。層ごとの入力・KV の共有を含む）・phi2・phi3・
   granite・minicpm・smollm3・internlm2・xverse・baichuan（7B）・ernie4_5・exaone・exaone4・olmo・olmo2・seed_oss・
   plamo・openelm・arcee・maincoder・gpt2・starcoder・starcoder2・stablelm・gptneox・falcon・codeshell・orion・
-  nemotron・jais2・command-r・cohere2・chatglm・glm4。YaRN で文脈を伸ばしたモデルにも対応しています。
+  nemotron・jais2・command-r・cohere2・chatglm・glm4・**lfm2**（注意と短い畳み込みを組み合わせた Liquid AI の LFM2）。YaRN で文脈を伸ばしたモデルにも対応しています。
   どの構造も、小さなテスト用モデルで llama.cpp と同じ計算結果になることを確かめています。
 - **対応している量子化**: F32・F16・BF16、Q4_0・Q4_1・Q5_0・Q5_1・Q8_0、Q2_K〜Q6_K、IQ2_XXS・IQ2_XS・IQ2_S・IQ3_XXS・IQ3_S・IQ4_NL・IQ4_XS。
 - **コンテキスト長**: 「コンテキスト長…」から、ファイルを書き換えずに変えられます（長くするほど KV キャッシュのメモリが増えます）。
@@ -135,7 +135,7 @@ GPU が使えないときは CPU（Accelerate）で行います。
   読み込んだ最初の 1 回だけ、GPU の計算が CPU と同じ結果になるかを数トークンで確かめます（合わなければ CPU で計算します）。
   設定の「計算ユニット」を「CPU のみ」にすると、GGUF も CPU で計算します。
 - **まだ対応していないもの**: 画像も扱うモデルの画像部分（mmproj）、何個かに分かれた GGUF（split）、MoE のモデル、
-  Mamba・RWKV などの注意（attention）を使わない構造、Gemma 3n、上に無い構造。
+  Mamba・RWKV などの状態を持つ構造（LFM2 を除く）、Gemma 3n、上に無い構造。
 
 ### 画像生成
 

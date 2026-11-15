@@ -10,6 +10,8 @@ struct ImageStudioView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // 画像・動画の切り替えは、モデルを入れる前から出しておく（動画も画像のモデルで作るので、まずモデルが要る）
+                StudioModeSection()
                 ImageModelSection()
                 if !store.completedModels.isEmpty { StudioSections() }
             }
@@ -33,7 +35,6 @@ private struct StudioSections: View {
     @Environment(ImageStudio.self) private var studio
 
     var body: some View {
-        StudioModeSection()
         ImagePromptSection()
         ImageOptionsSection()
         if studio.mode == .video { VideoOptionsSection() }

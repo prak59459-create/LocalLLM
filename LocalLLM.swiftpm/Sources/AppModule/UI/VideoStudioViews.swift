@@ -5,6 +5,7 @@ import UIKit
 /// 画像を作るか、動画を作るか。
 struct StudioModeSection: View {
     @Environment(ImageStudio.self) private var studio
+    @Environment(ImageModelStore.self) private var store
 
     var body: some View {
         @Bindable var studio = studio
@@ -16,7 +17,10 @@ struct StudioModeSection: View {
             .pickerStyle(.segmented)
             .disabled(studio.isGenerating)
         } footer: {
-            if studio.mode == .video {
+            if store.completedModels.isEmpty {
+                Text(L("画像も動画も、下の画像モデルで作ります。まずモデルを 1 つ入手してください。",
+                       "Images and videos are both made with an image model below. Get one first."))
+            } else if studio.mode == .video {
                 Text(L("画像モデルで少しずつ違うコマを何枚も描き、その間をなめらかにつないで短い動画（MP4）にします。コマの数だけ画像を作るので、画像 1 枚の数倍〜十数倍の時間がかかります。",
                        "Draws several slightly different frames with the image model and joins them smoothly into a short MP4. It takes several times longer than one image."))
             }

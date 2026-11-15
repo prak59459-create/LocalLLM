@@ -182,6 +182,7 @@ struct WelcomeView: View {
                           systemImage: "chevron.left.forwardslash.chevron.right")
                 }
                 ImageStudioButton(title: L("画像を作る", "Generate images"))
+                ImageStudioButton(title: L("動画を作る", "Generate videos"), mode: .video)
             }
             .buttonStyle(.bordered)
             .font(.callout)
@@ -191,16 +192,18 @@ struct WelcomeView: View {
     }
 }
 
-/// 画像生成の画面を開くボタン（どこに置いても同じ画面が開く）。
+/// 画像・動画生成の画面を開くボタン（どこに置いても同じ画面が開く。mode で、画像と動画のどちらで開くかを選ぶ）。
 struct ImageStudioButton: View {
     @Environment(ImageStudio.self) private var studio
     var title: String = L("画像生成", "Images")
+    var mode: StudioMode = .image
 
     var body: some View {
         Button {
+            if !studio.isGenerating { studio.mode = mode }
             studio.isPresented = true
         } label: {
-            Label(title, systemImage: "photo.on.rectangle.angled")
+            Label(title, systemImage: mode == .video ? "film" : "photo.on.rectangle.angled")
         }
     }
 }

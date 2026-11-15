@@ -403,9 +403,7 @@ struct StatsBar: View {
             Spacer(minLength: 8)
             ContextUsageLabel(used: contextUsed, total: chat.effectiveContext(settings: settings))
             if let footprint = chat.memoryFootprint {
-                Label(L("使用 \(ByteFormat.string(footprint))・残り \(ByteFormat.string(chat.memoryAvailable))",
-                        "Used \(ByteFormat.string(footprint)) · Free \(ByteFormat.string(chat.memoryAvailable))"),
-                      systemImage: "memorychip")
+                Label(memoryText(footprint), systemImage: "memorychip")
             }
         }
         .font(.caption.monospacedDigit())
@@ -418,6 +416,19 @@ struct StatsBar: View {
 }
 
 extension StatsBar {
+    /// 「使用」は iOS が数える分（phys_footprint）。GGUF の重みはファイルから読む分なので、別に「モデル（RAM に載っている分）」を出す
+    func memoryText(_ footprint: Int64) -> String {
+        let free = ByteFormat.string(chat.memoryAvailable)
+        let mapped = chat.mappedModel
+        guard mapped.mapped > 0 else {
+            return L("使用 \(ByteFormat.string(footprint))・残り \(free)", "Used \(ByteFormat.string(footprint)) · Free \(free)")
+        }
+        let model = ByteFormat.string(mapped.mapped)
+        let resident = ByteFormat.string(mapped.resident)
+        return L("使用 \(ByteFormat.string(footprint))＋重み \(model)（RAM \(resident)）・残り \(free)",
+                 "Used \(ByteFormat.string(footprint)) + weights \(model) (in RAM \(resident)) · Free \(free)")
+    }
+
     /// いまの会話で使っているコンテキスト（入力 + 出力）
     fileprivate var contextUsed: Int? {
         if let progress = chat.progress, progress.promptTokens > 0 { return progress.promptTokens }

@@ -50,6 +50,8 @@ final class ChatController {
     /// 統計表示用のメモリ情報（定期更新）
     private(set) var memoryFootprint: Int64?
     private(set) var memoryAvailable: Int64 = 0
+    /// GGUF の重みのファイル（メモリに対応づけたもの）。iOS の「使用」には数えられないので、別に見せる
+    private(set) var mappedModel = MappedFile.Usage(mapped: 0, resident: 0)
 
     @ObservationIgnored let engine = InferenceEngine()
     @ObservationIgnored private var generationTask: Task<Void, Never>?
@@ -97,6 +99,19 @@ final class ChatController {
     func refreshMemory() {
         memoryFootprint = DeviceMemory.footprintBytes
         memoryAvailable = DeviceMemory.availableBytes
+        mappedModel = MappedFile.usage()
+    }
+
+    /// 重みのファイルが、このアプリが使えるメモリに入りきらないときのお知らせ。
+    /// 落ちはしない（OS が読んだ分を捨てては読み直す）が、毎回ストレージから読むのでとても遅くなる。
+    private func warnIfWeightsDoNotFit() {
+        let usage = MappedFile.usage()
+        let room = (DeviceMemory.footprintBytes ?? 0) + DeviceMemory.availableBytes
+        guard usage.mapped > 0, room > 0, Double(usage.mapped) > Double(room) * 0.85 else { return }
+        notice = L("このモデルの重み（\(ByteFormat.string(usage.mapped))）は、アプリが使えるメモリ（約 \(ByteFormat.string(room))）に入りきりません。"
+                   + "落ちはしませんが、毎回ストレージから読み直すのでとても遅くなります。もっと小さいモデルがおすすめです。",
+                   "This model's weights (\(ByteFormat.string(usage.mapped))) do not fit in the memory the app can use (about \(ByteFormat.string(room))). "
+                   + "It will not crash, but it reads from storage every token and will be very slow. A smaller model is recommended.")
     }
 
     // MARK: - モデルの読み込み
@@ -125,6 +140,7 @@ final class ChatController {
                                                  prefillChunkSize: settings.prefillChunkSize)
                 if Task.isCancelled { return }
                 loadState = .ready(info)
+                warnIfWeightsDoNotFit()
             } catch is CancellationError {
                 loadState = .idle
             } catch {

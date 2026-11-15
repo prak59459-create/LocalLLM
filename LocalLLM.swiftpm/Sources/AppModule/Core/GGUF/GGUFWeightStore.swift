@@ -18,11 +18,74 @@ final class MappedFile {
         }
         pointer = UnsafeRawPointer(address)
         count = size
+        MappedFile.registry.add(self)
     }
 
     deinit {
+        MappedFile.registry.remove(self)
         munmap(UnsafeMutableRawPointer(mutating: pointer), count)
     }
+
+    /// 対応づけたファイルの大きさと、そのうち今メモリ（RAM）に載っている分。
+    /// ここは iOS のアプリのメモリ使用量（phys_footprint）には数えられない（足りなくなれば OS が捨てて、また読み直す）。
+    struct Usage: Equatable, Sendable {
+        var mapped: Int64
+        var resident: Int64
+    }
+
+    static func usage() -> Usage { registry.usage() }
+
+    /// このファイルのうち RAM に載っているバイト数（測れなければ nil）
+    func residentBytes() -> Int64? {
+        let page = Int(getpagesize())
+        guard page > 0 else { return nil }
+        let pages = (count + page - 1) / page
+        #if canImport(Darwin)
+        var vector = [CChar](repeating: 0, count: pages)
+        #else
+        var vector = [UInt8](repeating: 0, count: pages)
+        #endif
+        let result = vector.withUnsafeMutableBufferPointer { buffer in
+            mincore(UnsafeMutableRawPointer(mutating: pointer), count, buffer.baseAddress!)
+        }
+        guard result == 0 else { return nil }
+        let loaded = vector.reduce(0) { $0 + (($1 & 1) != 0 ? 1 : 0) }
+        return Int64(min(loaded * page, count))
+    }
+
+    /// 開いている MappedFile の一覧（弱い参照）
+    private final class Registry: @unchecked Sendable {
+        private let lock = NSLock()
+        private var files: [ObjectIdentifier: Weak] = [:]
+
+        private struct Weak { weak var file: MappedFile? }
+
+        func add(_ file: MappedFile) {
+            lock.lock()
+            files[ObjectIdentifier(file)] = Weak(file: file)
+            lock.unlock()
+        }
+
+        func remove(_ file: MappedFile) {
+            lock.lock()
+            files[ObjectIdentifier(file)] = nil
+            lock.unlock()
+        }
+
+        func usage() -> Usage {
+            lock.lock()
+            let open = files.values.compactMap(\.file)
+            lock.unlock()
+            var usage = Usage(mapped: 0, resident: 0)
+            for file in open {
+                usage.mapped += Int64(file.count)
+                usage.resident += file.residentBytes() ?? 0
+            }
+            return usage
+        }
+    }
+
+    private static let registry = Registry()
 }
 
 /// GGUF の重みを、このアプリの推論用に変換して保存したファイル（.llw）。

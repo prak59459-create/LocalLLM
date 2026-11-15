@@ -11,23 +11,9 @@ struct ImageStudioView: View {
         NavigationStack {
             Form {
                 ImageModelSection()
-                if !store.completedModels.isEmpty {
-                    StudioModeSection()
-                    ImagePromptSection()
-                    ImageOptionsSection()
-                    if studio.mode == .video { VideoOptionsSection() }
-                    ImageGenerateSection()
-                    if studio.mode == .video {
-                        VideoProgressPreview()
-                        VideoResultSection()
-                        VideoGallerySection()
-                    } else {
-                        ImageResultSection()
-                        ImageGallerySection()
-                    }
-                }
+                if !store.completedModels.isEmpty { StudioSections() }
             }
-            .navigationTitle(studio.mode == .video ? L("動画生成", "Video Generation") : L("画像生成", "Image Generation"))
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -35,6 +21,37 @@ struct ImageStudioView: View {
                 }
             }
         }
+    }
+
+    private var title: String {
+        studio.mode == .video ? L("動画生成", "Video Generation") : L("画像生成", "Image Generation")
+    }
+}
+
+/// モデルが入っているときの中身（型の推論を軽くするため、画面本体から分けてある）
+private struct StudioSections: View {
+    @Environment(ImageStudio.self) private var studio
+
+    var body: some View {
+        StudioModeSection()
+        ImagePromptSection()
+        ImageOptionsSection()
+        if studio.mode == .video { VideoOptionsSection() }
+        ImageGenerateSection()
+        if studio.mode == .video {
+            VideoSections()
+        } else {
+            ImageResultSection()
+            ImageGallerySection()
+        }
+    }
+}
+
+private struct VideoSections: View {
+    var body: some View {
+        VideoProgressPreview()
+        VideoResultSection()
+        VideoGallerySection()
     }
 }
 

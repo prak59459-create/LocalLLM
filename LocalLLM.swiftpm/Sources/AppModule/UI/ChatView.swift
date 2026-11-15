@@ -8,6 +8,7 @@ struct ChatView: View {
     @Environment(ChatController.self) private var chat
     @Environment(KnowledgeStore.self) private var knowledge
     @Environment(ConnectorStore.self) private var connectors
+    @Environment(VoiceController.self) private var voice
     @Environment(\.modelContext) private var context
 
     @Bindable var conversation: Conversation
@@ -42,9 +43,10 @@ struct ChatView: View {
                 focused: $composerFocused,
                 onSend: send,
                 onStop: { chat.stopGenerating() },
-                accessory: { ComposerOptions(searchWeb: $searchWeb) }
+                accessory: { ComposerOptions(searchWeb: $searchWeb, draft: $draft, onSend: send) }
             )
         }
+        .modifier(VoiceReplyModifier(latestReply: latestReply, listenAgain: listenAgain))
         .navigationTitle(conversation.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -92,6 +94,22 @@ struct ChatView: View {
     }
 
     private let bottomID = "bottom"
+
+    /// いちばん新しい返答の本文（読み上げ用）
+    private func latestReply() -> String? {
+        conversation.orderedMessages.last { $0.role == .assistant }?.content
+    }
+
+    /// 声だけの会話: 返答を読み終えたら、また聞き取る
+    private func listenAgain() {
+        Task {
+            await voice.startListening(onUpdate: { draft = $0 }, onFinish: { heard in
+                guard !heard.isEmpty else { return }
+                draft = heard
+                send()
+            })
+        }
+    }
 
     /// この会話のアシスタント（あれば）
     private var assistant: Assistant? {
@@ -257,10 +275,13 @@ struct ComposerOptions: View {
     @Environment(AppSettings.self) private var settings
     @Environment(ConnectorStore.self) private var connectors
     @Binding var searchWeb: Bool
+    @Binding var draft: String
+    var onSend: () -> Void
 
     var body: some View {
         @Bindable var settings = settings
         HStack(spacing: 4) {
+            VoiceButton(text: $draft, onSend: onSend)
             Button {
                 searchWeb.toggle()
             } label: {
@@ -382,9 +403,7 @@ struct StatsBar: View {
             Spacer(minLength: 8)
             ContextUsageLabel(used: contextUsed, total: chat.effectiveContext(settings: settings))
             if let footprint = chat.memoryFootprint {
-                Label(L("使用 \(ByteFormat.string(footprint))・残り \(ByteFormat.string(chat.memoryAvailable))",
-                        "Used \(ByteFormat.string(footprint)) · Free \(ByteFormat.string(chat.memoryAvailable))"),
-                      systemImage: "memorychip")
+                Label(memoryText(footprint), systemImage: "memorychip")
             }
         }
         .font(.caption.monospacedDigit())
@@ -397,6 +416,19 @@ struct StatsBar: View {
 }
 
 extension StatsBar {
+    /// 「使用」は iOS が数える分（phys_footprint）。GGUF の重みはファイルから読む分なので、別に「モデル（RAM に載っている分）」を出す
+    func memoryText(_ footprint: Int64) -> String {
+        let free = ByteFormat.string(chat.memoryAvailable)
+        let mapped = chat.mappedModel
+        guard mapped.mapped > 0 else {
+            return L("使用 \(ByteFormat.string(footprint))・残り \(free)", "Used \(ByteFormat.string(footprint)) · Free \(free)")
+        }
+        let model = ByteFormat.string(mapped.mapped)
+        let resident = ByteFormat.string(mapped.resident)
+        return L("使用 \(ByteFormat.string(footprint))＋重み \(model)（RAM \(resident)）・残り \(free)",
+                 "Used \(ByteFormat.string(footprint)) + weights \(model) (in RAM \(resident)) · Free \(free)")
+    }
+
     /// いまの会話で使っているコンテキスト（入力 + 出力）
     fileprivate var contextUsed: Int? {
         if let progress = chat.progress, progress.promptTokens > 0 { return progress.promptTokens }

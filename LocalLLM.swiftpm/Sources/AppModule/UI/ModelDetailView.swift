@@ -13,6 +13,8 @@ struct ModelDetailView: View {
     @State private var analysis: RepoAnalysis?
     /// variant.path → metadata.json の解析結果（.mlmodelc のみ。ダウンロード前に取得できる）
     @State private var metadata: [String: CoreMLMetadata] = [:]
+    /// GGUF の先頭部分から分かった情報（リポジトリ内の GGUF は量子化が違うだけなので、1 つ調べれば足りる）
+    @State private var gguf: GGUFSummary?
     @State private var isLoading = true
     @State private var loadError: String?
     @State private var actionError: String?
@@ -43,7 +45,7 @@ struct ModelDetailView: View {
             Button(L("もう一度", "Retry")) { Task { await load() } }
         } else if let analysis {
             warnings(analysis)
-            VariantsSection(repoID: repoID, analysis: analysis, metadata: metadata, onUse: onUse,
+            VariantsSection(repoID: repoID, analysis: analysis, metadata: metadata, gguf: gguf, onUse: onUse,
                             onError: { actionError = $0 })
             if let actionError {
                 Section {
@@ -85,13 +87,22 @@ struct ModelDetailView: View {
     @ViewBuilder
     private func warnings(_ analysis: RepoAnalysis) -> some View {
         let needsToken = (info?.gated ?? false) && settings.huggingFaceToken.isEmpty
-        if !analysis.hasTokenizer || needsToken {
+        // GGUF はトークナイザがファイルの中に入っているので、付属ファイルが無くてよい
+        let onlyGGUF = analysis.hasGGUF && analysis.variants.allSatisfy { $0.kind == .gguf }
+        if onlyGGUF {
+            if needsToken { GatedNotice() }
+        } else if !analysis.hasTokenizerJSON || needsToken {
             Section {
                 if !analysis.hasTokenizer {
-                    Label(L("tokenizer.json が含まれていません。このままでは使えません。",
-                            "tokenizer.json is not included, so this repository cannot be used as is."),
-                          systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
+                    Label(L("トークナイザが入っていません。読み込むときに、元のモデル（base_model）か同じ系列のモデルから自動で取ってきます。",
+                            "No tokenizer is included. It will be fetched from the base model or the same model family when loading."),
+                          systemImage: "arrow.down.circle")
+                        .foregroundStyle(.blue)
+                } else if !analysis.hasTokenizerJSON {
+                    Label(L("tokenizer.json はありませんが、tokenizer.model などから端末で作って使います。",
+                            "There is no tokenizer.json, but one will be built on the device from tokenizer.model or similar files."),
+                          systemImage: "wand.and.stars")
+                        .foregroundStyle(.blue)
                 }
                 if needsToken {
                     Label(L("このモデルは利用規約への同意が必要です。設定で Hugging Face のトークンを入力してください。",
@@ -135,8 +146,26 @@ struct ModelDetailView: View {
                 }
             }
             metadata = found
+            gguf = nil
+            // GGUF は、先頭部分（メタデータ）だけを取ってきて、動かせる構造かを調べる
+            if let variant = analysis.variants.first(where: { $0.kind == .gguf }),
+               let header = try? await client.fetchGGUFHeader(repo: repoID, path: variant.path) {
+                gguf = GGUFSummary(file: header)
+            }
         } catch {
             loadError = error.localizedDescription
+        }
+    }
+}
+
+/// 利用規約への同意が要るモデルの案内。
+private struct GatedNotice: View {
+    var body: some View {
+        Section {
+            Label(L("このモデルは利用規約への同意が必要です。設定で Hugging Face のトークンを入力してください。",
+                    "This model is gated. Enter your Hugging Face token in Settings."),
+                  systemImage: "lock")
+                .foregroundStyle(.orange)
         }
     }
 }
@@ -146,19 +175,25 @@ private struct VariantsSection: View {
     let repoID: String
     let analysis: RepoAnalysis
     let metadata: [String: CoreMLMetadata]
+    let gguf: GGUFSummary?
     var onUse: () -> Void
     var onError: (String) -> Void
 
     var body: some View {
         if analysis.variants.isEmpty {
-            Text(L("このリポジトリには Core ML のモデル（.mlmodelc / .mlpackage / 分割モデル / ZIP）が見つかりませんでした。",
-                   "No Core ML models (.mlmodelc / .mlpackage / split models / ZIP) were found in this repository."))
+            Text(L("このリポジトリには、動かせるモデル（Core ML の .mlmodelc / .mlpackage / 分割モデル / ZIP、または GGUF）が見つかりませんでした。",
+                   "No runnable models (Core ML .mlmodelc / .mlpackage / split models / ZIP, or GGUF) were found in this repository."))
                 .foregroundStyle(.secondary)
         } else {
             Section(L("モデル", "Models")) {
                 ForEach(analysis.variants) { variant in
-                    VariantRow(repoID: repoID, variant: variant, analysis: analysis,
-                               metadata: metadata[variant.path], onUse: onUse, onError: onError)
+                    if variant.kind == .gguf {
+                        GGUFVariantRow(repoID: repoID, variant: variant, analysis: analysis, summary: gguf,
+                                       onUse: onUse, onError: onError)
+                    } else {
+                        VariantRow(repoID: repoID, variant: variant, analysis: analysis,
+                                   metadata: metadata[variant.path], onUse: onUse, onError: onError)
+                    }
                 }
             }
         }
@@ -308,13 +343,16 @@ private struct VariantRow: View {
         case .archive:
             return L("ZIP（ダウンロード後に端末で展開して、中のモデルを調べます）",
                      "ZIP (expanded on device after download, then inspected)")
+        case .gguf:
+            return "GGUF"
         }
     }
 
     /// ZIP は中に tokenizer.json が入っていることがあるので、付属ファイルが無くてもダウンロードできる
     private var canDownload: Bool {
         if variant.kind == .archive { return true }
-        return analysis.hasTokenizer && metadata?.interface.isSupported != false
+        // トークナイザが無くても、読み込むときに作るか取ってくる
+        return metadata?.interface.isSupported != false
     }
 
     @ViewBuilder
@@ -427,6 +465,205 @@ private struct VariantRow: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(!canDownload)
+        }
+    }
+}
+
+/// GGUF のモデル 1 つ分の行（量子化の違うファイルごとに 1 行）。
+private struct GGUFVariantRow: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(ModelLibrary.self) private var library
+    @Environment(ChatController.self) private var chat
+
+    let repoID: String
+    let variant: ModelVariant
+    let analysis: RepoAnalysis
+    /// リポジトリの GGUF の情報（取れなかったら nil）
+    let summary: GGUFSummary?
+    var onUse: () -> Void
+    var onError: (String) -> Void
+
+    private var installed: InstalledModel? {
+        library.model(withID: InstalledModel.makeID(repoID: repoID, variantPath: variant.path))
+    }
+
+    private var quantization: String? { GGUFNaming.quantization(of: variant.path) }
+
+    /// このファイルの情報（量子化の名前だけ、このファイルのものにする）
+    private var variantSummary: GGUFSummary? {
+        guard var copy = summary else { return nil }
+        if let quantization { copy.quantization = quantization }
+        return copy
+    }
+
+    private var canDownload: Bool {
+        summary?.isSupported != false && GGUFNaming.isReadable(quantization: quantization)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(variant.displayName).font(.headline)
+                if GGUFNaming.rank(of: variant.path) == 0 {
+                    Badge(text: L("おすすめ", "Recommended"), color: .green)
+                }
+                Spacer()
+                Text(ByteFormat.string(variant.totalBytes))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Text(L("GGUF（llama.cpp 形式）。ダウンロード後にこのアプリ用に変換して、GPU（使えないときは CPU）で動かします。",
+                   "GGUF (llama.cpp format). Converted for this app after download and run on the GPU (or the CPU when the GPU is unavailable)."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            compatibility
+            details
+            GGUFVariantActions(repoID: repoID, variant: variant, analysis: analysis, summary: variantSummary,
+                               installed: installed, canDownload: canDownload, onUse: onUse, onError: onError)
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var compatibility: some View {
+        if !GGUFNaming.isReadable(quantization: quantization) {
+            Label(L("非対応の量子化形式（\(quantization ?? "?")）。Q4_K_M などを選んでください。",
+                    "Unsupported quantization (\(quantization ?? "?")). Choose Q4_K_M or similar."),
+                  systemImage: "xmark.octagon")
+                .font(.caption)
+                .foregroundStyle(.red)
+        } else if let summary {
+            if let reason = summary.unsupportedReason {
+                Label(reason, systemImage: "xmark.octagon")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            } else {
+                Label(L("対応: \(summary.architecture)・\(summary.parameterLabel) パラメータ", "Supported: \(summary.architecture) · \(summary.parameterLabel) parameters"),
+                      systemImage: "checkmark.seal.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+        } else {
+            Label(L("構造はダウンロード後に確認します", "The architecture will be checked after download"), systemImage: "questionmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var details: some View {
+        if let summary, summary.isSupported {
+            let context = summary.defaultContext
+            let required = summary.memoryBytes(context: context)
+            let fit = GGUFMemoryFit.fit(requiredBytes: required)
+            VStack(alignment: .leading, spacing: 2) {
+                Label(L("コンテキスト長 \(context.formatted()) トークン（学習時 \(summary.contextLength.formatted())。あとで変えられます）",
+                        "Context length \(context.formatted()) tokens (trained with \(summary.contextLength.formatted()); can be changed later)"),
+                      systemImage: "text.alignleft")
+                HStack(spacing: 6) {
+                    Image(systemName: "memorychip")
+                    Text(L("変換後 \(ByteFormat.string(summary.storeBytes))・必要メモリの目安 \(ByteFormat.string(required))",
+                           "\(ByteFormat.string(summary.storeBytes)) after conversion · estimated memory \(ByteFormat.string(required))"))
+                    Text("·")
+                    Text(fit.label).foregroundStyle(GGUFMemoryFit.color(for: fit))
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// GGUF の重みはファイルを直接読む（アプリのメモリ使用量には数えられにくい）ので、端末のメモリ全体と比べる。
+enum GGUFMemoryFit {
+    static func fit(requiredBytes: Int64) -> DeviceMemory.Fit {
+        let physical = Double(DeviceMemory.physicalBytes)
+        let required = Double(requiredBytes)
+        if required <= physical * 0.4 { return .comfortable }
+        if required <= physical * 0.65 { return .tight }
+        return .tooLarge
+    }
+
+    static func color(for fit: DeviceMemory.Fit) -> Color {
+        switch fit {
+        case .comfortable: return .green
+        case .tight: return .yellow
+        case .tooLarge: return .red
+        }
+    }
+}
+
+/// GGUF の行のボタン（ダウンロード・進み具合・使う）。
+private struct GGUFVariantActions: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(ModelLibrary.self) private var library
+    @Environment(ChatController.self) private var chat
+
+    let repoID: String
+    let variant: ModelVariant
+    let analysis: RepoAnalysis
+    let summary: GGUFSummary?
+    let installed: InstalledModel?
+    let canDownload: Bool
+    var onUse: () -> Void
+    var onError: (String) -> Void
+
+    var body: some View {
+        if let installed {
+            if installed.isComplete {
+                installedRow(installed)
+            } else {
+                downloadingRow(installed)
+            }
+        } else {
+            Button(action: download) {
+                Label(L("ダウンロード", "Download"), systemImage: "arrow.down.circle.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!canDownload)
+        }
+    }
+
+    private func installedRow(_ installed: InstalledModel) -> some View {
+        HStack {
+            Button {
+                chat.loadModel(id: installed.id, library: library, settings: settings)
+                onUse()
+            } label: {
+                Label(chat.loadedInfo?.modelID == installed.id ? L("使用中", "In use") : L("使う", "Use"), systemImage: "play.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(chat.loadedInfo?.modelID == installed.id)
+            Spacer()
+            Label(L("インストール済み", "Installed"), systemImage: "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(.green)
+        }
+    }
+
+    @ViewBuilder
+    private func downloadingRow(_ installed: InstalledModel) -> some View {
+        if let state = library.downloads[installed.id] {
+            DownloadStatusView(state: state)
+        }
+        HStack {
+            DownloadControls(modelID: installed.id)
+            Spacer()
+            Button(role: .destructive) {
+                library.delete(id: installed.id)
+            } label: {
+                Label(L("中止して削除", "Cancel & Delete"), systemImage: "xmark")
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    private func download() {
+        do {
+            try library.startDownload(repoID: repoID, variant: variant, analysis: analysis, metadata: nil,
+                                      gguf: summary, client: settings.makeHFClient())
+        } catch {
+            onError(error.localizedDescription)
         }
     }
 }

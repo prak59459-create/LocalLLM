@@ -238,6 +238,10 @@ private struct SidebarBottomButtons: View {
             Label(L("コーディング", "Coding"), systemImage: "chevron.left.forwardslash.chevron.right")
         }
         Spacer()
+        ImageStudioButton()
+        Spacer()
+        ImageStudioButton(title: L("動画生成", "Videos"), mode: .video)
+        Spacer()
         Button(action: onShowAssistants) {
             Label(L("アシスタント", "Assistants"), systemImage: "person.crop.rectangle.stack")
         }

@@ -532,6 +532,25 @@ final class GGUFMetalModel: GGUFEvaluator {
         encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: group, height: 1, depth: 1))
     }
 
+    /// threadgroup の数を決めて並べる（1 つの threadgroup に threads 個のスレッド）
+    private func run(_ kernel: Kernel, _ encoder: MTLComputeCommandEncoder, _ bindings: [Binding], _ arguments: GGUFMetalArgs,
+                     groups: Int, threads: Int) {
+        guard let pipeline = pipelines[kernel], groups > 0 else { return }
+        encoder.setComputePipelineState(pipeline)
+        for (index, binding) in bindings.enumerated() {
+            encoder.setBuffer(binding.buffer, offset: binding.offset, index: index)
+        }
+        var values = arguments
+        encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: bindings.count)
+        encoder.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
+    }
+
+    /// SIMD グループが 32 スレッドの GPU（Apple の GPU）なら、1 トークンの線形層を 32 スレッドで 1 行ずつ計算する
+    private var usesSimdRows: Bool {
+        pipelines[.linearQ8Vector]?.threadExecutionWidth == 32 && pipelines[.linearF32Vector]?.threadExecutionWidth == 32
+    }
+
     private func vector(_ position: Int?) -> Binding {
         (vectors, (position ?? 0) * MemoryLayout<Float>.size)
     }
@@ -550,13 +569,18 @@ final class GGUFMetalModel: GGUFEvaluator {
         if weights.scales != nil { arguments.flags |= Flag.scales }
         if weights.bias != nil { arguments.flags |= Flag.bias }
         let batched = count > 1
+        let bindings: [Binding] = [(weights.buffer, weights.offset), vector(weights.scales), vector(weights.bias), (input, 0), (output, 0)]
+        if !batched && usesSimdRows {
+            // 1 トークン: 32 スレッドで 1 行
+            run(weights.isInt8 ? .linearQ8Vector : .linearF32Vector, encoder, bindings, arguments, groups: weights.rows, threads: 32)
+            return
+        }
         let kernel: Kernel
         if weights.isInt8 {
             kernel = batched ? .linearQ8Batch : .linearQ8
         } else {
             kernel = batched ? .linearF32Batch : .linearF32
         }
-        let bindings: [Binding] = [(weights.buffer, weights.offset), vector(weights.scales), vector(weights.bias), (input, 0), (output, 0)]
         run(kernel, encoder, bindings, arguments, width: weights.rows, height: batched ? (count + 3) / 4 : 1)
     }
 

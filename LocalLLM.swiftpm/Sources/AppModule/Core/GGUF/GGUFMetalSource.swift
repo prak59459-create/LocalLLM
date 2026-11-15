@@ -11,6 +11,8 @@ enum GGUFMetalSource {
         case linearQ8Batch = "linear_q8_batch"
         case linearF32 = "linear_f32"
         case linearF32Batch = "linear_f32_batch"
+        case linearQ8Vector = "linear_q8_vector"
+        case linearF32Vector = "linear_f32_vector"
         case rmsNorm = "rms_norm"
         case rope = "rope"
         case attentionScores = "attention_scores"
@@ -184,6 +186,49 @@ enum GGUFMetalSource {
                                  constant Args &a [[buffer(5)]],
                                  uint2 gid [[thread_position_in_grid]]) {
         linear_four((device const packed_float4 *)(weights + a.weightSkip), scales, bias, input, output, a, gid);
+    }
+
+    // 線形層（1 トークンだけのとき）: 1 つの SIMD グループ（32 スレッド）で 1 行を計算する。
+    // 隣どうしのスレッドが隣どうしの重みを読むので、メモリを続けて読める。threadgroup = 行
+    template <typename W>
+    inline void linear_vector(device const W *weights, device const float *scales, device const float *bias,
+                              device const float *input, device float *output, constant Args &a, uint row, uint lane) {
+        if (row >= a.rows) { return; }
+        uint quads = a.columns >> 2;
+        device const W *w = weights + row * quads;
+        device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
+        float4 acc = float4(0.0f);
+        for (uint i = lane; i < quads; i += 32u) {
+            acc += load4(w, i) * float4(x[i]);
+        }
+        float sum = simd_sum(sum4(acc));
+        if (lane == 0u) {
+            if ((a.flags & 1u) != 0u) { sum *= scales[row]; }
+            if ((a.flags & 2u) != 0u) { sum += bias[row]; }
+            output[a.outOffset + row] = sum;
+        }
+    }
+
+    kernel void linear_q8_vector(device const char *weights [[buffer(0)]],
+                                 device const float *scales [[buffer(1)]],
+                                 device const float *bias [[buffer(2)]],
+                                 device const float *input [[buffer(3)]],
+                                 device float *output [[buffer(4)]],
+                                 constant Args &a [[buffer(5)]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        linear_vector((device const packed_char4 *)(weights + a.weightSkip), scales, bias, input, output, a, row, lane);
+    }
+
+    kernel void linear_f32_vector(device const char *weights [[buffer(0)]],
+                                  device const float *scales [[buffer(1)]],
+                                  device const float *bias [[buffer(2)]],
+                                  device const float *input [[buffer(3)]],
+                                  device float *output [[buffer(4)]],
+                                  constant Args &a [[buffer(5)]],
+                                  uint row [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+        linear_vector((device const packed_float4 *)(weights + a.weightSkip), scales, bias, input, output, a, row, lane);
     }
 
     // 正規化（RMSNorm か LayerNorm）。gid = 行（rows 行 × columns）。入力と出力は同じ場所でもよい。

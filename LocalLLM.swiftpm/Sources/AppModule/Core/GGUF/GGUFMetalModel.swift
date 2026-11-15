@@ -65,6 +65,10 @@ final class GGUFMetalModel: GGUFEvaluator {
         /// vectors の中の位置（Float の個数）。無ければ nil
         var scales: Int?
         var bias: Int?
+        /// 4・5 ビット（GGUFGroupQuant）のときの、5 ビット目の面（5 ビットだけ）と倍率・下限の面
+        var groupBits = 0
+        var high: (buffer: MTLBuffer, offset: Int)? = nil
+        var params: (buffer: MTLBuffer, offset: Int)? = nil
     }
 
     /// 正規化の重み（vectors の中の位置）
@@ -309,6 +313,7 @@ final class GGUFMetalModel: GGUFEvaluator {
     private func weights(_ matrix: GGUFMatrix, bias: UnsafePointer<Float>?) throws -> Weights {
         guard matrix.columns % 4 == 0 else { throw GGUFMetalError.unavailable("matrix width \(matrix.columns)") }
         guard matrix.storage != .raw else { throw GGUFMetalError.unavailable("raw matrix") }
+        if matrix.storage.isGrouped { return try groupedWeights(matrix, bias: bias) }
         let isInt8 = matrix.storage == .int8Rows
         let bytes = matrix.rows * matrix.columns * (isInt8 ? 1 : MemoryLayout<Float>.size)
         let (buffer, offset) = try mapped(matrix.data, bytes: bytes)
@@ -317,6 +322,31 @@ final class GGUFMetalModel: GGUFEvaluator {
                        isInt8: isInt8,
                        scales: matrix.scales.map { pooled($0, matrix.rows) },
                        bias: bias.map { pooled($0, matrix.rows) })
+    }
+
+    /// 4・5 ビットの行列: 3 つの面をそれぞれ GPU から読めるようにする（どの面も保存ファイルで 64 バイトの境目にそろえてある）
+    private func groupedWeights(_ matrix: GGUFMatrix, bias: UnsafePointer<Float>?) throws -> Weights {
+        guard matrix.columns % GGUFGroupQuant.groupSize == 0, let groupParams = matrix.groupParams else {
+            throw GGUFMetalError.unavailable("group matrix")
+        }
+        let rows = matrix.rows, columns = matrix.columns
+        let nibbles = try mapped(matrix.data, bytes: GGUFGroupQuant.nibbleBytes(rows: rows, columns: columns))
+        let params = try mapped(groupParams, bytes: GGUFGroupQuant.paramBytes(rows: rows, columns: columns))
+        var high: (buffer: MTLBuffer, offset: Int)?
+        if matrix.storage == .q5Groups {
+            guard let bits = matrix.highBits else { throw GGUFMetalError.unavailable("group high bits") }
+            high = try mapped(bits, bytes: GGUFGroupQuant.highBytes(rows: rows, columns: columns))
+        }
+        // 読む位置は 16 バイト（uint4）・4 バイトの境目にそろっている必要がある
+        guard nibbles.1 % 16 == 0, params.1 % 4 == 0, (high?.1 ?? 0) % 4 == 0 else {
+            throw GGUFMetalError.unavailable("group matrix alignment")
+        }
+        var weights = Weights(buffer: nibbles.0, offset: nibbles.1, skip: 0, rows: rows, columns: columns, isInt8: false,
+                              scales: nil, bias: bias.map { pooled($0, rows) })
+        weights.groupBits = GGUFGroupQuant.bits(matrix.storage)
+        weights.high = high.map { ($0.buffer, $0.offset) }
+        weights.params = (params.0, params.1)
+        return weights
     }
 
     /// 保存ファイルを対応づけたメモリを、コピーせずに GPU から読めるようにする（ページの境目にそろえた範囲を渡す）
@@ -549,6 +579,7 @@ final class GGUFMetalModel: GGUFEvaluator {
     /// SIMD グループが 32 スレッドの GPU（Apple の GPU）なら、1 トークンの線形層を 32 スレッドで 1 行ずつ計算する
     private var usesSimdRows: Bool {
         pipelines[.linearQ8Vector]?.threadExecutionWidth == 32 && pipelines[.linearF32Vector]?.threadExecutionWidth == 32
+            && pipelines[.linearQ4Vector]?.threadExecutionWidth == 32 && pipelines[.linearQ5Vector]?.threadExecutionWidth == 32
     }
 
     private func vector(_ position: Int?) -> Binding {
@@ -569,6 +600,10 @@ final class GGUFMetalModel: GGUFEvaluator {
         if weights.scales != nil { arguments.flags |= Flag.scales }
         if weights.bias != nil { arguments.flags |= Flag.bias }
         let batched = count > 1
+        if weights.groupBits > 0, let params = weights.params {
+            linearGrouped(encoder, weights, params: params, input: input, output: output, arguments: arguments, batched: batched)
+            return
+        }
         let bindings: [Binding] = [(weights.buffer, weights.offset), vector(weights.scales), vector(weights.bias), (input, 0), (output, 0)]
         if !batched && usesSimdRows {
             // 1 トークン: 32 スレッドで 1 行
@@ -582,6 +617,21 @@ final class GGUFMetalModel: GGUFEvaluator {
             kernel = batched ? .linearF32Batch : .linearF32
         }
         run(kernel, encoder, bindings, arguments, width: weights.rows, height: batched ? (count + 3) / 4 : 1)
+    }
+
+    /// 4・5 ビットの線形層（1 トークンは 32 スレッドで 1 行、それ以外はトークン 4 個ずつ）
+    private func linearGrouped(_ encoder: MTLComputeCommandEncoder, _ weights: Weights, params: Binding, input: MTLBuffer,
+                               output: MTLBuffer, arguments: GGUFMetalArgs, batched: Bool) {
+        let five = weights.groupBits == 5
+        // 5 ビット目の面が無い 4 ビットでも、場所は埋めておく（読まない）
+        let high: Binding = weights.high.map { ($0.buffer, $0.offset) } ?? params
+        let bindings: [Binding] = [(weights.buffer, weights.offset), params, vector(weights.bias), (input, 0), (output, 0), high]
+        if !batched && usesSimdRows {
+            run(five ? .linearQ5Vector : .linearQ4Vector, encoder, bindings, arguments, groups: weights.rows, threads: 32)
+            return
+        }
+        run(five ? .linearQ5Batch : .linearQ4Batch, encoder, bindings, arguments, width: weights.rows,
+            height: (Int(arguments.count) + 3) / 4)
     }
 
     /// 正規化（weight が無ければ、重みを掛けない正規化）

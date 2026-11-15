@@ -739,7 +739,14 @@ llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推�
   注意の代わりの短い畳み込み（LFM2。位置ごとの b × x を KV キャッシュのように覚えるので、巻き戻しもそのままできる）。
   新しく足した値は、前の版で変換したファイルに無いので、読むときに既定の値を入れる（`init(from:)`）。
 - `GGUFRope`: 全体を見る層・直近だけを見る層の周波数（rope_freqs での割り算・線形の伸ばし方・YaRN の混ぜ方と cos / sin の倍率）。
-- `GGUFConverter` → `GGUFWeightStore`（.llw）: 重みを「1 行ごとに倍率を持つ 8 ビット整数」にして保存する（1 パラメータ 1 バイト）。
+- `GGUFConverter` → `GGUFWeightStore`（.llw）: 行列ごとに、元の形式に合わせて置き方を選ぶ（`GGUFGroupQuant.storage(for:)`）。
+  - 元が 4 ビット以下 → `q4Groups`、5 ビット → `q5Groups`、それ以外 → `int8Rows`（1 行ごとに倍率を持つ 8 ビット整数、1 パラメータ 1 バイト）。
+  - `q4Groups`・`q5Groups`: 32 個ずつの組ごとに半精度の倍率と下限（値 = q × 倍率 + 下限）。行列ごとに 3 つの面
+    （下位 4 ビット = 1 バイトに 2 個 / 5 ビット目 = 1 バイトに 8 個 / 倍率と下限）に分けて、どれも 64 バイトの境目にそろえて置く。
+  - Q4_0・Q4_1・Q5_0・Q5_1・Q4_K・Q5_K は、量子化の整数を全部 0 にしたブロックと全部 1 にしたブロックを戻して
+    目盛り（b と a + b）を求め、元の整数をそのまま写す（形式ごとの並びを知らなくてよい）。ほかの形式は組の最小・最大から目盛りを決める。
+  - CPU（`GGUFGroupQuant.linear`）: q を Accelerate でまとめて Float にし、y = Σ_組 (倍率 × Σ q·x + 下限 × Σ x) を sgemv と dotpr で計算する。
+    GPU: `linear_q4_vector` / `linear_q5_vector`（1 トークン、32 スレッドで 1 行）と `linear_q4_batch` / `linear_q5_batch`。
   4 ビットのブロックを毎トークンほどくより速く、Float32 のまま置くより 4 倍小さい。ファイルは mmap で読むので、
   アプリのメモリ使用量（iOS が強制終了を決める量）にはほとんど数えられない。正規化の重みやバイアスは Float32 のまま。
   変換は行のまとまりごとに並列に行う。
@@ -768,7 +775,7 @@ llama.cpp を組み込まず、GGUF の読み取り・量子化の復元・推�
   llama.cpp と一致する（多くは 1e-5 ほど。GELU の系列は、llama.cpp が GELU を半精度の表で計算するぶん 1e-2 ほどずれる）。
   まとめて読み込んだとき・巻き戻したときも同じ。Gemma 4 は GELU を多く使うので、同じ計算を numpy で書いたもの
   （半精度の GELU を真似ると llama.cpp と 1e-3 で一致する）の、正確な GELU の値と 1e-4 以内で比べる。
-- GPU（Metal）は、すべての構造で CPU と同じ logits になるかを macOS の CI で確かめる（Float32 のままと 8 ビットの両方）。
+- GPU（Metal）は、すべての構造で CPU と同じ logits になるかを macOS の CI で確かめる（Float32 のままと 8 ビットの両方。4・5 ビットは本物の Q4_K_M のモデルで）。
 - 本物のモデル（SmolLM2 135M・Qwen2.5 0.5B / 1.5B・Qwen3 0.6B・Gemma 3 1B・Llama 3.2 1B・Gemma 4 E2B）で、
   llama.cpp と同じ続きを貪欲に生成する（CI では SmolLM2 と Qwen2.5 1.5B。速さも出力する）。
 - トークナイザは、9 つの実在モデルの GGUF（先頭 16MB）から作ったものを、元の tokenizer.json と突き合わせる。

@@ -97,6 +97,9 @@ final class GGUFMetalTests: XCTestCase {
     }
 
     /// ほかの構造も、GPU と CPU で同じ logits になる（CPU は llama.cpp と一致することを GGUFModelTests で確かめている）
+    /// GPU ではまだ計算しない構造
+    static let cpuOnlyFamilies: Set<String> = ["qwen35", "qwen3moe", "qwen2moe", "olmoe", "granitemoe"]
+
     func testMoreArchitecturesMatchCPU() throws {
         try requireDevice()
         var failures: [String] = []
@@ -105,6 +108,14 @@ final class GGUFMetalTests: XCTestCase {
                 let file = try convert(family, compact: compact)
                 defer { try? FileManager.default.removeItem(at: file) }
                 let store = try GGUFWeightStore(url: file)
+                // GPU ではまだ計算しない構造（Qwen3.5・MoE）は、GPU 用を作らずに断り、読み込みの入口は CPU 用を返す
+                if Self.cpuOnlyFamilies.contains(family) {
+                    XCTAssertThrowsError(try GGUFMetalModel(store: store), family) { error in
+                        guard case .unavailable = error as? GGUFMetalError else { return XCTFail("\(family): \(error)") }
+                    }
+                    XCTAssertFalse(try GGUFModelFactory.make(store: file, context: 64, useGPU: true).isMetal, family)
+                    continue
+                }
                 let gpu = try GGUFMetalModel(store: store)
                 let cpu = try GGUFModel(store: store)
                 let tokens = try reference(family).tokens

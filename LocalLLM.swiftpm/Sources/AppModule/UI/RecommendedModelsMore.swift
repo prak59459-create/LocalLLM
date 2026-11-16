@@ -16,6 +16,14 @@ extension RecommendedModels {
     }
 
     private static var moreGeneral: [RecommendedModel] {[
+        entry("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5 0.8B (GGUF)", 532_517_120, .good, .general,
+              ja: "Qwen の新しい世代。線形の注意（Gated DeltaNet）と普通の注意を組み合わせた構造で、長い会話でもメモリが増えにくい。今は CPU で動かします。",
+              en: "Qwen's new generation. Mixes linear attention (Gated DeltaNet) with regular attention, so memory grows slowly in long chats. Runs on the CPU for now."),
+        entry("unsloth/Qwen3.5-2B-GGUF", "Qwen3.5 2B (GGUF)", 1_280_835_840, .good, .general,
+              ja: "Qwen3.5 の 2B。0.8B より賢い。今は CPU で動かします。", en: "Qwen3.5 2B. Smarter than 0.8B. Runs on the CPU for now."),
+        entry("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5 4B (GGUF)", 2_740_937_888, .good, .reasoning,
+              ja: "Qwen3.5 の 4B。この大きさでとても賢い。メモリの多い iPad 向け。今は CPU で動かします。",
+              en: "Qwen3.5 4B. Very capable for its size. For iPads with more memory. Runs on the CPU for now."),
         entry("unsloth/Qwen3-1.7B-GGUF", "Qwen3 1.7B (GGUF)", 1_107_409_472, .good, .general,
              ja: "思考モードを切り替えられる Qwen3。賢さと速さのバランスがよい。", en: "Qwen3 with switchable thinking. A good balance of smarts and speed."),
         entry("unsloth/Qwen3-4B-Instruct-2507-GGUF", "Qwen3 4B Instruct 2507 (GGUF)", 2_497_281_120, .good, .general,

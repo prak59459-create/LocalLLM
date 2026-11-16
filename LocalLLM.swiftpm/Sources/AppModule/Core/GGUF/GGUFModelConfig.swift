@@ -11,7 +11,7 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         case gemma4, mistral3, internlm2, xverse, baichuan, ernie45 = "ernie4_5", granite, minicpm, arcee, smollm3
         case maincoder, qwen, qwen2vl, qwen3vl, exaone, exaone4, olmo, olmo2, seedOSS = "seed_oss", plamo, openelm
         case phi2, gpt2, starcoder, starcoder2, stablelm, gptneox, falcon, codeshell, orion, nemotron, jais2
-        case commandR = "command-r", cohere2, chatglm, glm4, lfm2
+        case commandR = "command-r", cohere2, chatglm, glm4, lfm2, qwen35
     }
 
     enum Activation: String, Codable, Sendable { case silu, gelu, reluSquared }
@@ -34,12 +34,14 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         var kvLayer: Int
         /// 注意の代わりに、短い畳み込みを使う層（LFM2）
         var convolution = false
+        /// 注意の代わりに、Gated DeltaNet（状態を持つ線形の注意）を使う層（Qwen3.5）
+        var deltaNet = false
 
         var querySize: Int { headCount * headSize }
         var kvSize: Int { kvHeadCount * headSize }
 
         init(headCount: Int, kvHeadCount: Int, headSize: Int, feedForwardSize: Int, usesRope: Bool, sliding: Bool, kvLayer: Int,
-             convolution: Bool = false) {
+             convolution: Bool = false, deltaNet: Bool = false) {
             self.headCount = headCount
             self.kvHeadCount = kvHeadCount
             self.headSize = headSize
@@ -48,10 +50,14 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
             self.sliding = sliding
             self.kvLayer = kvLayer
             self.convolution = convolution
+            self.deltaNet = deltaNet
         }
 
+        /// 位置ごとの KV キャッシュを使わない層（畳み込み・DeltaNet）
+        var isRecurrent: Bool { convolution || deltaNet }
+
         enum CodingKeys: String, CodingKey {
-            case headCount, kvHeadCount, headSize, feedForwardSize, usesRope, sliding, kvLayer, convolution
+            case headCount, kvHeadCount, headSize, feedForwardSize, usesRope, sliding, kvLayer, convolution, deltaNet
         }
 
         init(from decoder: Decoder) throws {
@@ -64,7 +70,25 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
             sliding = try c.decode(Bool.self, forKey: .sliding)
             kvLayer = try c.decode(Int.self, forKey: .kvLayer)
             convolution = try c.decodeIfPresent(Bool.self, forKey: .convolution) ?? false
+            deltaNet = try c.decodeIfPresent(Bool.self, forKey: .deltaNet) ?? false
         }
+    }
+
+    /// Gated DeltaNet の大きさ（Qwen3.5）。キー・バリューのヘッドごとに、キーの大きさ × バリューの大きさの状態を持つ
+    struct DeltaNet: Codable, Equatable, Sendable {
+        /// 入力の短い畳み込みの長さ
+        var convolutionLength: Int
+        var keyHeads: Int
+        var keyHeadSize: Int
+        var valueHeads: Int
+        var valueHeadSize: Int
+
+        var keySize: Int { keyHeads * keyHeadSize }
+        var valueSize: Int { valueHeads * valueHeadSize }
+        /// 畳み込みのチャンネル数（q・k・v）
+        var channels: Int { 2 * keySize + valueSize }
+        /// 1 層の状態の Float の数
+        var stateFloats: Int { valueHeads * valueHeadSize * keyHeadSize }
     }
 
     /// YaRN（学習時より長い文脈に伸ばす仕組み）の値
@@ -157,6 +181,13 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
     var convolutionLength: Int
     var yarn: YaRN?
 
+    // MARK: 版 4 で足したもの（無ければ既定の値）
+
+    /// Gated DeltaNet の層の大きさ（Qwen3.5。無ければ nil）
+    var deltaNet: DeltaNet?
+    /// 注意の q の射影に、ヘッドごとの出力のゲートが続いている（q とゲートが交互）。出力 × sigmoid(ゲート)（Qwen3.5）
+    var attentionOutputGate: Bool
+
     var kvSize: Int { kvHeadCount * headSize }
     var querySize: Int { headCount * headSize }
 
@@ -181,12 +212,24 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         layers.enumerated().reduce(0) { total, item in
             // 畳み込みの層は、位置ごとに 1 つ（埋め込みの大きさ）を覚えておく
             if item.element.convolution { return total + embeddingSize * MemoryLayout<Float>.size }
+            // DeltaNet の層は、位置によらず決まった大きさの状態だけ
+            if item.element.deltaNet { return total }
             return item.element.kvLayer == item.offset ? total + item.element.kvSize * 2 * MemoryLayout<Float>.size : total
         }
     }
 
     /// 注意を使う層の、いちばん大きいヘッドの数
-    var maxAttentionHeads: Int { layers.filter { !$0.convolution }.map(\.headCount).max() ?? headCount }
+    var maxAttentionHeads: Int { layers.filter { !$0.isRecurrent }.map(\.headCount).max() ?? headCount }
+
+    /// 位置によらない状態（DeltaNet の状態と畳み込みの直前の入力）のバイト数。スナップショットを 1 つ持つので 2 倍
+    var recurrentStateBytes: Int {
+        guard let deltaNet else { return 0 }
+        let perLayer = deltaNet.stateFloats + (deltaNet.convolutionLength - 1) * deltaNet.channels
+        return 2 * layers.filter(\.deltaNet).count * perLayer * MemoryLayout<Float>.size
+    }
+
+    /// 巻き戻せない状態を持つ（巻き戻すときは、覚えておいた状態から読み直す）
+    var hasRecurrentState: Bool { deltaNet != nil }
 
     func isSliding(_ layer: Int) -> Bool {
         slidingWindow > 0 && layer < slidingLayers.count && slidingLayers[layer]
@@ -223,6 +266,7 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         case layerShapes, norm, feedForward, parallelResidual, hasPreNorms, qkNormIsFull, hasValueNorm
         case learnedPositions, residualScale, logitScale, perLayerInputSize, slidingRopeDimensions
         case ropeFactorsOnSlidingLayers, slidingRopeScale, qkNormAfterRope, convolutionLength, yarn
+        case deltaNet, attentionOutputGate
     }
 
     init(from decoder: Decoder) throws {
@@ -274,5 +318,7 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         qkNormAfterRope = try c.decodeIfPresent(Bool.self, forKey: .qkNormAfterRope) ?? false
         convolutionLength = try c.decodeIfPresent(Int.self, forKey: .convolutionLength) ?? 0
         yarn = try c.decodeIfPresent(YaRN.self, forKey: .yarn)
+        deltaNet = try c.decodeIfPresent(DeltaNet.self, forKey: .deltaNet)
+        attentionOutputGate = try c.decodeIfPresent(Bool.self, forKey: .attentionOutputGate) ?? false
     }
 }

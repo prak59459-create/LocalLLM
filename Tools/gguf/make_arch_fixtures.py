@@ -351,7 +351,78 @@ def build_lfm2(path, seed):
     w.close()
 
 
-SPECIAL = {"gemma4": build_gemma4, "lfm2": build_lfm2}
+def build_qwen35(path, seed):
+    """Qwen3.5: 3 層ごとに Gated DeltaNet（線形の注意 + 状態）、4 層目が普通の注意（出力にゲート、部分的な RoPE）"""
+    rng = np.random.default_rng(seed)
+    layers, interval = 5, 4
+    head_dim, rot = 8, 4
+    k_dim, k_heads, v_heads, conv = 8, 2, 4, 4
+    v_dim = k_dim
+    inner = v_heads * v_dim
+    conv_dim = 2 * k_heads * k_dim + inner
+
+    def mat(rows, cols, scale=0.35):
+        return (rng.standard_normal((rows, cols)) * scale / np.sqrt(cols) * 4).astype(np.float32)
+
+    def norm(size):
+        return (1.0 + 0.2 * rng.standard_normal(size)).astype(np.float32)
+
+    arch = "qwen35"
+    w = gguf.GGUFWriter(path, arch)
+    w.add_name(f"tiny test model {seed}")
+    w.add_context_length(CONTEXT)
+    w.add_embedding_length(DIM)
+    w.add_block_count(layers)
+    w.add_feed_forward_length(FF)
+    w.add_head_count(HEADS)
+    w.add_head_count_kv(KV_HEADS)
+    w.add_key_length(head_dim)
+    w.add_value_length(head_dim)
+    w.add_rope_dimension_count(rot)
+    w.add_array(f"{arch}.rope.dimension_sections", [1, 1, 0, 0])
+    w.add_rope_freq_base(10000.0)
+    w.add_layer_norm_rms_eps(1e-6)
+    w.add_uint32(f"{arch}.ssm.conv_kernel", conv)
+    w.add_uint32(f"{arch}.ssm.state_size", k_dim)
+    w.add_uint32(f"{arch}.ssm.group_count", k_heads)
+    w.add_uint32(f"{arch}.ssm.time_step_rank", v_heads)
+    w.add_uint32(f"{arch}.ssm.inner_size", inner)
+    w.add_uint32(f"{arch}.full_attention_interval", interval)
+    w.add_file_type(0)
+    tiny_vocab(w)
+    w.add_tensor("token_embd.weight", mat(VOCAB, DIM, 1.0))
+    w.add_tensor("output_norm.weight", norm(DIM))
+    for i in range(layers):
+        p = f"blk.{i}."
+        w.add_tensor(p + "attn_norm.weight", norm(DIM))
+        w.add_tensor(p + "post_attention_norm.weight", norm(DIM))
+        if (i + 1) % interval != 0:
+            w.add_tensor(p + "attn_qkv.weight", mat(conv_dim, DIM))
+            w.add_tensor(p + "attn_gate.weight", mat(inner, DIM))
+            w.add_tensor(p + "ssm_conv1d.weight", (0.5 * rng.standard_normal((conv_dim, conv))).astype(np.float32))
+            w.add_tensor(p + "ssm_dt.bias", (0.3 * rng.standard_normal(v_heads)).astype(np.float32))
+            w.add_tensor(p + "ssm_a", (-np.exp(0.5 * rng.standard_normal(v_heads))).astype(np.float32))
+            w.add_tensor(p + "ssm_beta.weight", mat(v_heads, DIM))
+            w.add_tensor(p + "ssm_alpha.weight", mat(v_heads, DIM))
+            w.add_tensor(p + "ssm_norm.weight", norm(v_dim))
+            w.add_tensor(p + "ssm_out.weight", mat(DIM, inner))
+        else:
+            w.add_tensor(p + "attn_q.weight", mat(2 * HEADS * head_dim, DIM))
+            w.add_tensor(p + "attn_k.weight", mat(KV_HEADS * head_dim, DIM))
+            w.add_tensor(p + "attn_v.weight", mat(KV_HEADS * head_dim, DIM))
+            w.add_tensor(p + "attn_q_norm.weight", norm(head_dim))
+            w.add_tensor(p + "attn_k_norm.weight", norm(head_dim))
+            w.add_tensor(p + "attn_output.weight", mat(DIM, HEADS * head_dim))
+        w.add_tensor(p + "ffn_gate.weight", mat(FF, DIM))
+        w.add_tensor(p + "ffn_up.weight", mat(FF, DIM))
+        w.add_tensor(p + "ffn_down.weight", mat(DIM, FF))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+SPECIAL = {"gemma4": build_gemma4, "lfm2": build_lfm2, "qwen35": build_qwen35}
 
 
 def reference_or_error(path, tokens):

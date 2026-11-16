@@ -189,6 +189,8 @@ REAL = [
     # 速さの目標にしているモデル（macOS の CI で GPU の計算を確かめるのに使う）
     ("qwen2.5-1.5b-q4_k_m", "qwen2.5-1.5b-instruct-q4_k_m.gguf", "The capital of France is"),
     ("gemma-4-e2b-q4_0", "gemma-4-E2B-it-Q4_0.gguf", "The capital of France is"),
+    # Gated DeltaNet と注意を組み合わせた Qwen3.5
+    ("qwen3.5-0.8b-q4_k_m", "Qwen3.5-0.8B-Q4_K_M.gguf", "The capital of France is"),
 ]
 
 

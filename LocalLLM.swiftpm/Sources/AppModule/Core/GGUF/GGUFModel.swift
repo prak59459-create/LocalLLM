@@ -11,8 +11,19 @@ final class GGUFModel: GGUFEvaluator {
     let config: GGUFModelConfig
     /// 扱える最大のトークン数（KV キャッシュの大きさ）
     let maxContext: Int
-    /// KV キャッシュに入っているトークン数
-    private(set) var length = 0
+    /// KV キャッシュに入っているトークン数（巻き戻したあと、まだ読み直していないトークンも含める）
+    var length: Int { computed + pending.count }
+    /// 実際に計算し終わったトークン数
+    private var computed = 0
+    /// 巻き戻しのあと、次の計算の前に読み直すトークン（状態を巻き戻せない層がある系列だけ）
+    private var pending: [Int] = []
+    /// 計算したトークン（状態を巻き戻せない層がある系列だけ。読み直しに使う）
+    private var history: [Int] = []
+    /// 最後にまとめて読み込んだ（プロンプトの）終わりの状態。巻き戻すときは、ここから読み直す
+    private var snapshot: (position: Int, data: [Float])?
+    /// Gated DeltaNet の層の状態（その層でなければ nil）
+    private var deltaLayers: [GGUFDeltaNetLayer?] = []
+    private let deltaWork = GGUFDeltaNetLayer.Work()
 
     private let store: GGUFWeightStore
     private let workers: GGUFWorkers
@@ -47,7 +58,9 @@ final class GGUFModel: GGUFEvaluator {
         self.config = config
         self.maxContext = max(8, min(config.contextLength, maxContext ?? config.contextLength))
         shapes = config.layers
-        let widest = max(config.maxFeedForwardSize, config.embeddingSize, config.maxQuerySize, config.perLayerInputSize)
+        var widest = max(config.maxFeedForwardSize, config.embeddingSize, config.maxQuerySize, config.perLayerInputSize)
+        if let delta = config.deltaNet { widest = max(widest, delta.channels, delta.valueSize) }
+        if config.attentionOutputGate { widest = max(widest, 2 * config.maxQuerySize) }
         // 畳み込みの層の入力の射影は 3 × 埋め込みの大きさ
         workers = GGUFWorkers(chunkCount: chunkCount, widestRow: widest)
         let globals = try GGUFGlobalWeights(store: store, config: config)
@@ -55,6 +68,7 @@ final class GGUFModel: GGUFEvaluator {
         layers = try (0..<config.layerCount).map { try GGUFLayerWeights.load($0, store: store, config: config) }
         fullRope = GGUFRope.table(config: config, sliding: false, factors: globals.ropeFactors)
         slidingRope = GGUFRope.table(config: config, sliding: true, factors: globals.ropeFactors)
+        deltaLayers = shapes.map { shape in config.deltaNet.flatMap { shape.deltaNet ? GGUFDeltaNetLayer(sizes: $0) : nil } }
         allocateCache()
     }
 
@@ -68,6 +82,11 @@ final class GGUFModel: GGUFEvaluator {
         keys = []
         values = []
         for (index, shape) in shapes.enumerated() {
+            if shape.deltaNet {
+                keys.append(nil)
+                values.append(nil)
+                continue
+            }
             if shape.convolution {
                 // 畳み込みの層は、位置ごとの b × x を覚えておく（巻き戻しても、その位置から続けられる）
                 keys.append(Out.allocate(capacity: config.embeddingSize * maxContext))
@@ -87,16 +106,63 @@ final class GGUFModel: GGUFEvaluator {
         values = []
     }
 
-    /// KV キャッシュを length トークンまで巻き戻す（それより後ろは次の計算で上書きされる）
+    /// KV キャッシュを length トークンまで巻き戻す（それより後ろは次の計算で上書きされる）。
+    /// 状態を巻き戻せない層（DeltaNet）がある系列は、覚えておいた状態（無ければ最初）に戻して、次の計算の前に読み直す
     func truncate(to newLength: Int) {
-        length = max(0, min(length, newLength))
+        let target = max(0, min(length, newLength))
+        guard config.hasRecurrentState else {
+            computed = target
+            return
+        }
+        if target >= computed {
+            pending = Array(pending.prefix(target - computed))
+            return
+        }
+        var from = 0
+        if let snapshot, snapshot.position <= target {
+            restoreStates(snapshot.data)
+            from = snapshot.position
+        } else {
+            snapshot = nil
+            for layer in deltaLayers { layer?.reset() }
+        }
+        pending = Array(history[from..<target])
+        history = Array(history.prefix(from))
+        computed = from
     }
 
     /// KV キャッシュを空にして、使っていたメモリを OS に返す（確保し直す。使うまで実メモリにはならない）
     func releaseCache() {
-        length = 0
+        computed = 0
+        pending = []
+        history = []
+        snapshot = nil
+        for layer in deltaLayers { layer?.reset() }
         freeCache()
         allocateCache()
+    }
+
+    private func saveStates() -> [Float] {
+        let total = deltaLayers.reduce(0) { $0 + ($1?.savedFloats ?? 0) }
+        var data = [Float](repeating: 0, count: total)
+        data.withUnsafeMutableBufferPointer { buffer in
+            guard var target = buffer.baseAddress else { return }
+            for layer in deltaLayers.compactMap({ $0 }) {
+                layer.save(into: target)
+                target += layer.savedFloats
+            }
+        }
+        return data
+    }
+
+    private func restoreStates(_ data: [Float]) {
+        data.withUnsafeBufferPointer { buffer in
+            guard var source = buffer.baseAddress else { return }
+            for layer in deltaLayers.compactMap({ $0 }) {
+                layer.restore(from: source)
+                source += layer.savedFloats
+            }
+        }
     }
 
     /// KV キャッシュが今使っているメモリの目安（バイト）
@@ -111,6 +177,21 @@ final class GGUFModel: GGUFEvaluator {
     @discardableResult
     func evaluate(_ tokens: [Int], batch: Int, progress: ((Int) throws -> Void)?) throws -> [Float] {
         try validate(tokens)
+        // 巻き戻したあとの読み直し
+        if !pending.isEmpty {
+            let replay = pending
+            pending = []
+            var offset = 0
+            while offset < replay.count {
+                let count = min(max(1, batch), replay.count - offset)
+                _ = forward(Array(replay[offset..<(offset + count)]), wantsLogits: false)
+                offset += count
+            }
+        }
+        defer {
+            // まとめて読み込んだ（プロンプトの）終わりの状態を覚えておく
+            if config.hasRecurrentState && tokens.count > 1 { snapshot = (computed, saveStates()) }
+        }
         var offset = 0
         var logits: [Float] = []
         while offset < tokens.count {
@@ -126,7 +207,7 @@ final class GGUFModel: GGUFEvaluator {
 
     private func forward(_ tokens: [Int], wantsLogits: Bool) -> [Float] {
         let n = tokens.count, d = config.embeddingSize
-        let start = length
+        let start = computed
         let x = hidden.reserve(n * d)
         embed(tokens, start: start, into: x)
         let inputs = preparePerLayerInputs(tokens, embedded: x)
@@ -134,7 +215,8 @@ final class GGUFModel: GGUFEvaluator {
         for index in layers.indices {
             runLayer(index, x: x, start: start, count: n, perLayerInputs: inputs)
         }
-        length = start + n
+        computed = start + n
+        if config.hasRecurrentState { history.append(contentsOf: tokens) }
         guard wantsLogits else { return [] }
         return logits(from: x + (n - 1) * d)
     }
@@ -247,9 +329,30 @@ final class GGUFModel: GGUFEvaluator {
             convolve(index, input: input, start: start, count: n, into: out)
             return
         }
+        if shape.deltaNet {
+            deltaNet(index, input: input, count: n, into: out)
+            return
+        }
         let q = shape.querySize, kv = shape.kvSize
         let qs = queries.reserve(n * q)
-        linear(layer.query, bias: layer.queryBias, input: input, count: n, output: qs)
+        var outputGate: Out?
+        if config.attentionOutputGate {
+            // q の射影は、ヘッドごとに [q | ゲート] が並ぶ（Qwen3.5）
+            let size = shape.headSize, heads = shape.headCount
+            let full = scratch.reserve(n * 2 * q)
+            linear(layer.query, bias: layer.queryBias, input: input, count: n, output: full)
+            let gate = gateBuffer.reserve(n * q)
+            for token in 0..<n {
+                for head in 0..<heads {
+                    let source = full + (token * heads + head) * 2 * size
+                    (qs + (token * heads + head) * size).update(from: source, count: size)
+                    (gate + (token * heads + head) * size).update(from: source + size, count: size)
+                }
+            }
+            outputGate = gate
+        } else {
+            linear(layer.query, bias: layer.queryBias, input: input, count: n, output: qs)
+        }
         if config.qkNormAfterRope { rotate(qs, heads: shape.headCount, layer: index, count: n) }
         if let norm = layer.queryNorm {
             normalizeHeads(qs, weight: norm, perHead: layer.queryNormPerHead, heads: shape.headCount, size: shape.headSize, count: n)
@@ -279,7 +382,30 @@ final class GGUFModel: GGUFEvaluator {
         }
         let attention = attended.reserve(n * q)
         attend(index, queries: qs, start: start, count: n, into: attention)
+        if let outputGate {
+            // 出力 × sigmoid(ゲート)
+            for index in 0..<(n * q) { attention[index] *= 1 / (1 + Foundation.exp(-outputGate[index])) }
+        }
         linear(layer.output, bias: layer.outputBias, input: attention, count: n, output: out)
+    }
+
+    /// Gated DeltaNet の層（Qwen3.5）
+    private func deltaNet(_ index: Int, input: In, count n: Int, into out: Out) {
+        let layer = layers[index]
+        guard let state = deltaLayers[index], let weights = layer.delta, let kernel = layer.convolutionKernel else { return }
+        let sizes = state.sizes
+        let projected = deltaWork.projected.reserve(n * sizes.channels)
+        linear(layer.query, bias: nil, input: input, count: n, output: projected)
+        let z = deltaWork.z.reserve(n * sizes.valueSize)
+        linear(weights.outputGate, bias: nil, input: input, count: n, output: z)
+        let beta = deltaWork.beta.reserve(n * sizes.valueHeads)
+        linear(weights.beta, bias: nil, input: input, count: n, output: beta)
+        let decay = deltaWork.decay.reserve(n * sizes.valueHeads)
+        linear(weights.alpha, bias: nil, input: input, count: n, output: decay)
+        let core = deltaWork.core.reserve(n * sizes.valueSize)
+        state.run(count: n, projected: projected, z: z, betaRaw: beta, alphaRaw: decay, weights: weights, kernel: kernel,
+                  epsilon: config.normEpsilon, into: core, work: deltaWork)
+        linear(layer.output, bias: nil, input: core, count: n, output: out)
     }
 
     /// 短い畳み込み（LFM2）: [b, c, x] = 射影、bx = b × x を位置ごとに覚え、

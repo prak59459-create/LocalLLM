@@ -23,6 +23,7 @@ TEXTS = [
     "Emoji 🚀🎉 and symbols ©®™ ½ ∑ ≠",
     "1234567890 3.14159 0xDEADBEEF",
     "   \t tabs\tand\r\nwindows newlines",
+    "Cafe\u0301 and \u304b\u3099\u304d\u3099 (combining marks)",
 ]
 
 

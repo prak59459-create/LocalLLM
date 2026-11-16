@@ -62,6 +62,8 @@ struct GGUFLayerWeights {
     var outputScale: Float = 1
     /// 短い畳み込みの層（LFM2）: 重み [チャンネル][長さ]。このとき query は入力の射影（b・c・x の 3 つ分）、output は出力の射影
     var convolutionKernel: UnsafePointer<Float>?
+    /// Gated DeltaNet の層（Qwen3.5）。query は q・k・v の射影、output は出力の射影、convolutionKernel は入力の畳み込み
+    var delta: GGUFDeltaNetWeights?
 
     static func load(_ index: Int, store: GGUFWeightStore, config: GGUFModelConfig) throws -> GGUFLayerWeights {
         let prefix = "blk.\(index)."
@@ -69,6 +71,7 @@ struct GGUFLayerWeights {
         let q = shape.querySize, kv = shape.kvSize, ff = shape.feedForwardSize
         let ownsCache = shape.kvLayer == index
         if shape.convolution { return try loadConvolution(prefix: prefix, store: store, config: config) }
+        if shape.deltaNet { return try loadDeltaNet(prefix: prefix, store: store, config: config, size: ff) }
         var query: GGUFMatrix, key: GGUFMatrix?, value: GGUFMatrix?
         var queryBias: UnsafePointer<Float>?, keyBias: UnsafePointer<Float>?, valueBias: UnsafePointer<Float>?
         if store.has(prefix + "attn_qkv.weight") {
@@ -123,6 +126,28 @@ struct GGUFLayerWeights {
         return weights
     }
 
+    /// Gated DeltaNet の層（Qwen3.5）
+    private static func loadDeltaNet(prefix: String, store: GGUFWeightStore, config: GGUFModelConfig, size ff: Int) throws
+        -> GGUFLayerWeights {
+        var weights = GGUFLayerWeights(
+            query: try store.matrix(prefix + "attn_qkv.weight"),
+            output: try store.matrix(prefix + "ssm_out.weight"),
+            up: try store.matrix(prefix + "ffn_up.weight"),
+            down: try store.matrix(prefix + "ffn_down.weight"))
+        weights.attentionNorm = try store.requiredVector(prefix + "attn_norm.weight")
+        weights.feedForwardNorm = try store.requiredVector(prefix + "post_attention_norm.weight")
+        weights.gate = try store.matrix(prefix + "ffn_gate.weight")
+        weights.convolutionKernel = try store.requiredVector(prefix + "ssm_conv1d.weight")
+        weights.delta = GGUFDeltaNetWeights(
+            outputGate: try store.matrix(prefix + "attn_gate.weight"),
+            beta: try store.matrix(prefix + "ssm_beta.weight"),
+            alpha: try store.matrix(prefix + "ssm_alpha.weight"),
+            timeStepBias: try store.requiredVector(prefix + "ssm_dt.bias"),
+            decay: try store.requiredVector(prefix + "ssm_a"),
+            norm: try store.requiredVector(prefix + "ssm_norm.weight"))
+        return weights
+    }
+
     private mutating func loadNorms(prefix: String, store: GGUFWeightStore, config: GGUFModelConfig, shape: GGUFModelConfig.Layer) {
         if config.family == .falcon, let second = store.vector(prefix + "attn_norm_2.weight") {
             // Falcon 40B: 注意は 2 つ目の正規化、FFN は 1 つ目の正規化から
@@ -133,8 +158,8 @@ struct GGUFLayerWeights {
         } else {
             attentionNorm = store.vector(prefix + "attn_norm.weight")
             attentionNormBias = store.vector(prefix + "attn_norm.bias")
-            // Seed-OSS は FFN の前の正規化を post_attention_norm という名前で持つ
-            let name = config.family == .seedOSS ? "post_attention_norm" : "ffn_norm"
+            // Seed-OSS・Qwen3.5 は FFN の前の正規化を post_attention_norm という名前で持つ
+            let name = config.family == .seedOSS || config.family == .qwen35 ? "post_attention_norm" : "ffn_norm"
             feedForwardNorm = store.vector(prefix + name + ".weight")
             feedForwardNormBias = store.vector(prefix + name + ".bias")
         }
@@ -169,6 +194,20 @@ struct GGUFLayerWeights {
             upBias = store.vector(prefix + "ffn_up.bias")
         }
     }
+}
+
+/// Gated DeltaNet の層の重み（Qwen3.5）
+struct GGUFDeltaNetWeights {
+    /// z（出力の正規化のあとに silu(z) を掛ける）
+    var outputGate: GGUFMatrix
+    /// β = sigmoid(beta · x)（ヘッドごとの書き込みの強さ）
+    var beta: GGUFMatrix
+    /// 減衰 g = softplus(alpha · x + timeStepBias) × decay（decay = −exp(A_log)）
+    var alpha: GGUFMatrix
+    var timeStepBias: UnsafePointer<Float>
+    var decay: UnsafePointer<Float>
+    /// 出力の RMSNorm の重み（バリューのヘッドの大きさ。どのヘッドも同じ）
+    var norm: UnsafePointer<Float>
 }
 
 /// 層の外の重み

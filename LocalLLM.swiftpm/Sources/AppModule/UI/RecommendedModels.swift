@@ -20,6 +20,7 @@ struct RecommendedModel: Identifiable, Hashable {
     /// 何が得意か（おすすめ一覧の見出し）
     enum Category: String, CaseIterable, Identifiable {
         case general
+        case japanese
         case coding
         case reasoning
         case tiny
@@ -30,6 +31,7 @@ struct RecommendedModel: Identifiable, Hashable {
         var title: String {
             switch self {
             case .general: return L("はじめに・会話", "Start here · Chat")
+            case .japanese: return L("日本語が得意", "Good at Japanese")
             case .coding: return L("コーディング専用", "Coding")
             case .reasoning: return L("賢さ・推論専門", "Reasoning")
             case .tiny: return L("とても軽い（動作確認・古い iPad）", "Very light (testing · older iPads)")
@@ -40,6 +42,8 @@ struct RecommendedModel: Identifiable, Hashable {
         var subtitle: String {
             switch self {
             case .general: return L("普段の会話や質問に。小さくて速いものから。", "For everyday chat and questions. Small and fast first.")
+            case .japanese: return L("日本で作られた・日本語で鍛えたモデル。日本語の自然さを重視するならこちら。",
+                                     "Models made in Japan or trained on Japanese. Pick these for natural Japanese.")
             case .coding: return L("コードを書く・直すのが得意。コーディングワークスペース（CDWS）のエージェントに。",
                                    "Good at writing and fixing code. Use them for the Coding Workspace agent.")
             case .reasoning: return L("考えてから答える（<think>）。難しい質問・数学・論理に強いが、答えるまで時間がかかる。",
@@ -53,6 +57,7 @@ struct RecommendedModel: Identifiable, Hashable {
         var symbolName: String {
             switch self {
             case .general: return "bubble.left.and.bubble.right.fill"
+            case .japanese: return "character.ja"
             case .coding: return "chevron.left.forwardslash.chevron.right"
             case .reasoning: return "brain.head.profile"
             case .tiny: return "hare.fill"
@@ -81,7 +86,7 @@ enum RecommendedModels {
     }
 
     // 言語の切り替えに追従するよう、毎回作り直す（computed）。
-    static var all: [RecommendedModel] { general + coding + reasoning + tiny + gguf }
+    static var all: [RecommendedModel] { general + coding + reasoning + tiny + gguf + more }
 
     /// GGUF のおすすめ（大きさは Q4_K_M のファイル）
     private static var gguf: [RecommendedModel] {[

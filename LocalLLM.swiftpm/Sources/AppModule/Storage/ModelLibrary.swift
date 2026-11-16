@@ -614,7 +614,7 @@ final class ModelLibrary {
         return ModelFiles(
             modelID: model.id,
             displayName: model.displayName,
-            source: .gguf(GGUFModelFiles(store: store, context: context)),
+            source: .gguf(GGUFModelFiles(store: store, context: context, memory: .stored)),
             tokenizerJSON: tokenizer,
             tokenizerConfigJSON: optional("tokenizer_config.json"),
             generationConfigJSON: optional("generation_config.json"),

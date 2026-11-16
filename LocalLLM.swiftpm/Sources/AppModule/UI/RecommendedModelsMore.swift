@@ -5,8 +5,20 @@ import Foundation
 /// 型の推論を軽くするため、小さな関数で作って、分野ごとに分けてある。
 extension RecommendedModels {
     static var more: [RecommendedModel] {
-        moreGeneral + moreGeneral2 + japanese + moreCoding + moreReasoning + moreTiny
+        moreGeneral + moreGeneral2 + japanese + moreCoding + moreReasoning + mixture + moreTiny
     }
+
+    private static var mixture: [RecommendedModel] {[
+        entry("lmstudio-community/granite-3.1-1b-a400m-instruct-GGUF", "Granite 3.1 1B-A400M MoE (GGUF)", 821_847_040, .weak, .mixture,
+              ja: "IBM の MoE。32 個の専門家から 8 個だけ使うので、1B なのに 400M 並みに速い。今は CPU で動かします。",
+              en: "IBM's MoE. Uses 8 of 32 experts per token, so it runs about as fast as a 400M model. Runs on the CPU for now."),
+        entry("lmstudio-community/granite-3.1-3b-a800m-instruct-GGUF", "Granite 3.1 3B-A800M MoE (GGUF)", 2_016_888_096, .weak, .mixture,
+              ja: "IBM の MoE の 3B（40 個の専門家から 8 個）。1B より賢い。今は CPU で動かします。",
+              en: "IBM's 3B MoE (8 of 40 experts). Smarter than the 1B. Runs on the CPU for now."),
+        entry("allenai/OLMoE-1B-7B-0125-Instruct-GGUF", "OLMoE 1B-7B (GGUF)", 4_213_512_192, .weak, .mixture,
+              ja: "AI2 の完全オープンな MoE。全体は 7B だが、使うのは 1B 分。メモリが足りなければ「使う分だけ置く」にすると動きます（遅め）。",
+              en: "AI2's fully open MoE. 7B in total but only 1B active. If memory is short, choose \"Keep only what is in use\" (slower)."),
+    ]}
 
     private static func entry(_ repo: String, _ title: String, _ bytes: Int64, _ japanese: RecommendedModel.JapaneseSupport,
                              _ category: RecommendedModel.Category, ja: String, en: String) -> RecommendedModel {

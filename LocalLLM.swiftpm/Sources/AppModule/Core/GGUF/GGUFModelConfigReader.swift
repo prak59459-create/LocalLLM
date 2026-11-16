@@ -18,7 +18,7 @@ extension GGUFModelConfig {
     private static func rules(_ family: Family, file: GGUFFile) -> Rules {
         var rules = Rules()
         switch family {
-        case .llama, .mistral3, .internlm2, .xverse, .baichuan, .ernie45, .granite, .minicpm, .smollm3, .maincoder, .chatglm:
+        case .llama, .mistral3, .internlm2, .xverse, .baichuan, .ernie45, .granite, .granitemoe, .minicpm, .smollm3, .maincoder, .chatglm:
             rules.splitPairs = false
         case .glm4:
             // 画像も扱う版（GLM-4V）は M-RoPE（文章だけなら NEOX と同じ）
@@ -34,7 +34,7 @@ extension GGUFModelConfig {
         case .olmo:
             rules.splitPairs = false
             rules.norm = .layer
-        case .qwen, .qwen2, .qwen2vl, .qwen3, .qwen3vl, .phi3, .exaone, .seedOSS, .openelm, .lfm2, .qwen35:
+        case .qwen, .qwen2, .qwen2vl, .qwen3, .qwen3vl, .phi3, .exaone, .seedOSS, .openelm, .lfm2, .qwen35, .qwen2moe, .qwen3moe, .olmoe:
             break
         case .plamo:
             rules.parallel = true
@@ -115,6 +115,7 @@ extension GGUFModelConfig {
         let read = try Self.readShapes(file, family: family, rules: rules, layers: layerCount, embeddingSize: embeddingSize,
                                        slidingWindow: slidingWindow, slidingLayers: slidingLayers, deltaLayers: deltaLayers)
         deltaNet = try Self.deltaNetSizes(file, family: family)
+        moe = try Self.moeSizes(file, family: family)
         attentionOutputGate = family == .qwen35
         let shapes = read.shapes, fullHead = read.fullHead, slidingHead = read.slidingHead
         layerShapes = shapes
@@ -172,8 +173,8 @@ extension GGUFModelConfig {
         guard let embedding = file.tensor("token_embd.weight"), embedding.dimensions.count == 2 else {
             throw GGUFError.missingTensor("token_embd.weight")
         }
-        // 混合エキスパート（MoE）は扱わない
-        if file.has("blk.0.ffn_gate_inp.weight") || (file.archInt("expert_count") ?? 0) > 0 {
+        // 混合エキスパート（MoE）は、対応している系列だけ
+        if !moeFamilies.contains(family), file.has("blk.0.ffn_gate_inp.weight") || (file.archInt("expert_count") ?? 0) > 0 {
             throw GGUFError.unsupportedArchitecture("\(arch) (MoE)")
         }
         return (family, embedding)
@@ -218,12 +219,15 @@ extension GGUFModelConfig {
             let sliding = slidingWindow > 0 && slidingLayers[index] && !convolution
             let rope = rules.rope && usesRope(family: family, file: file, layer: index, sliding: sliding, hasSliding: slidingWindow > 0)
             let kvLayer = index >= ownCache ? ownCache - (sliding ? 2 : 1) : index
-            let ff = try feedForwardSize(file, layer: index)
+            // MoE の層は、専門家 1 つの大きさ
+            let moe = file.has("blk.\(index).ffn_gate_inp.weight")
+            let ff = moe ? (file.tensor("blk.\(index).ffn_up_exps.weight")?.dimensions.dropFirst().first ?? 0)
+                         : try feedForwardSize(file, layer: index)
             let delta = deltaLayers[index]
             shapes.append(Layer(headCount: heads[index], kvHeadCount: convolution ? heads[index] : kvHeads[index],
                                 headSize: sliding ? slidingHead : fullHead, feedForwardSize: ff,
                                 usesRope: rope && !convolution && !delta, sliding: sliding, kvLayer: kvLayer,
-                                convolution: convolution, deltaNet: delta))
+                                convolution: convolution, deltaNet: delta, moe: moe))
         }
         try validateShapes(shapes)
         return (shapes, fullHead, slidingHead)
@@ -239,6 +243,29 @@ extension GGUFModelConfig {
             }
         }
     }
+
+    /// 専門家の混合（MoE）の大きさと選び方（llama.cpp の各系列の build_moe_ffn の引数と同じ）
+    private static func moeSizes(_ file: GGUFFile, family: Family) throws -> MoE? {
+        guard moeFamilies.contains(family), let up = file.tensor("blk.0.ffn_up_exps.weight") ?? firstExperts(file) else { return nil }
+        let count = try require(file, "expert_count")
+        let used = try require(file, "expert_used_count")
+        guard count > 0, used > 0, used <= count, up.dimensions.count == 3 else {
+            throw GGUFError.unsupportedArchitecture("\(file.architecture) (experts)")
+        }
+        let shared = (0..<(file.archInt("block_count") ?? 1)).lazy
+            .compactMap { file.tensor("blk.\($0).ffn_up_shexp.weight")?.dimensions.dropFirst().first }.first ?? 0
+        let gated = (0..<(file.archInt("block_count") ?? 1)).contains { file.has("blk.\($0).ffn_gate_inp_shexp.weight") }
+        return MoE(expertCount: count, expertsUsed: used, expertFeedForward: up.dimensions[1], sharedFeedForward: shared,
+                   sharedGated: gated, normalizeWeights: family == .qwen3moe || family == .granitemoe,
+                   weightScale: Float(file.archDouble("expert_weights_scale") ?? 0))
+    }
+
+    private static func firstExperts(_ file: GGUFFile) -> GGUFTensorInfo? {
+        file.tensors.first { $0.name.hasSuffix("ffn_up_exps.weight") }
+    }
+
+    /// 専門家の混合に対応している系列
+    static let moeFamilies: Set<Family> = [.qwen2moe, .qwen3moe, .olmoe, .granitemoe]
 
     /// Gated DeltaNet の層（Qwen3.5: メタデータの層の並びか、full_attention_interval 層ごとに 1 層だけ注意）
     private static func deltaNetLayers(_ file: GGUFFile, family: Family, layers: Int) -> [Bool] {
@@ -406,7 +433,7 @@ extension GGUFModelConfig {
         case .commandR, .cohere2:
             let scale = Float(file.archDouble("logit_scale") ?? 0)
             logitScale = scale == 0 ? 1 : scale
-        case .granite:
+        case .granite, .granitemoe:
             let logit = Float(file.archDouble("logit_scale") ?? 1)
             logitScale = logit == 0 ? 1 : 1 / logit
             let residual = Float(file.archDouble("residual_scale") ?? 0)
@@ -476,6 +503,10 @@ extension GGUFModelConfig {
             }
         }
         try check(file, prefix + "attn_output.weight", rows: d, columns: q)
+        if shape.moe, let moe {
+            try validateExperts(file, prefix: prefix, moe: moe, feedForward: ff)
+            return
+        }
         switch feedForward {
         case .gated where hasFusedGateUp:
             try check(file, prefix + "ffn_up.weight", rows: 2 * ff, columns: d)
@@ -499,6 +530,21 @@ extension GGUFModelConfig {
             try check(file, prefix + "inp_gate.weight", rows: perLayerInputSize, columns: d)
             try check(file, prefix + "proj.weight", rows: d, columns: perLayerInputSize)
             try check(file, prefix + "post_norm.weight", rows: 1, columns: d)
+        }
+    }
+
+    /// 専門家の重み: 振り分け [専門家][d]、gate・up [専門家 × ff][d]、down [専門家 × d][ff]、共通の専門家
+    private func validateExperts(_ file: GGUFFile, prefix: String, moe: MoE, feedForward ff: Int) throws {
+        let d = embeddingSize, count = moe.expertCount
+        try check(file, prefix + "ffn_gate_inp.weight", rows: count, columns: d)
+        try check(file, prefix + "ffn_gate_exps.weight", rows: count * ff, columns: d)
+        try check(file, prefix + "ffn_up_exps.weight", rows: count * ff, columns: d)
+        try check(file, prefix + "ffn_down_exps.weight", rows: count * d, columns: ff)
+        if moe.sharedFeedForward > 0, file.has(prefix + "ffn_up_shexp.weight") {
+            let shared = moe.sharedFeedForward
+            try check(file, prefix + "ffn_gate_shexp.weight", rows: shared, columns: d)
+            try check(file, prefix + "ffn_up_shexp.weight", rows: shared, columns: d)
+            try check(file, prefix + "ffn_down_shexp.weight", rows: d, columns: shared)
         }
     }
 
@@ -561,6 +607,8 @@ extension GGUFModelConfig {
             "shortconv.conv.weight", "shortconv.in_proj.weight", "shortconv.out_proj.weight",
             "attn_gate.weight", "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a", "ssm_beta.weight", "ssm_alpha.weight",
             "ssm_norm.weight", "ssm_out.weight",
+            "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+            "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight",
         ]
         for layer in 0..<layerCount {
             for suffix in perLayer where file.has("blk.\(layer).\(suffix)") { names.append("blk.\(layer).\(suffix)") }

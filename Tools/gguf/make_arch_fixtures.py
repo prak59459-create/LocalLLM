@@ -76,9 +76,19 @@ SPECS = {
     "cohere2": dict(norm="layer", ffn_norm=False, layers=4, meta={"logit_scale": 0.5, "attention.sliding_window": 5}),
     "chatglm": dict(qkv="fused", qkv_bias=True, ffn="fused", rope_dims=4, output=True),
     "glm4": dict(qkv_bias=True, ffn="fused", post_norms=True, rope_dims=4),
+    # 専門家の混合（MoE）: 専門家 4 つから 2 つ（shared: 共通の専門家、shared_gate: そのゲート）
+    "qwen3moe": dict(qk_norm="head", moe=dict(experts=4, used=2, ff=16)),
+    "qwen2moe": dict(qkv_bias=True, output=True, moe=dict(experts=4, used=2, ff=16, shared=24, shared_gate=True)),
+    "olmoe": dict(qk_norm="full", kv_heads=HEADS, output=True, moe=dict(experts=4, used=2, ff=16)),
+    "granitemoe": dict(meta={"logit_scale": 4.0, "residual_scale": 0.5, "embedding_scale": 3.0, "attention.scale": 0.3},
+                       moe=dict(experts=4, used=2, ff=16, shared=24)),
     "llama-yarn": dict(arch="llama", rope_scaling=("yarn", 4.0, 16)),
     "llama-linear": dict(arch="llama", rope_scaling=("linear", 2.0, None)),
 }
+
+
+# 専門家の FFN の大きさが feed_forward_length のもの
+DENSE_SIZED_EXPERTS = ("granitemoe", "olmoe")
 
 
 def build(name, spec, path, seed):
@@ -136,6 +146,14 @@ def build(name, spec, path, seed):
         if original:
             w.add_uint32(f"{arch}.rope.scaling.original_context_length", original)
     w.add_file_type(0)
+    moe = spec.get("moe")
+    if moe:
+        w.add_uint32(f"{arch}.expert_count", moe["experts"])
+        w.add_uint32(f"{arch}.expert_used_count", moe["used"])
+        if arch not in DENSE_SIZED_EXPERTS:
+            w.add_uint32(f"{arch}.expert_feed_forward_length", moe["ff"])
+        if moe.get("shared"):
+            w.add_uint32(f"{arch}.expert_shared_feed_forward_length", moe["shared"])
     for key, value in spec["meta"].items():
         full = f"{arch}.{key}"
         if isinstance(value, bool):
@@ -202,6 +220,20 @@ def build(name, spec, path, seed):
             w.add_tensor(p + spec["ffn_norm_name"] + ".weight", norm(DIM))
             if spec["norm_bias"]:
                 w.add_tensor(p + spec["ffn_norm_name"] + ".bias", bias(DIM))
+        if moe:
+            e, f = moe["experts"], (ff if arch in DENSE_SIZED_EXPERTS else moe["ff"])
+            w.add_tensor(p + "ffn_gate_inp.weight", mat(e, DIM))
+            w.add_tensor(p + "ffn_gate_exps.weight", np.stack([mat(f, DIM) for _ in range(e)]))
+            w.add_tensor(p + "ffn_up_exps.weight", np.stack([mat(f, DIM) for _ in range(e)]))
+            w.add_tensor(p + "ffn_down_exps.weight", np.stack([mat(DIM, f) for _ in range(e)]))
+            if moe.get("shared"):
+                sf = moe["shared"]
+                w.add_tensor(p + "ffn_gate_shexp.weight", mat(sf, DIM))
+                w.add_tensor(p + "ffn_up_shexp.weight", mat(sf, DIM))
+                w.add_tensor(p + "ffn_down_shexp.weight", mat(DIM, sf))
+                if moe.get("shared_gate"):
+                    w.add_tensor(p + "ffn_gate_inp_shexp.weight", (0.5 * rng.standard_normal(DIM)).astype(np.float32))
+            continue
         if spec["ffn"] == "gated":
             w.add_tensor(p + "ffn_gate.weight", mat(ff, DIM))
             w.add_tensor(p + "ffn_up.weight", mat(ff, DIM))

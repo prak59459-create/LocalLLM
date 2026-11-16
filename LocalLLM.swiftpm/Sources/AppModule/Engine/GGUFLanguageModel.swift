@@ -6,6 +6,8 @@ struct GGUFModelFiles: Sendable {
     var store: URL
     /// KV キャッシュを用意するトークン数
     var context: Int
+    /// 重みのメモリへの置き方
+    var memory = GGUFMemoryOptions()
 }
 
 /// 途中で止めるための旗（計算は専用のスレッドで動くので、Task の取り消しを自分で伝える）
@@ -53,7 +55,11 @@ final class GGUFLanguageModel: LanguageModelRunner {
     }
 
     static func load(files: GGUFModelFiles, useGPU: Bool = true) async throws -> GGUFLanguageModel {
-        let made = try await InferenceQueue.run { try GGUFModelFactory.make(store: files.store, context: files.context, useGPU: useGPU) }
+        let available = DeviceMemory.availableBytes
+        let made = try await InferenceQueue.run {
+            try GGUFModelFactory.make(store: files.store, context: files.context, useGPU: useGPU, memory: files.memory,
+                                      availableBytes: available)
+        }
         return GGUFLanguageModel(model: made.model, isMetal: made.isMetal, files: files, note: made.note)
     }
 
@@ -147,7 +153,11 @@ final class GGUFLanguageModel: LanguageModelRunner {
         model.releaseCache()
         cachedTokens = []
         let files = self.files
-        let made = try await InferenceQueue.run { try GGUFModelFactory.make(store: files.store, context: files.context, useGPU: false) }
+        let available = DeviceMemory.availableBytes
+        let made = try await InferenceQueue.run {
+            try GGUFModelFactory.make(store: files.store, context: files.context, useGPU: false, memory: files.memory,
+                                      availableBytes: available)
+        }
         model = made.model
         note = L("GPU が使えなくなったので CPU で計算中", "GPU became unavailable; computing on the CPU")
     }

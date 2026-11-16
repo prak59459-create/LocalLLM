@@ -46,6 +46,28 @@ final class GGUFModel: GGUFEvaluator {
     private let gateBuffer = GGUFBuffer(), upBuffer = GGUFBuffer(), scratch = GGUFBuffer()
     private let scores = GGUFBuffer(), perLayerInputs = GGUFBuffer(), perLayerTokens = GGUFBuffer(), perLayerWork = GGUFBuffer()
     private let angles = GGUFBuffer()
+    private let routerBuffer = GGUFBuffer(), gathered = GGUFBuffer(), expertOut = GGUFBuffer()
+
+    /// 1 トークンで使う専門家の数を、モデルの既定から変える（MoE だけ。nil なら既定）。
+    /// 少なくすると速く・メモリの読み込みも減るが、答えの質は下がる
+    var expertsUsedOverride: Int?
+    /// 専門家ごとの使われた回数（メモリの置き方の判断に使う）
+    private(set) var expertUse: [[Int]] = []
+    /// 専門家の重みを使い終わるたびに呼ぶ（層, 専門家）。使う分だけメモリに置く設定で、ページを手放すのに使う
+    var onExpertFinished: ((Int, Int) -> Void)?
+    /// 層の計算が終わるたびに呼ぶ（層）。普通のモデルで、使う分だけメモリに置く設定のときに使う
+    var onLayerFinished: ((Int) -> Void)?
+    /// メモリへの置き方の管理（持っておく）
+    private var residency: GGUFResidency?
+
+    /// メモリの置き方の設定をつなぐ
+    func attach(_ residency: GGUFResidency, options: GGUFMemoryOptions) {
+        self.residency = residency
+        expertsUsedOverride = options.expertsUsed > 0 ? options.expertsUsed : nil
+        guard options.residency == .activeOnly else { return }
+        onExpertFinished = { [unowned residency] layer, expert in residency.expertFinished(layer: layer, expert: expert) }
+        onLayerFinished = { [unowned residency] layer in residency.layerFinished(layer) }
+    }
     private let fullCos = GGUFBuffer(), fullSin = GGUFBuffer(), slidingCos = GGUFBuffer(), slidingSin = GGUFBuffer()
 
     /// 1 回にまとめて計算するトークン数の上限
@@ -69,6 +91,7 @@ final class GGUFModel: GGUFEvaluator {
         fullRope = GGUFRope.table(config: config, sliding: false, factors: globals.ropeFactors)
         slidingRope = GGUFRope.table(config: config, sliding: true, factors: globals.ropeFactors)
         deltaLayers = shapes.map { shape in config.deltaNet.flatMap { shape.deltaNet ? GGUFDeltaNetLayer(sizes: $0) : nil } }
+        if let moe = config.moe { expertUse = shapes.map { $0.moe ? [Int](repeating: 0, count: moe.expertCount) : [] } }
         allocateCache()
     }
 
@@ -214,6 +237,7 @@ final class GGUFModel: GGUFEvaluator {
         prepareRotations(start: start, count: n)
         for index in layers.indices {
             runLayer(index, x: x, start: start, count: n, perLayerInputs: inputs)
+            onLayerFinished?(index)
         }
         computed = start + n
         if config.hasRecurrentState { history.append(contentsOf: tokens) }
@@ -504,6 +528,10 @@ final class GGUFModel: GGUFEvaluator {
 
     private func feedForward(_ index: Int, input: In, count n: Int, into out: Out) {
         let layer = layers[index]
+        if let moe = layer.moe, let sizes = config.moe {
+            mixtureOfExperts(index, weights: moe, sizes: sizes, input: input, count: n, into: out)
+            return
+        }
         let ff = shapes[index].feedForwardSize
         let work = scratch.reserve(n * ff)
         let up = upBuffer.reserve(n * ff)
@@ -517,6 +545,75 @@ final class GGUFModel: GGUFEvaluator {
             GGUFKernels.activate(config.activation, up, count: n * ff, scratch: work)
             linear(layer.down, bias: layer.downBias, input: up, count: n, output: out)
         }
+    }
+
+    // MARK: - 専門家の混合（MoE）
+
+    /// 振り分けの softmax から上位 k 個の専門家を選び、その専門家の FFN の出力を重み付きで足す（llama.cpp の build_moe_ffn）。
+    /// 専門家ごとに、その専門家を選んだトークンをまとめて計算する
+    private func mixtureOfExperts(_ index: Int, weights moe: GGUFMoEWeights, sizes: GGUFModelConfig.MoE,
+                                  input: In, count n: Int, into out: Out) {
+        let d = config.embeddingSize, ff = shapes[index].feedForwardSize, experts = sizes.expertCount
+        let used = max(1, min(experts, expertsUsedOverride ?? sizes.expertsUsed))
+        let router = routerBuffer.reserve(n * experts)
+        linear(moe.router, bias: nil, input: input, count: n, output: router)
+        // トークンごとに選んだ専門家と重み
+        var chosen = [[(expert: Int, weight: Float)]](repeating: [], count: n)
+        for token in 0..<n {
+            let row = router + token * experts
+            GGUFKernels.softmax(row, count: experts)
+            var top = (0..<experts).map { ($0, row[$0]) }.sorted { $0.1 > $1.1 }.prefix(used).map { (expert: $0.0, weight: $0.1) }
+            if sizes.normalizeWeights {
+                let sum = max(top.reduce(0) { $0 + $1.weight }, 6.103515625e-5)
+                top = top.map { (expert: $0.expert, weight: $0.weight / sum) }
+            }
+            if sizes.weightScale != 0 && sizes.weightScale != 1 {
+                top = top.map { (expert: $0.expert, weight: $0.weight * sizes.weightScale) }
+            }
+            chosen[token] = top
+        }
+        // 専門家ごとに、選んだトークンを集める
+        var members = [[(token: Int, weight: Float)]](repeating: [], count: experts)
+        for (token, list) in chosen.enumerated() {
+            for item in list { members[item.expert].append((token, item.weight)) }
+        }
+        MiniVector.fillZero(out, n * d)
+        for expert in 0..<experts where !members[expert].isEmpty {
+            let group = members[expert], m = group.count
+            let rows = gathered.reserve(m * d)
+            for (slot, member) in group.enumerated() { (rows + slot * d).update(from: input + member.token * d, count: d) }
+            let (gate, up, down) = moe.expert(expert, feedForward: ff, embedding: d)
+            let result = expertOut.reserve(m * d)
+            gatedFeedForward(gate: gate, up: up, down: down, input: rows, count: m, size: ff, into: result)
+            for (slot, member) in group.enumerated() {
+                MiniVector.scaleAdd(result + slot * d, member.weight, out + member.token * d, out + member.token * d, d)
+            }
+            if index < expertUse.count, expert < expertUse[index].count { expertUse[index][expert] += m }
+            onExpertFinished?(index, expert)
+        }
+        // 共通の専門家（いつも使う）
+        guard let sharedGate = moe.sharedGate, let sharedUp = moe.sharedUp, let sharedDown = moe.sharedDown else { return }
+        let size = sharedUp.rows
+        let result = expertOut.reserve(n * d)
+        gatedFeedForward(gate: sharedGate, up: sharedUp, down: sharedDown, input: input, count: n, size: size, into: result)
+        for token in 0..<n {
+            var scale: Float = 1
+            if let gateWeights = moe.sharedRouter {
+                scale = 1 / (1 + Foundation.exp(-MiniMath.dot(gateWeights, input + token * d, count: d)))
+            }
+            MiniVector.scaleAdd(result + token * d, scale, out + token * d, out + token * d, d)
+        }
+    }
+
+    /// down(act(gate · x) × (up · x))
+    private func gatedFeedForward(gate: GGUFMatrix, up: GGUFMatrix, down: GGUFMatrix, input: In, count n: Int, size ff: Int,
+                                  into out: Out) {
+        let work = scratch.reserve(n * ff)
+        let upRows = upBuffer.reserve(n * ff), gateRows = gateBuffer.reserve(n * ff)
+        linear(up, bias: nil, input: input, count: n, output: upRows)
+        linear(gate, bias: nil, input: input, count: n, output: gateRows)
+        GGUFKernels.gatedActivation(.silu, gate: gateRows, up: upRows, count: n * ff, scratch: work)
+        linear(down, bias: nil, input: gateRows, count: n, output: out)
     }
 
     /// 層ごとの入力を足す（Gemma 4）

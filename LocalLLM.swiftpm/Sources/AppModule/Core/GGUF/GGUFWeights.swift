@@ -64,6 +64,8 @@ struct GGUFLayerWeights {
     var convolutionKernel: UnsafePointer<Float>?
     /// Gated DeltaNet の層（Qwen3.5）。query は q・k・v の射影、output は出力の射影、convolutionKernel は入力の畳み込み
     var delta: GGUFDeltaNetWeights?
+    /// 専門家の混合（MoE）の FFN（このとき up・down は使わない）
+    var moe: GGUFMoEWeights?
 
     static func load(_ index: Int, store: GGUFWeightStore, config: GGUFModelConfig) throws -> GGUFLayerWeights {
         let prefix = "blk.\(index)."
@@ -99,10 +101,14 @@ struct GGUFLayerWeights {
             output: try store.matrix(prefix + "attn_output.weight"),
             // ERNIE 4.5 は、注意の出力のバイアスを llama.cpp も使わない
             outputBias: config.family == .ernie45 ? nil : store.vector(prefix + "attn_output.bias"),
-            up: try store.matrix(prefix + "ffn_up.weight"),
-            down: try store.matrix(prefix + "ffn_down.weight"))
+            up: try store.matrix(prefix + (shape.moe ? "ffn_up_exps.weight" : "ffn_up.weight")),
+            down: try store.matrix(prefix + (shape.moe ? "ffn_down_exps.weight" : "ffn_down.weight")))
         weights.loadNorms(prefix: prefix, store: store, config: config, shape: shape)
-        try weights.loadFeedForward(prefix: prefix, store: store, config: config, size: ff)
+        if shape.moe {
+            weights.moe = try GGUFMoEWeights(prefix: prefix, store: store)
+        } else {
+            try weights.loadFeedForward(prefix: prefix, store: store, config: config, size: ff)
+        }
         if config.perLayerInputSize > 0 {
             weights.inputGate = try store.matrix(prefix + "inp_gate.weight")
             weights.projection = try store.matrix(prefix + "proj.weight")
@@ -193,6 +199,41 @@ struct GGUFLayerWeights {
             gateBias = store.vector(prefix + "ffn_gate.bias")
             upBias = store.vector(prefix + "ffn_up.bias")
         }
+    }
+}
+
+/// 専門家の混合（MoE）の重み。専門家 e の重みは、まとめた行列の e 番目の行の束
+struct GGUFMoEWeights {
+    /// 振り分け [専門家][d]
+    var router: GGUFMatrix
+    /// [専門家 × ff][d]
+    var gate: GGUFMatrix
+    var up: GGUFMatrix
+    /// [専門家 × d][ff]
+    var down: GGUFMatrix
+    /// 共通の専門家（いつも使う）
+    var sharedGate: GGUFMatrix?
+    var sharedUp: GGUFMatrix?
+    var sharedDown: GGUFMatrix?
+    /// 共通の専門家のゲート（sigmoid(w · x)。Qwen2-MoE）
+    var sharedRouter: UnsafePointer<Float>?
+
+    init(prefix: String, store: GGUFWeightStore) throws {
+        router = try store.matrix(prefix + "ffn_gate_inp.weight")
+        gate = try store.matrix(prefix + "ffn_gate_exps.weight")
+        up = try store.matrix(prefix + "ffn_up_exps.weight")
+        down = try store.matrix(prefix + "ffn_down_exps.weight")
+        if store.has(prefix + "ffn_up_shexp.weight") {
+            sharedGate = try store.matrix(prefix + "ffn_gate_shexp.weight")
+            sharedUp = try store.matrix(prefix + "ffn_up_shexp.weight")
+            sharedDown = try store.matrix(prefix + "ffn_down_shexp.weight")
+        }
+        sharedRouter = store.vector(prefix + "ffn_gate_inp_shexp.weight")
+    }
+
+    /// 専門家 e の重み
+    func expert(_ e: Int, feedForward ff: Int, embedding d: Int) -> (gate: GGUFMatrix, up: GGUFMatrix, down: GGUFMatrix) {
+        (gate.slice((e * ff)..<((e + 1) * ff)), up.slice((e * ff)..<((e + 1) * ff)), down.slice((e * d)..<((e + 1) * d)))
     }
 }
 

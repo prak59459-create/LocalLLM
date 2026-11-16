@@ -16,6 +16,7 @@ struct SettingsView: View {
                 SystemPromptSection()
                 ThinkingSettingsSection()
                 ExecutionSettingsSection()
+                GGUFMemorySettingsLink()
                 ConnectorsLinkSection()
                 DisplaySettingsSection()
                 TokenSettingsSection()

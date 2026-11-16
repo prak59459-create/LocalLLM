@@ -18,7 +18,7 @@ Swift Playgrounds（iPad）でそのまま開いて実行できます。
 - **アプリの更新**: このアプリの .swiftpm と GitHub を 1 ファイルずつ比べ、変わったファイルだけをダウンロードして書き換え、版を上げる（差分の確認・取り消し付き）
 - **コンテキスト長の拡張**: ダウンロードしたモデルの最大コンテキスト長を、端末の中で最大 128k まで広げる
 - **GGUF**: llama.cpp 形式（Ollama・LM Studio で使われている形式）のモデルを、端末の中で変換して GPU（Metal）で動かす。
-  Gemma 4・Qwen・Llama・Phi・Mistral・LFM2 など 40 以上の構造に対応
+  Gemma 4・Qwen・Qwen3.5・Llama・Phi・Mistral・LFM2・MoE（Qwen3-MoE・Granite-MoE など）など 45 以上の構造に対応
 - **画像・動画の生成**: Core ML 版の Stable Diffusion で、文章から画像や短い動画（MP4）を作る
 - **音声**: 音声入力、返答の読み上げ、声だけの会話、音声ファイルの文字起こし
 - 外部ライブラリなし（トークナイザ、チャットテンプレート、ダウンローダまで純 Swift で実装）
@@ -153,16 +153,25 @@ GPU が使えないときは CPU（Accelerate）で行います。
   gemma・gemma2・gemma3・**gemma4**（E2B / E4B など。層ごとの入力・KV の共有を含む）・phi2・phi3・
   granite・minicpm・smollm3・internlm2・xverse・baichuan（7B）・ernie4_5・exaone・exaone4・olmo・olmo2・seed_oss・
   plamo・openelm・arcee・maincoder・gpt2・starcoder・starcoder2・stablelm・gptneox・falcon・codeshell・orion・
-  nemotron・jais2・command-r・cohere2・chatglm・glm4・**lfm2**（注意と短い畳み込みを組み合わせた Liquid AI の LFM2）。YaRN で文脈を伸ばしたモデルにも対応しています。
-  どの構造も、小さなテスト用モデルで llama.cpp と同じ計算結果になることを確かめています。
+  nemotron・jais2・command-r・cohere2・chatglm・glm4・**lfm2**（注意と短い畳み込みを組み合わせた Liquid AI の LFM2）・
+  **qwen35**（Gated DeltaNet と注意を組み合わせた Qwen3.5。CPU）・
+  **MoE（専門家の混合）**: qwen3moe・qwen2moe・olmoe・granitemoe（CPU）。YaRN で文脈を伸ばしたモデルにも対応しています。
+  どの構造も、小さなテスト用モデルで llama.cpp と同じ計算結果になることを確かめています
+  （Qwen3.5 0.8B と Granite 3.1 1B-A400M は、本物のモデルで llama.cpp と同じ続きを生成することも確かめています）。
+- **メモリの置き方（上級）**: 設定 →「GGUF のメモリ（上級）」で選べます。
+  - 自動: OS に任せる（これまでどおり）
+  - 先に全部読む: 読み込みのときに重みを全部読んでおく（最初の返事が速い。RAM を多く使う）
+  - 使う分だけ置く: 使い終わった重みをすぐ手放す。MoE は層ごとに最近使った専門家だけ、
+    普通のモデルは先頭から決めた数の層だけを RAM に残し、ほかは毎回ファイルから読む（RAM より大きなモデルも動くが遅い。CPU で計算）
+  - MoE は「1 トークンで使う専門家の数」も変えられます（減らすと速いが、答えの質は下がる）
 - **対応している量子化**: F32・F16・BF16、Q4_0・Q4_1・Q5_0・Q5_1・Q8_0、Q2_K〜Q6_K、IQ2_XXS・IQ2_XS・IQ2_S・IQ3_XXS・IQ3_S・IQ4_NL・IQ4_XS。
 - **コンテキスト長**: 「コンテキスト長…」から、ファイルを書き換えずに変えられます（長くするほど KV キャッシュのメモリが増えます）。
 - **速さ**: GPU で計算します。目安として、CI の Mac（仮想の GPU）で、Qwen2.5 1.5B が 1 秒に約 15 トークン
   （CPU だけのときは約 7）、SmolLM2 135M が約 55 トークンでした。A16 の iPad の GPU は CI の Mac と同じくらいかそれ以上です。
   読み込んだ最初の 1 回だけ、GPU の計算が CPU と同じ結果になるかを数トークンで確かめます（合わなければ CPU で計算します）。
   設定の「計算ユニット」を「CPU のみ」にすると、GGUF も CPU で計算します。
-- **まだ対応していないもの**: 画像も扱うモデルの画像部分（mmproj）、何個かに分かれた GGUF（split）、MoE のモデル、
-  Mamba・RWKV などの状態を持つ構造（LFM2 を除く）、Gemma 3n、上に無い構造。
+- **まだ対応していないもの**: 画像も扱うモデルの画像部分（mmproj）、何個かに分かれた GGUF（split）、上に無い MoE（DeepSeek・Mixtral など）、
+  Mamba・RWKV などの状態を持つ構造（LFM2・Qwen3.5 を除く）、Gemma 3n、上に無い構造。
 
 ### 画像生成
 

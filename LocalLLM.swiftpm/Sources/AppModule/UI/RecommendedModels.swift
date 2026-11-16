@@ -23,6 +23,7 @@ struct RecommendedModel: Identifiable, Hashable {
         case japanese
         case coding
         case reasoning
+        case mixture
         case tiny
         case gguf
 
@@ -34,6 +35,7 @@ struct RecommendedModel: Identifiable, Hashable {
             case .japanese: return L("日本語が得意", "Good at Japanese")
             case .coding: return L("コーディング専用", "Coding")
             case .reasoning: return L("賢さ・推論専門", "Reasoning")
+            case .mixture: return L("MoE（専門家の混合）", "Mixture of experts (MoE)")
             case .tiny: return L("とても軽い（動作確認・古い iPad）", "Very light (testing · older iPads)")
             case .gguf: return L("GGUF（llama.cpp 形式）", "GGUF (llama.cpp format)")
             }
@@ -48,6 +50,8 @@ struct RecommendedModel: Identifiable, Hashable {
                                    "Good at writing and fixing code. Use them for the Coding Workspace agent.")
             case .reasoning: return L("考えてから答える（<think>）。難しい質問・数学・論理に強いが、答えるまで時間がかかる。",
                                       "Think before answering (<think>). Stronger at hard questions, math and logic, but slower to answer.")
+            case .mixture: return L("全体は大きいが、1 トークンで使うのは一部の専門家だけなので速い。設定 →「GGUF のメモリ（上級）」で、使う専門家だけを RAM に置けます。",
+                                    "Large overall, but each token uses only a few experts, so they are fast. Settings → GGUF memory (advanced) can keep only the experts in use in RAM.")
             case .tiny: return L("メモリの少ない iPad でも動く。賢さは控えめ。", "Run even on iPads with little memory. Not very smart.")
             case .gguf: return L("Ollama や LM Studio で使われている形式。ダウンロード後にこのアプリ用に変換して、GPU（Metal）で動かします。検索で「GGUF」を選ぶと、ほかのモデルも探せます。",
                                  "The format used by Ollama and LM Studio. Converted for this app after download and run on the GPU (Metal). Choose \"GGUF\" in Search to find more.")
@@ -60,6 +64,7 @@ struct RecommendedModel: Identifiable, Hashable {
             case .japanese: return "character.ja"
             case .coding: return "chevron.left.forwardslash.chevron.right"
             case .reasoning: return "brain.head.profile"
+            case .mixture: return "square.grid.3x3.fill"
             case .tiny: return "hare.fill"
             case .gguf: return "shippingbox.fill"
             }

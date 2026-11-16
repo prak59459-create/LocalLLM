@@ -18,7 +18,7 @@ extension GGUFModelConfig {
     private static func rules(_ family: Family, file: GGUFFile) -> Rules {
         var rules = Rules()
         switch family {
-        case .llama, .mistral3, .internlm2, .xverse, .baichuan, .ernie45, .granite, .minicpm, .smollm3, .maincoder, .chatglm:
+        case .llama, .mistral3, .internlm2, .xverse, .baichuan, .ernie45, .granite, .granitemoe, .minicpm, .smollm3, .maincoder, .chatglm:
             rules.splitPairs = false
         case .glm4:
             // 画像も扱う版（GLM-4V）は M-RoPE（文章だけなら NEOX と同じ）
@@ -34,7 +34,7 @@ extension GGUFModelConfig {
         case .olmo:
             rules.splitPairs = false
             rules.norm = .layer
-        case .qwen, .qwen2, .qwen2vl, .qwen3, .qwen3vl, .phi3, .exaone, .seedOSS, .openelm, .lfm2:
+        case .qwen, .qwen2, .qwen2vl, .qwen3, .qwen3vl, .phi3, .exaone, .seedOSS, .openelm, .lfm2, .qwen35, .qwen2moe, .qwen3moe, .olmoe:
             break
         case .plamo:
             rules.parallel = true
@@ -79,16 +79,7 @@ extension GGUFModelConfig {
     /// メタデータと重みの一覧から構造を決める。対応していない構造なら GGUFError を投げる。
     init(file: GGUFFile) throws {
         let arch = file.architecture
-        guard let family = Self.supportedArchitectures[arch] else {
-            throw GGUFError.unsupportedArchitecture(arch.isEmpty ? "?" : arch)
-        }
-        guard let embedding = file.tensor("token_embd.weight"), embedding.dimensions.count == 2 else {
-            throw GGUFError.missingTensor("token_embd.weight")
-        }
-        // 混合エキスパート（MoE）は扱わない
-        if file.has("blk.0.ffn_gate_inp.weight") || (file.archInt("expert_count") ?? 0) > 0 {
-            throw GGUFError.unsupportedArchitecture("\(arch) (MoE)")
-        }
+        let (family, embedding) = try Self.checkSupported(file)
         let rules = Self.rules(family, file: file)
         architecture = arch
         self.family = family
@@ -109,7 +100,11 @@ extension GGUFModelConfig {
         learnedPositions = rules.learnedPositions
         ropePairsAreSplit = rules.splitPairs
         tiedOutput = !file.has("output.weight")
-        let firstAttention = (0..<layerCount).first { file.has("blk.\($0).attn_q.weight") || file.has("blk.\($0).attn_qkv.weight") } ?? 0
+        // DeltaNet の層（Qwen3.5）も attn_qkv を持つので、注意の層だけを見る
+        let deltaLayers = Self.deltaNetLayers(file, family: family, layers: layerCount)
+        let firstAttention = (0..<layerCount).first {
+            !deltaLayers[$0] && (file.has("blk.\($0).attn_q.weight") || file.has("blk.\($0).attn_qkv.weight"))
+        } ?? 0
         hasFusedQKV = file.has("blk.\(firstAttention).attn_qkv.weight")
         hasFusedGateUp = rules.feedForward == .gated && !file.has("blk.0.ffn_gate.weight")
 
@@ -118,7 +113,10 @@ extension GGUFModelConfig {
 
         // 層ごとの形
         let read = try Self.readShapes(file, family: family, rules: rules, layers: layerCount, embeddingSize: embeddingSize,
-                                       slidingWindow: slidingWindow, slidingLayers: slidingLayers)
+                                       slidingWindow: slidingWindow, slidingLayers: slidingLayers, deltaLayers: deltaLayers)
+        deltaNet = try Self.deltaNetSizes(file, family: family)
+        moe = try Self.moeSizes(file, family: family)
+        attentionOutputGate = family == .qwen35
         let shapes = read.shapes, fullHead = read.fullHead, slidingHead = read.slidingHead
         layerShapes = shapes
         headCount = shapes.map(\.headCount).max() ?? 1
@@ -127,17 +125,15 @@ extension GGUFModelConfig {
         feedForwardSize = shapes.map(\.feedForwardSize).max() ?? 0
 
         // RoPE
-        ropeDimensions = file.archInt("rope.dimension_count") ?? fullHead
-        slidingRopeDimensions = file.archInt("rope.dimension_count_swa") ?? min(ropeDimensions, slidingHead)
-        guard ropeDimensions % 2 == 0, ropeDimensions <= fullHead, slidingRopeDimensions % 2 == 0,
-              slidingRopeDimensions <= slidingHead else { throw GGUFError.invalid("rope dimensions") }
-        ropeBase = Float(file.archDouble("rope.freq_base") ?? 10000)
-        slidingRopeBase = Float(file.archDouble("rope.freq_base_swa") ?? (family == .gemma3 ? 10000 : Double(ropeBase)))
+        let rope = try Self.rope(file, family: family, fullHead: fullHead, slidingHead: slidingHead)
+        ropeDimensions = rope.dimensions
+        slidingRopeDimensions = rope.slidingDimensions
+        ropeBase = rope.base
+        slidingRopeBase = rope.slidingBase
         ropeFactorsOnSlidingLayers = family != .gemma4
-        (ropeScale, yarn) = Self.ropeScaling(file)
-        // llama.cpp: 直近だけを見る層は、系列によって全体と同じ倍率か、伸ばさない（1）
-        let scalesSliding: Set<Family> = [.gemma2, .cohere2, .exaone4]
-        slidingRopeScale = scalesSliding.contains(family) ? ropeScale : 1
+        ropeScale = rope.scale
+        yarn = rope.yarn
+        slidingRopeScale = rope.slidingScale
         contextLength = try Self.usableContext(file, family: family, trained: contextLength, yarn: yarn,
                                                learnedPositions: rules.learnedPositions)
 
@@ -168,9 +164,40 @@ extension GGUFModelConfig {
         try validateTensors(file)
     }
 
+    /// 対応している構造か（系列と、埋め込みの表）
+    private static func checkSupported(_ file: GGUFFile) throws -> (Family, GGUFTensorInfo) {
+        let arch = file.architecture
+        guard let family = supportedArchitectures[arch] else {
+            throw GGUFError.unsupportedArchitecture(arch.isEmpty ? "?" : arch)
+        }
+        guard let embedding = file.tensor("token_embd.weight"), embedding.dimensions.count == 2 else {
+            throw GGUFError.missingTensor("token_embd.weight")
+        }
+        // 混合エキスパート（MoE）は、対応している系列だけ
+        if !moeFamilies.contains(family), file.has("blk.0.ffn_gate_inp.weight") || (file.archInt("expert_count") ?? 0) > 0 {
+            throw GGUFError.unsupportedArchitecture("\(arch) (MoE)")
+        }
+        return (family, embedding)
+    }
+
+    /// RoPE の次元・底・倍率
+    private static func rope(_ file: GGUFFile, family: Family, fullHead: Int, slidingHead: Int) throws
+        -> (dimensions: Int, slidingDimensions: Int, base: Float, slidingBase: Float, scale: Float, yarn: YaRN?, slidingScale: Float) {
+        let dimensions = file.archInt("rope.dimension_count") ?? fullHead
+        let slidingDimensions = file.archInt("rope.dimension_count_swa") ?? min(dimensions, slidingHead)
+        guard dimensions % 2 == 0, dimensions <= fullHead, slidingDimensions % 2 == 0,
+              slidingDimensions <= slidingHead else { throw GGUFError.invalid("rope dimensions") }
+        let base = Float(file.archDouble("rope.freq_base") ?? 10000)
+        let slidingBase = Float(file.archDouble("rope.freq_base_swa") ?? (family == .gemma3 ? 10000 : Double(base)))
+        let (scale, yarn) = ropeScaling(file)
+        // llama.cpp: 直近だけを見る層は、系列によって全体と同じ倍率か、伸ばさない（1）
+        let scalesSliding: Set<Family> = [.gemma2, .cohere2, .exaone4]
+        return (dimensions, slidingDimensions, base, slidingBase, scale, yarn, scalesSliding.contains(family) ? scale : 1)
+    }
+
     /// 層ごとの形（ヘッドの数・大きさ・FFN・RoPE を使うか・KV キャッシュを持つ層）
     private static func readShapes(_ file: GGUFFile, family: Family, rules: Rules, layers: Int, embeddingSize: Int,
-                                   slidingWindow: Int, slidingLayers: [Bool]) throws
+                                   slidingWindow: Int, slidingLayers: [Bool], deltaLayers: [Bool]) throws
         -> (shapes: [Layer], fullHead: Int, slidingHead: Int) {
         let arch = file.architecture
         let heads = try perLayer(file, "attention.head_count", layers: layers)
@@ -192,17 +219,22 @@ extension GGUFModelConfig {
             let sliding = slidingWindow > 0 && slidingLayers[index] && !convolution
             let rope = rules.rope && usesRope(family: family, file: file, layer: index, sliding: sliding, hasSliding: slidingWindow > 0)
             let kvLayer = index >= ownCache ? ownCache - (sliding ? 2 : 1) : index
-            let ff = try feedForwardSize(file, layer: index)
+            // MoE の層は、専門家 1 つの大きさ
+            let moe = file.has("blk.\(index).ffn_gate_inp.weight")
+            let ff = moe ? (file.tensor("blk.\(index).ffn_up_exps.weight")?.dimensions.dropFirst().first ?? 0)
+                         : try feedForwardSize(file, layer: index)
+            let delta = deltaLayers[index]
             shapes.append(Layer(headCount: heads[index], kvHeadCount: convolution ? heads[index] : kvHeads[index],
-                                headSize: sliding ? slidingHead : fullHead, feedForwardSize: ff, usesRope: rope && !convolution,
-                                sliding: sliding, kvLayer: kvLayer, convolution: convolution))
+                                headSize: sliding ? slidingHead : fullHead, feedForwardSize: ff,
+                                usesRope: rope && !convolution && !delta, sliding: sliding, kvLayer: kvLayer,
+                                convolution: convolution, deltaNet: delta, moe: moe))
         }
         try validateShapes(shapes)
         return (shapes, fullHead, slidingHead)
     }
 
     private static func validateShapes(_ shapes: [Layer]) throws {
-        for (index, shape) in shapes.enumerated() where !shape.convolution {
+        for (index, shape) in shapes.enumerated() where !shape.isRecurrent {
             guard shape.headCount > 0, shape.kvHeadCount > 0, shape.headCount % shape.kvHeadCount == 0,
                   shape.kvLayer >= 0, shape.kvLayer <= index else { throw GGUFError.invalid("head counts") }
             let source = shapes[shape.kvLayer]
@@ -210,6 +242,55 @@ extension GGUFModelConfig {
                 throw GGUFError.invalid("shared KV layer \(index)")
             }
         }
+    }
+
+    /// 専門家の混合（MoE）の大きさと選び方（llama.cpp の各系列の build_moe_ffn の引数と同じ）
+    private static func moeSizes(_ file: GGUFFile, family: Family) throws -> MoE? {
+        guard moeFamilies.contains(family), let up = file.tensor("blk.0.ffn_up_exps.weight") ?? firstExperts(file) else { return nil }
+        let count = try require(file, "expert_count")
+        let used = try require(file, "expert_used_count")
+        guard count > 0, used > 0, used <= count, up.dimensions.count == 3 else {
+            throw GGUFError.unsupportedArchitecture("\(file.architecture) (experts)")
+        }
+        let shared = (0..<(file.archInt("block_count") ?? 1)).lazy
+            .compactMap { file.tensor("blk.\($0).ffn_up_shexp.weight")?.dimensions.dropFirst().first }.first ?? 0
+        let gated = (0..<(file.archInt("block_count") ?? 1)).contains { file.has("blk.\($0).ffn_gate_inp_shexp.weight") }
+        return MoE(expertCount: count, expertsUsed: used, expertFeedForward: up.dimensions[1], sharedFeedForward: shared,
+                   sharedGated: gated, normalizeWeights: family == .qwen3moe || family == .granitemoe,
+                   weightScale: Float(file.archDouble("expert_weights_scale") ?? 0))
+    }
+
+    private static func firstExperts(_ file: GGUFFile) -> GGUFTensorInfo? {
+        file.tensors.first { $0.name.hasSuffix("ffn_up_exps.weight") }
+    }
+
+    /// 専門家の混合に対応している系列
+    static let moeFamilies: Set<Family> = [.qwen2moe, .qwen3moe, .olmoe, .granitemoe]
+
+    /// Gated DeltaNet の層（Qwen3.5: メタデータの層の並びか、full_attention_interval 層ごとに 1 層だけ注意）
+    private static func deltaNetLayers(_ file: GGUFFile, family: Family, layers: Int) -> [Bool] {
+        guard family == .qwen35 else { return [Bool](repeating: false, count: layers) }
+        if let flags = file.metadata["\(file.architecture).attention.recurrent_layers"]?.intArray, flags.count >= layers {
+            return (0..<layers).map { flags[$0] != 0 }
+        }
+        let interval = max(1, file.archInt("full_attention_interval") ?? 4)
+        return (0..<layers).map { ($0 + 1) % interval != 0 }
+    }
+
+    /// Gated DeltaNet の大きさ（ssm.state_size = キーのヘッドの大きさ、group_count = キーのヘッドの数、
+    /// time_step_rank = バリューのヘッドの数、inner_size = バリュー全体の大きさ）
+    private static func deltaNetSizes(_ file: GGUFFile, family: Family) throws -> DeltaNet? {
+        guard family == .qwen35 else { return nil }
+        let keyHeadSize = try require(file, "ssm.state_size")
+        let keyHeads = try require(file, "ssm.group_count")
+        let valueHeads = try require(file, "ssm.time_step_rank")
+        let inner = try require(file, "ssm.inner_size")
+        guard keyHeads > 0, valueHeads > 0, inner % valueHeads == 0, valueHeads % keyHeads == 0,
+              inner / valueHeads == keyHeadSize else {
+            throw GGUFError.unsupportedArchitecture("\(file.architecture) (DeltaNet sizes)")
+        }
+        return DeltaNet(convolutionLength: try require(file, "ssm.conv_kernel"), keyHeads: keyHeads, keyHeadSize: keyHeadSize,
+                        valueHeads: valueHeads, valueHeadSize: inner / valueHeads)
     }
 
     /// 使える文脈の長さ（伸ばす仕組みのうち使わないものがあれば、その元の長さまで）
@@ -352,7 +433,7 @@ extension GGUFModelConfig {
         case .commandR, .cohere2:
             let scale = Float(file.archDouble("logit_scale") ?? 0)
             logitScale = scale == 0 ? 1 : scale
-        case .granite:
+        case .granite, .granitemoe:
             let logit = Float(file.archDouble("logit_scale") ?? 1)
             logitScale = logit == 0 ? 1 : 1 / logit
             let residual = Float(file.archDouble("residual_scale") ?? 0)
@@ -392,6 +473,10 @@ extension GGUFModelConfig {
         let prefix = "blk.\(layer)."
         let d = embeddingSize, q = shape.querySize, kv = shape.kvSize, ff = shape.feedForwardSize
         let ownsCache = shape.kvLayer == layer
+        if shape.deltaNet, let delta = deltaNet {
+            try validateDeltaNet(file, prefix: prefix, delta: delta, feedForward: ff)
+            return
+        }
         if shape.convolution {
             try check(file, prefix + "attn_norm.weight", rows: 1, columns: d)
             try check(file, prefix + "shortconv.in_proj.weight", rows: 3 * d, columns: d)
@@ -410,7 +495,7 @@ extension GGUFModelConfig {
         if hasFusedQKV {
             try check(file, prefix + "attn_qkv.weight", rows: q + 2 * kv, columns: d)
         } else {
-            try check(file, prefix + "attn_q.weight", rows: q, columns: d)
+            try check(file, prefix + "attn_q.weight", rows: attentionOutputGate ? 2 * q : q, columns: d)
             if ownsCache {
                 try check(file, prefix + "attn_k.weight", rows: kv, columns: d)
                 // Gemma 4 は v が無ければ k を使う
@@ -418,6 +503,10 @@ extension GGUFModelConfig {
             }
         }
         try check(file, prefix + "attn_output.weight", rows: d, columns: q)
+        if shape.moe, let moe {
+            try validateExperts(file, prefix: prefix, moe: moe, feedForward: ff)
+            return
+        }
         switch feedForward {
         case .gated where hasFusedGateUp:
             try check(file, prefix + "ffn_up.weight", rows: 2 * ff, columns: d)
@@ -442,6 +531,39 @@ extension GGUFModelConfig {
             try check(file, prefix + "proj.weight", rows: d, columns: perLayerInputSize)
             try check(file, prefix + "post_norm.weight", rows: 1, columns: d)
         }
+    }
+
+    /// 専門家の重み: 振り分け [専門家][d]、gate・up [専門家 × ff][d]、down [専門家 × d][ff]、共通の専門家
+    private func validateExperts(_ file: GGUFFile, prefix: String, moe: MoE, feedForward ff: Int) throws {
+        let d = embeddingSize, count = moe.expertCount
+        try check(file, prefix + "ffn_gate_inp.weight", rows: count, columns: d)
+        try check(file, prefix + "ffn_gate_exps.weight", rows: count * ff, columns: d)
+        try check(file, prefix + "ffn_up_exps.weight", rows: count * ff, columns: d)
+        try check(file, prefix + "ffn_down_exps.weight", rows: count * d, columns: ff)
+        if moe.sharedFeedForward > 0, file.has(prefix + "ffn_up_shexp.weight") {
+            let shared = moe.sharedFeedForward
+            try check(file, prefix + "ffn_gate_shexp.weight", rows: shared, columns: d)
+            try check(file, prefix + "ffn_up_shexp.weight", rows: shared, columns: d)
+            try check(file, prefix + "ffn_down_shexp.weight", rows: d, columns: shared)
+        }
+    }
+
+    private func validateDeltaNet(_ file: GGUFFile, prefix: String, delta: DeltaNet, feedForward ff: Int) throws {
+        let d = embeddingSize
+        try check(file, prefix + "attn_norm.weight", rows: 1, columns: d)
+        try check(file, prefix + "post_attention_norm.weight", rows: 1, columns: d)
+        try check(file, prefix + "attn_qkv.weight", rows: delta.channels, columns: d)
+        try check(file, prefix + "attn_gate.weight", rows: delta.valueSize, columns: d)
+        try check(file, prefix + "ssm_conv1d.weight", rows: delta.channels, columns: delta.convolutionLength)
+        try check(file, prefix + "ssm_dt.bias", rows: 1, columns: delta.valueHeads)
+        try check(file, prefix + "ssm_a", rows: 1, columns: delta.valueHeads)
+        try check(file, prefix + "ssm_beta.weight", rows: delta.valueHeads, columns: d)
+        try check(file, prefix + "ssm_alpha.weight", rows: delta.valueHeads, columns: d)
+        try check(file, prefix + "ssm_norm.weight", rows: 1, columns: delta.valueHeadSize)
+        try check(file, prefix + "ssm_out.weight", rows: d, columns: delta.valueSize)
+        try check(file, prefix + "ffn_gate.weight", rows: ff, columns: d)
+        try check(file, prefix + "ffn_up.weight", rows: ff, columns: d)
+        try check(file, prefix + "ffn_down.weight", rows: d, columns: ff)
     }
 
     private func check(_ file: GGUFFile, _ name: String, rows: Int, columns: Int, optional: Bool = false) throws {
@@ -483,6 +605,10 @@ extension GGUFModelConfig {
             "ffn_gate.bias", "ffn_up.bias", "ffn_down.bias", "post_ffw_norm.weight",
             "inp_gate.weight", "proj.weight", "post_norm.weight", "layer_output_scale.weight",
             "shortconv.conv.weight", "shortconv.in_proj.weight", "shortconv.out_proj.weight",
+            "attn_gate.weight", "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a", "ssm_beta.weight", "ssm_alpha.weight",
+            "ssm_norm.weight", "ssm_out.weight",
+            "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+            "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight",
         ]
         for layer in 0..<layerCount {
             for suffix in perLayer where file.has("blk.\(layer).\(suffix)") { names.append("blk.\(layer).\(suffix)") }
@@ -493,7 +619,7 @@ extension GGUFModelConfig {
     /// 行列でも、Float32 のベクトルとして置く重み（正規化の重み・層ごとの倍率）
     static func isVectorTensor(_ name: String) -> Bool {
         name.hasSuffix("norm.weight") || name.hasSuffix("norm.bias") || name.hasSuffix("layer_output_scale.weight")
-            || name.hasSuffix("shortconv.conv.weight")
+            || name.hasSuffix("shortconv.conv.weight") || name.hasSuffix("ssm_conv1d.weight")
     }
 
     /// 量子化したまま置く重み（行ごとに取り出すだけで、掛け算には使わない大きな表）

@@ -165,6 +165,10 @@ final class GGUFMetalModel: GGUFEvaluator {
         guard let queue = device.makeCommandQueue() else { throw GGUFMetalError.unavailable("command queue") }
         let config = store.config
         let shapes = config.layers
+        // Gated DeltaNet の層・出力のゲートは、まだ GPU では計算しない（CPU で動かす）
+        if config.deltaNet != nil || config.attentionOutputGate { throw GGUFMetalError.unavailable("Gated DeltaNet") }
+        // 専門家の混合（MoE）も、まだ GPU では計算しない
+        if config.moe != nil { throw GGUFMetalError.unavailable("mixture of experts") }
         for shape in shapes where shape.headSize % 4 != 0 || shape.headCount % shape.kvHeadCount != 0 {
             throw GGUFMetalError.unavailable("head size \(shape.headSize)")
         }

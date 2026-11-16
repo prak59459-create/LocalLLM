@@ -79,7 +79,7 @@ final class GGUFModelTests: XCTestCase {
         "qwen", "qwen2vl", "qwen3vl", "exaone", "exaone4", "olmo", "olmo2", "seed_oss", "plamo", "openelm",
         "phi2", "gpt2", "starcoder", "starcoder2", "stablelm", "stablelm-par", "gptneox", "gptneox-seq", "falcon",
         "falcon-40b", "codeshell", "orion", "nemotron", "jais2", "command-r", "cohere2", "chatglm", "glm4",
-        "llama-yarn", "llama-linear", "gemma4", "lfm2",
+        "llama-yarn", "llama-linear", "gemma4", "lfm2", "qwen35", "qwen3moe", "qwen2moe", "olmoe", "granitemoe",
     ]
     static var allFamilies: [String] { families + moreFamilies }
 
@@ -144,6 +144,38 @@ final class GGUFModelTests: XCTestCase {
         XCTAssertEqual(failures, [])
     }
 
+    /// メモリの置き方を変えても（先に全部読む・使う分だけ置く）、結果は変わらない。専門家の数を変えると結果が変わる
+    func testMemoryOptionsKeepResults() throws {
+        for family in ["qwen3moe", "qwen2moe", "llama"] {
+            let source = GGUFFixtures.root.appendingPathComponent("tiny-\(family).gguf")
+            let store = GGUFFixtures.temporaryFile("\(family)-memory.llw")
+            defer { try? FileManager.default.removeItem(at: store) }
+            try GGUFConverter.convert(gguf: source, to: store, compact: false)
+            let expected = try reference(family)
+            let last = expected.logits[expected.tokens.count - 1]
+            let options: [GGUFMemoryOptions] = [
+                GGUFMemoryOptions(residency: .preload),
+                GGUFMemoryOptions(residency: .activeOnly, keptExperts: 1, keptLayers: 0),
+                GGUFMemoryOptions(residency: .activeOnly, keptLayers: -1),
+            ]
+            for option in options {
+                let made = try GGUFModelFactory.make(store: store, context: 64, useGPU: true, memory: option, availableBytes: 1 << 20)
+                if option.residency == .activeOnly { XCTAssertFalse(made.isMetal) }
+                // 1 トークンずつ（使う分だけ置くと、毎回ページを手放す）
+                var logits: [Float] = []
+                for token in expected.tokens { logits = try made.model.evaluate([token]) }
+                XCTAssertLessThan(maxDifference(logits, last), 0.002, "\(family) \(option.residency)")
+            }
+            guard family != "llama" else { continue }
+            // 専門家を 1 つだけ使うと、結果が変わる（でも数としては正しい）
+            let fewer = try GGUFModelFactory.make(store: store, context: 64, useGPU: false,
+                                                  memory: GGUFMemoryOptions(expertsUsed: 1))
+            let logits = try fewer.model.evaluate(expected.tokens)
+            XCTAssertTrue(logits.allSatisfy(\.isFinite))
+            XCTAssertGreaterThan(maxDifference(logits, last), 0.01, family)
+        }
+    }
+
     /// まとめて読み込んでも（プロンプトの読み込み）、途中で巻き戻しても同じ結果になる
     func testBatchedAndRewoundEvaluationMatch() throws {
         for family in Self.families {
@@ -166,6 +198,33 @@ final class GGUFModelTests: XCTestCase {
             logits = try model.evaluate(expected.tokens)
             XCTAssertLessThan(maxDifference(logits, expected.logits[count - 1]), tolerance, "\(family) after release")
         }
+    }
+
+    /// 状態を巻き戻せない層（Qwen3.5 の DeltaNet）がある系列も、巻き戻して読み直すと同じ logits になる
+    /// （プロンプトの終わりの状態から読み直す場合と、最初から読み直す場合）
+    func testRecurrentModelRewinds() throws {
+        let (model, file) = try load("qwen35", compact: false)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let expected = try reference("qwen35")
+        let tokens = expected.tokens, count = tokens.count
+        let tolerance: Float = 0.002 * max(1, expected.logits[0].map { abs($0) }.max() ?? 1)
+        _ = try model.evaluate(Array(tokens[0..<8]))
+        for position in 8..<11 { _ = try model.evaluate([tokens[position]]) }
+        XCTAssertEqual(model.length, 11)
+        // プロンプトの終わり（8）より後ろへ: そこから 1 トークン読み直す
+        model.truncate(to: 9)
+        XCTAssertEqual(model.length, 9)
+        XCTAssertLessThan(maxDifference(try model.evaluate([tokens[9]]), expected.logits[9]), tolerance, "after snapshot")
+        XCTAssertLessThan(maxDifference(try model.evaluate(Array(tokens[10...])), expected.logits[count - 1]), tolerance, "tail")
+        // プロンプトの終わりより前へ: 最初から読み直す
+        model.truncate(to: 3)
+        XCTAssertEqual(model.length, 3)
+        XCTAssertLessThan(maxDifference(try model.evaluate([tokens[3]]), expected.logits[3]), tolerance, "before snapshot")
+        XCTAssertLessThan(maxDifference(try model.evaluate(Array(tokens[4...]), batch: 3), expected.logits[count - 1]), tolerance,
+                          "replayed tail")
+        model.releaseCache()
+        XCTAssertEqual(model.length, 0)
+        XCTAssertLessThan(maxDifference(try model.evaluate(tokens), expected.logits[count - 1]), tolerance, "after release")
     }
 
     /// 8 ビットにした重みでも、ほぼ同じ logits になる
@@ -222,7 +281,8 @@ final class GGUFModelTests: XCTestCase {
         guard let directory = GGUFFixtures.realModels else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
         // 正解のある本物のモデルのうち、フォルダに置いてあるものを確かめる（CI では SmolLM2 だけ）
         var names = ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0", "qwen2.5-0.5b-q4_k_m", "qwen3-0.6b-q4_k_m",
-                     "gemma-3-1b-q4_k_m", "llama-3.2-1b-q4_k_m", "qwen2.5-1.5b-q4_k_m", "gemma-4-e2b-q4_0"]
+                     "gemma-3-1b-q4_k_m", "llama-3.2-1b-q4_k_m", "qwen2.5-1.5b-q4_k_m", "gemma-4-e2b-q4_0",
+                     "qwen3.5-0.8b-q4_k_m", "granite-3.1-1b-a400m-q4_k_m"]
         // LOCALLLM_GGUF_ONLY で、確かめるモデルを絞れる（カンマ区切り）
         if let only = ProcessInfo.processInfo.environment["LOCALLLM_GGUF_ONLY"] {
             let wanted = Set(only.split(separator: ",").map(String.init))

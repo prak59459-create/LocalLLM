@@ -103,6 +103,10 @@ final class AppSettings {
     var contextLimit: Int {
         didSet { defaults.set(contextLimit, forKey: Keys.contextLimit) }
     }
+    /// GGUF のモデルの重みのメモリへの置き方（上級。次の読み込みから）
+    var ggufMemory: GGUFMemoryOptions {
+        didSet { ggufMemory.save() }
+    }
     /// Hugging Face のアクセストークン（ゲート付きモデル用。任意）
     var huggingFaceToken: String {
         didSet { Keychain.set(huggingFaceToken, for: Keys.huggingFaceToken) }
@@ -127,6 +131,7 @@ final class AppSettings {
         huggingFaceToken = Keychain.get(Keys.huggingFaceToken) ?? ""
         toolsEnabled = defaults.object(forKey: Keys.toolsEnabled) as? Bool ?? true
         contextLimit = max(0, defaults.integer(forKey: Keys.contextLimit))
+        ggufMemory = .stored
     }
 
     /// 生成パラメータを既定値に戻す。

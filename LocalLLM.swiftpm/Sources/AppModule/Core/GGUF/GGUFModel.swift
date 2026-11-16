@@ -11,8 +11,19 @@ final class GGUFModel: GGUFEvaluator {
     let config: GGUFModelConfig
     /// 扱える最大のトークン数（KV キャッシュの大きさ）
     let maxContext: Int
-    /// KV キャッシュに入っているトークン数
-    private(set) var length = 0
+    /// KV キャッシュに入っているトークン数（巻き戻したあと、まだ読み直していないトークンも含める）
+    var length: Int { computed + pending.count }
+    /// 実際に計算し終わったトークン数
+    private var computed = 0
+    /// 巻き戻しのあと、次の計算の前に読み直すトークン（状態を巻き戻せない層がある系列だけ）
+    private var pending: [Int] = []
+    /// 計算したトークン（状態を巻き戻せない層がある系列だけ。読み直しに使う）
+    private var history: [Int] = []
+    /// 最後にまとめて読み込んだ（プロンプトの）終わりの状態。巻き戻すときは、ここから読み直す
+    private var snapshot: (position: Int, data: [Float])?
+    /// Gated DeltaNet の層の状態（その層でなければ nil）
+    private var deltaLayers: [GGUFDeltaNetLayer?] = []
+    private let deltaWork = GGUFDeltaNetLayer.Work()
 
     private let store: GGUFWeightStore
     private let workers: GGUFWorkers
@@ -35,6 +46,28 @@ final class GGUFModel: GGUFEvaluator {
     private let gateBuffer = GGUFBuffer(), upBuffer = GGUFBuffer(), scratch = GGUFBuffer()
     private let scores = GGUFBuffer(), perLayerInputs = GGUFBuffer(), perLayerTokens = GGUFBuffer(), perLayerWork = GGUFBuffer()
     private let angles = GGUFBuffer()
+    private let routerBuffer = GGUFBuffer(), gathered = GGUFBuffer(), expertOut = GGUFBuffer()
+
+    /// 1 トークンで使う専門家の数を、モデルの既定から変える（MoE だけ。nil なら既定）。
+    /// 少なくすると速く・メモリの読み込みも減るが、答えの質は下がる
+    var expertsUsedOverride: Int?
+    /// 専門家ごとの使われた回数（メモリの置き方の判断に使う）
+    private(set) var expertUse: [[Int]] = []
+    /// 専門家の重みを使い終わるたびに呼ぶ（層, 専門家）。使う分だけメモリに置く設定で、ページを手放すのに使う
+    var onExpertFinished: ((Int, Int) -> Void)?
+    /// 層の計算が終わるたびに呼ぶ（層）。普通のモデルで、使う分だけメモリに置く設定のときに使う
+    var onLayerFinished: ((Int) -> Void)?
+    /// メモリへの置き方の管理（持っておく）
+    private var residency: GGUFResidency?
+
+    /// メモリの置き方の設定をつなぐ
+    func attach(_ residency: GGUFResidency, options: GGUFMemoryOptions) {
+        self.residency = residency
+        expertsUsedOverride = options.expertsUsed > 0 ? options.expertsUsed : nil
+        guard options.residency == .activeOnly else { return }
+        onExpertFinished = { [unowned residency] layer, expert in residency.expertFinished(layer: layer, expert: expert) }
+        onLayerFinished = { [unowned residency] layer in residency.layerFinished(layer) }
+    }
     private let fullCos = GGUFBuffer(), fullSin = GGUFBuffer(), slidingCos = GGUFBuffer(), slidingSin = GGUFBuffer()
 
     /// 1 回にまとめて計算するトークン数の上限
@@ -47,7 +80,9 @@ final class GGUFModel: GGUFEvaluator {
         self.config = config
         self.maxContext = max(8, min(config.contextLength, maxContext ?? config.contextLength))
         shapes = config.layers
-        let widest = max(config.maxFeedForwardSize, config.embeddingSize, config.maxQuerySize, config.perLayerInputSize)
+        var widest = max(config.maxFeedForwardSize, config.embeddingSize, config.maxQuerySize, config.perLayerInputSize)
+        if let delta = config.deltaNet { widest = max(widest, delta.channels, delta.valueSize) }
+        if config.attentionOutputGate { widest = max(widest, 2 * config.maxQuerySize) }
         // 畳み込みの層の入力の射影は 3 × 埋め込みの大きさ
         workers = GGUFWorkers(chunkCount: chunkCount, widestRow: widest)
         let globals = try GGUFGlobalWeights(store: store, config: config)
@@ -55,6 +90,8 @@ final class GGUFModel: GGUFEvaluator {
         layers = try (0..<config.layerCount).map { try GGUFLayerWeights.load($0, store: store, config: config) }
         fullRope = GGUFRope.table(config: config, sliding: false, factors: globals.ropeFactors)
         slidingRope = GGUFRope.table(config: config, sliding: true, factors: globals.ropeFactors)
+        deltaLayers = shapes.map { shape in config.deltaNet.flatMap { shape.deltaNet ? GGUFDeltaNetLayer(sizes: $0) : nil } }
+        if let moe = config.moe { expertUse = shapes.map { $0.moe ? [Int](repeating: 0, count: moe.expertCount) : [] } }
         allocateCache()
     }
 
@@ -68,6 +105,11 @@ final class GGUFModel: GGUFEvaluator {
         keys = []
         values = []
         for (index, shape) in shapes.enumerated() {
+            if shape.deltaNet {
+                keys.append(nil)
+                values.append(nil)
+                continue
+            }
             if shape.convolution {
                 // 畳み込みの層は、位置ごとの b × x を覚えておく（巻き戻しても、その位置から続けられる）
                 keys.append(Out.allocate(capacity: config.embeddingSize * maxContext))
@@ -87,16 +129,63 @@ final class GGUFModel: GGUFEvaluator {
         values = []
     }
 
-    /// KV キャッシュを length トークンまで巻き戻す（それより後ろは次の計算で上書きされる）
+    /// KV キャッシュを length トークンまで巻き戻す（それより後ろは次の計算で上書きされる）。
+    /// 状態を巻き戻せない層（DeltaNet）がある系列は、覚えておいた状態（無ければ最初）に戻して、次の計算の前に読み直す
     func truncate(to newLength: Int) {
-        length = max(0, min(length, newLength))
+        let target = max(0, min(length, newLength))
+        guard config.hasRecurrentState else {
+            computed = target
+            return
+        }
+        if target >= computed {
+            pending = Array(pending.prefix(target - computed))
+            return
+        }
+        var from = 0
+        if let snapshot, snapshot.position <= target {
+            restoreStates(snapshot.data)
+            from = snapshot.position
+        } else {
+            snapshot = nil
+            for layer in deltaLayers { layer?.reset() }
+        }
+        pending = Array(history[from..<target])
+        history = Array(history.prefix(from))
+        computed = from
     }
 
     /// KV キャッシュを空にして、使っていたメモリを OS に返す（確保し直す。使うまで実メモリにはならない）
     func releaseCache() {
-        length = 0
+        computed = 0
+        pending = []
+        history = []
+        snapshot = nil
+        for layer in deltaLayers { layer?.reset() }
         freeCache()
         allocateCache()
+    }
+
+    private func saveStates() -> [Float] {
+        let total = deltaLayers.reduce(0) { $0 + ($1?.savedFloats ?? 0) }
+        var data = [Float](repeating: 0, count: total)
+        data.withUnsafeMutableBufferPointer { buffer in
+            guard var target = buffer.baseAddress else { return }
+            for layer in deltaLayers.compactMap({ $0 }) {
+                layer.save(into: target)
+                target += layer.savedFloats
+            }
+        }
+        return data
+    }
+
+    private func restoreStates(_ data: [Float]) {
+        data.withUnsafeBufferPointer { buffer in
+            guard var source = buffer.baseAddress else { return }
+            for layer in deltaLayers.compactMap({ $0 }) {
+                layer.restore(from: source)
+                source += layer.savedFloats
+            }
+        }
     }
 
     /// KV キャッシュが今使っているメモリの目安（バイト）
@@ -111,6 +200,21 @@ final class GGUFModel: GGUFEvaluator {
     @discardableResult
     func evaluate(_ tokens: [Int], batch: Int, progress: ((Int) throws -> Void)?) throws -> [Float] {
         try validate(tokens)
+        // 巻き戻したあとの読み直し
+        if !pending.isEmpty {
+            let replay = pending
+            pending = []
+            var offset = 0
+            while offset < replay.count {
+                let count = min(max(1, batch), replay.count - offset)
+                _ = forward(Array(replay[offset..<(offset + count)]), wantsLogits: false)
+                offset += count
+            }
+        }
+        defer {
+            // まとめて読み込んだ（プロンプトの）終わりの状態を覚えておく
+            if config.hasRecurrentState && tokens.count > 1 { snapshot = (computed, saveStates()) }
+        }
         var offset = 0
         var logits: [Float] = []
         while offset < tokens.count {
@@ -126,15 +230,17 @@ final class GGUFModel: GGUFEvaluator {
 
     private func forward(_ tokens: [Int], wantsLogits: Bool) -> [Float] {
         let n = tokens.count, d = config.embeddingSize
-        let start = length
+        let start = computed
         let x = hidden.reserve(n * d)
         embed(tokens, start: start, into: x)
         let inputs = preparePerLayerInputs(tokens, embedded: x)
         prepareRotations(start: start, count: n)
         for index in layers.indices {
             runLayer(index, x: x, start: start, count: n, perLayerInputs: inputs)
+            onLayerFinished?(index)
         }
-        length = start + n
+        computed = start + n
+        if config.hasRecurrentState { history.append(contentsOf: tokens) }
         guard wantsLogits else { return [] }
         return logits(from: x + (n - 1) * d)
     }
@@ -247,9 +353,30 @@ final class GGUFModel: GGUFEvaluator {
             convolve(index, input: input, start: start, count: n, into: out)
             return
         }
+        if shape.deltaNet {
+            deltaNet(index, input: input, count: n, into: out)
+            return
+        }
         let q = shape.querySize, kv = shape.kvSize
         let qs = queries.reserve(n * q)
-        linear(layer.query, bias: layer.queryBias, input: input, count: n, output: qs)
+        var outputGate: Out?
+        if config.attentionOutputGate {
+            // q の射影は、ヘッドごとに [q | ゲート] が並ぶ（Qwen3.5）
+            let size = shape.headSize, heads = shape.headCount
+            let full = scratch.reserve(n * 2 * q)
+            linear(layer.query, bias: layer.queryBias, input: input, count: n, output: full)
+            let gate = gateBuffer.reserve(n * q)
+            for token in 0..<n {
+                for head in 0..<heads {
+                    let source = full + (token * heads + head) * 2 * size
+                    (qs + (token * heads + head) * size).update(from: source, count: size)
+                    (gate + (token * heads + head) * size).update(from: source + size, count: size)
+                }
+            }
+            outputGate = gate
+        } else {
+            linear(layer.query, bias: layer.queryBias, input: input, count: n, output: qs)
+        }
         if config.qkNormAfterRope { rotate(qs, heads: shape.headCount, layer: index, count: n) }
         if let norm = layer.queryNorm {
             normalizeHeads(qs, weight: norm, perHead: layer.queryNormPerHead, heads: shape.headCount, size: shape.headSize, count: n)
@@ -279,7 +406,30 @@ final class GGUFModel: GGUFEvaluator {
         }
         let attention = attended.reserve(n * q)
         attend(index, queries: qs, start: start, count: n, into: attention)
+        if let outputGate {
+            // 出力 × sigmoid(ゲート)
+            for index in 0..<(n * q) { attention[index] *= 1 / (1 + Foundation.exp(-outputGate[index])) }
+        }
         linear(layer.output, bias: layer.outputBias, input: attention, count: n, output: out)
+    }
+
+    /// Gated DeltaNet の層（Qwen3.5）
+    private func deltaNet(_ index: Int, input: In, count n: Int, into out: Out) {
+        let layer = layers[index]
+        guard let state = deltaLayers[index], let weights = layer.delta, let kernel = layer.convolutionKernel else { return }
+        let sizes = state.sizes
+        let projected = deltaWork.projected.reserve(n * sizes.channels)
+        linear(layer.query, bias: nil, input: input, count: n, output: projected)
+        let z = deltaWork.z.reserve(n * sizes.valueSize)
+        linear(weights.outputGate, bias: nil, input: input, count: n, output: z)
+        let beta = deltaWork.beta.reserve(n * sizes.valueHeads)
+        linear(weights.beta, bias: nil, input: input, count: n, output: beta)
+        let decay = deltaWork.decay.reserve(n * sizes.valueHeads)
+        linear(weights.alpha, bias: nil, input: input, count: n, output: decay)
+        let core = deltaWork.core.reserve(n * sizes.valueSize)
+        state.run(count: n, projected: projected, z: z, betaRaw: beta, alphaRaw: decay, weights: weights, kernel: kernel,
+                  epsilon: config.normEpsilon, into: core, work: deltaWork)
+        linear(layer.output, bias: nil, input: core, count: n, output: out)
     }
 
     /// 短い畳み込み（LFM2）: [b, c, x] = 射影、bx = b × x を位置ごとに覚え、
@@ -378,6 +528,10 @@ final class GGUFModel: GGUFEvaluator {
 
     private func feedForward(_ index: Int, input: In, count n: Int, into out: Out) {
         let layer = layers[index]
+        if let moe = layer.moe, let sizes = config.moe {
+            mixtureOfExperts(index, weights: moe, sizes: sizes, input: input, count: n, into: out)
+            return
+        }
         let ff = shapes[index].feedForwardSize
         let work = scratch.reserve(n * ff)
         let up = upBuffer.reserve(n * ff)
@@ -391,6 +545,75 @@ final class GGUFModel: GGUFEvaluator {
             GGUFKernels.activate(config.activation, up, count: n * ff, scratch: work)
             linear(layer.down, bias: layer.downBias, input: up, count: n, output: out)
         }
+    }
+
+    // MARK: - 専門家の混合（MoE）
+
+    /// 振り分けの softmax から上位 k 個の専門家を選び、その専門家の FFN の出力を重み付きで足す（llama.cpp の build_moe_ffn）。
+    /// 専門家ごとに、その専門家を選んだトークンをまとめて計算する
+    private func mixtureOfExperts(_ index: Int, weights moe: GGUFMoEWeights, sizes: GGUFModelConfig.MoE,
+                                  input: In, count n: Int, into out: Out) {
+        let d = config.embeddingSize, ff = shapes[index].feedForwardSize, experts = sizes.expertCount
+        let used = max(1, min(experts, expertsUsedOverride ?? sizes.expertsUsed))
+        let router = routerBuffer.reserve(n * experts)
+        linear(moe.router, bias: nil, input: input, count: n, output: router)
+        // トークンごとに選んだ専門家と重み
+        var chosen = [[(expert: Int, weight: Float)]](repeating: [], count: n)
+        for token in 0..<n {
+            let row = router + token * experts
+            GGUFKernels.softmax(row, count: experts)
+            var top = (0..<experts).map { ($0, row[$0]) }.sorted { $0.1 > $1.1 }.prefix(used).map { (expert: $0.0, weight: $0.1) }
+            if sizes.normalizeWeights {
+                let sum = max(top.reduce(0) { $0 + $1.weight }, 6.103515625e-5)
+                top = top.map { (expert: $0.expert, weight: $0.weight / sum) }
+            }
+            if sizes.weightScale != 0 && sizes.weightScale != 1 {
+                top = top.map { (expert: $0.expert, weight: $0.weight * sizes.weightScale) }
+            }
+            chosen[token] = top
+        }
+        // 専門家ごとに、選んだトークンを集める
+        var members = [[(token: Int, weight: Float)]](repeating: [], count: experts)
+        for (token, list) in chosen.enumerated() {
+            for item in list { members[item.expert].append((token, item.weight)) }
+        }
+        MiniVector.fillZero(out, n * d)
+        for expert in 0..<experts where !members[expert].isEmpty {
+            let group = members[expert], m = group.count
+            let rows = gathered.reserve(m * d)
+            for (slot, member) in group.enumerated() { (rows + slot * d).update(from: input + member.token * d, count: d) }
+            let (gate, up, down) = moe.expert(expert, feedForward: ff, embedding: d)
+            let result = expertOut.reserve(m * d)
+            gatedFeedForward(gate: gate, up: up, down: down, input: rows, count: m, size: ff, into: result)
+            for (slot, member) in group.enumerated() {
+                MiniVector.scaleAdd(result + slot * d, member.weight, out + member.token * d, out + member.token * d, d)
+            }
+            if index < expertUse.count, expert < expertUse[index].count { expertUse[index][expert] += m }
+            onExpertFinished?(index, expert)
+        }
+        // 共通の専門家（いつも使う）
+        guard let sharedGate = moe.sharedGate, let sharedUp = moe.sharedUp, let sharedDown = moe.sharedDown else { return }
+        let size = sharedUp.rows
+        let result = expertOut.reserve(n * d)
+        gatedFeedForward(gate: sharedGate, up: sharedUp, down: sharedDown, input: input, count: n, size: size, into: result)
+        for token in 0..<n {
+            var scale: Float = 1
+            if let gateWeights = moe.sharedRouter {
+                scale = 1 / (1 + Foundation.exp(-MiniMath.dot(gateWeights, input + token * d, count: d)))
+            }
+            MiniVector.scaleAdd(result + token * d, scale, out + token * d, out + token * d, d)
+        }
+    }
+
+    /// down(act(gate · x) × (up · x))
+    private func gatedFeedForward(gate: GGUFMatrix, up: GGUFMatrix, down: GGUFMatrix, input: In, count n: Int, size ff: Int,
+                                  into out: Out) {
+        let work = scratch.reserve(n * ff)
+        let upRows = upBuffer.reserve(n * ff), gateRows = gateBuffer.reserve(n * ff)
+        linear(up, bias: nil, input: input, count: n, output: upRows)
+        linear(gate, bias: nil, input: input, count: n, output: gateRows)
+        GGUFKernels.gatedActivation(.silu, gate: gateRows, up: upRows, count: n * ff, scratch: work)
+        linear(down, bias: nil, input: gateRows, count: n, output: out)
     }
 
     /// 層ごとの入力を足す（Gemma 4）

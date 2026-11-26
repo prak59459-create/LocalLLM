@@ -188,8 +188,9 @@ struct ChatTemplateRenderer {
     var endOfTurnTokens: [String] {
         var tokens: [String] = []
         let source = template ?? ""
+        // <|tool_response> は Gemma 4: ツールを呼んだあと、結果を待つ印（ここで止めて、アプリが結果を渡す）
         let candidates = ["<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<end_of_turn>", "<|end|>", "[|endofturn|]",
-                          "<｜end▁of▁sentence｜>", "<|endoftext|>", "<|end_of_text|>"]
+                          "<｜end▁of▁sentence｜>", "<|endoftext|>", "<|end_of_text|>", "<turn|>", Gemma4ToolSyntax.responseMarker]
         for candidate in candidates where source.contains(candidate) { tokens.append(candidate) }
         for candidate in fallbackFormat.endOfTurnTokens where !tokens.contains(candidate) && (compiled == nil || source.contains(candidate)) {
             tokens.append(candidate)
@@ -229,7 +230,7 @@ struct ChatTemplateRenderer {
     }
 }
 
-/// 生成テキストから <think>…</think> の思考部分を分ける。
+/// 生成テキストから <think>…</think> の思考部分を分ける（Gemma 4 の <|channel>thought … <channel|> も）。
 struct ThinkingSplit: Equatable {
     var thinking: String?
     var answer: String
@@ -237,8 +238,19 @@ struct ThinkingSplit: Equatable {
 
     static let openTag = "<think>"
     static let closeTag = "</think>"
+    /// Gemma 4 の思考の始まりと終わり
+    static let channelOpenTag = "<|channel>thought"
+    static let channelCloseTag = "<channel|>"
 
     static func split(_ text: String) -> ThinkingSplit {
+        // ツールの結果のあとはプロンプト側に <|channel>thought があり、出力には <channel|> だけが出る
+        if text.contains(channelOpenTag) || text.contains(channelCloseTag) {
+            return split(text, open: channelOpenTag, close: channelCloseTag)
+        }
+        return split(text, open: openTag, close: closeTag)
+    }
+
+    private static func split(_ text: String, open openTag: String, close closeTag: String) -> ThinkingSplit {
         let ns = text as NSString
         let open = ns.range(of: openTag, options: .literal)
         if open.location != NSNotFound {

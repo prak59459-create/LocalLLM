@@ -93,7 +93,9 @@ enum GGUFTokenizer {
     /// 数字を 1 つずつ分けてから GPT-2 の規則で分ける系統（tokenizer.ggml.pre）
     private static let digitFamilies: Set<String> = ["smollm", "starcoder", "refact", "command-r", "codeshell", "smaug-bpe", "exaone"]
     private static let llama3Families: Set<String> = ["llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2"]
-    private static let qwenFamilies: Set<String> = ["qwen2", "deepseek-r1-qwen", "megrez", "kormo", "qwen35", "stablelm2", "hunyuan"]
+    private static let qwenFamilies: Set<String> = ["qwen2", "deepseek-r1-qwen", "megrez", "kormo", "stablelm2", "hunyuan"]
+    /// Qwen3.5: 文字に結合文字（\p{M}）も含める（llama.cpp の LLAMA_VOCAB_PRE_TYPE_QWEN35）
+    static let qwen35Pattern = #"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"#
     static let tekkenPattern = #"[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"#
     static let gpt4oPattern = #"[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"#
 
@@ -111,6 +113,9 @@ enum GGUFTokenizer {
         if qwenFamilies.contains(pre) {
             normalizer = ["type": "NFC"]
             preTokenizer = TokenizerSynthesizer.splitThenByteLevel(TokenizerSynthesizer.qwenPattern)
+        } else if pre == "qwen35" {
+            // llama.cpp は正規化しない（結合文字はそのまま。文字と一緒に 1 つの塊にする）
+            preTokenizer = TokenizerSynthesizer.splitThenByteLevel(qwen35Pattern)
         } else if llama3Families.contains(pre) {
             ignoreMerges = true
             preTokenizer = TokenizerSynthesizer.splitThenByteLevel(TokenizerSynthesizer.llama3Pattern)

@@ -177,7 +177,7 @@ final class ModelLibrary {
                                   expectedSize: file.size > 0 ? file.size : nil)
         }
         let job = ModelDownloadJob(items: items, destinationDirectory: directory(for: model),
-                                   headers: client.authorizationHeaders)
+                                   headers: client.headers(forRepo: model.repoID))
         downloads[id] = DownloadState(phase: .downloading, progress: downloads[id]?.progress)
         beginBackgroundTask(for: id)
         updateIdleTimer()
@@ -614,7 +614,7 @@ final class ModelLibrary {
         return ModelFiles(
             modelID: model.id,
             displayName: model.displayName,
-            source: .gguf(GGUFModelFiles(store: store, context: context)),
+            source: .gguf(GGUFModelFiles(store: store, context: context, memory: .stored)),
             tokenizerJSON: tokenizer,
             tokenizerConfigJSON: optional("tokenizer_config.json"),
             generationConfigJSON: optional("generation_config.json"),

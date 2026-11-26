@@ -13,22 +13,37 @@ enum GGUFModelFactory {
     private static var verified: Set<String> = []
     private static let lock = NSLock()
 
-    static func make(store url: URL, context: Int, useGPU: Bool) throws -> Made {
+    /// - Parameters:
+    ///   - memory: 重みのメモリへの置き方（使う分だけ置くときは CPU で計算する）
+    ///   - availableBytes: 空いているメモリ（使う分だけ置くときに、残す層の数を決めるのに使う）
+    static func make(store url: URL, context: Int, useGPU: Bool, memory: GGUFMemoryOptions = GGUFMemoryOptions(),
+                     availableBytes: Int64? = nil) throws -> Made {
         let store = try GGUFWeightStore(url: url)
+        let residency = GGUFResidency(store: store, options: memory, availableBytes: availableBytes)
+        defer { residency.prepare() }
+        func cpu() throws -> GGUFModel {
+            let model = try GGUFModel(store: store, maxContext: context)
+            model.attach(residency, options: memory)
+            return model
+        }
         #if canImport(Metal)
-        if useGPU {
+        if useGPU && memory.allowsGPU {
             do {
                 let model = try GGUFMetalModel(store: store, maxContext: context)
                 try verifyOnce(model, store: store, key: url.path + "|\(store.header.dataBytes)")
                 return Made(model: model, isMetal: true, note: nil)
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-                let cpu = try GGUFModel(store: store, maxContext: context)
-                return Made(model: cpu, isMetal: false, note: reason)
+                return Made(model: try cpu(), isMetal: false, note: reason)
             }
         }
         #endif
-        return Made(model: try GGUFModel(store: store, maxContext: context), isMetal: false, note: nil)
+        var note: String? = residency.summary.isEmpty ? nil : residency.summary
+        if useGPU && !memory.allowsGPU {
+            note = L("使う分だけメモリに置く設定なので CPU で計算", "Computing on the CPU to keep only the weights in use in memory")
+                + (note.map { "・" + $0 } ?? "")
+        }
+        return Made(model: try cpu(), isMetal: false, note: note)
     }
 
     #if canImport(Metal)

@@ -62,6 +62,41 @@ final class GGUFTokenizerTests: XCTestCase {
         print("GGUF tokenizers checked: \(checked)")
     }
 
+    /// Qwen3.5（"qwen35" の分け方。文字に結合文字も含める）: llama.cpp が分けたトークンと同じになる。構造も読める
+    func testQwen35TokenizerMatchesLlamaCpp() throws {
+        guard let file = header("unsloth__Qwen3.5-0.8B-GGUF") else {
+            throw XCTSkip("GGUF header fixtures missing (run ./Tools/fetch_fixtures.sh)")
+        }
+        let reference = try GGUFFixtures.json("tokens-qwen35.json")
+        let texts = try XCTUnwrap(reference["texts"] as? [String])
+        let expected = try XCTUnwrap(reference["tokens"] as? [[Int]])
+        let files = try GGUFTokenizer.files(from: file)
+        let tokenizer = try HFTokenizer(tokenizerJSON: files.tokenizerJSON, tokenizerConfigJSON: files.tokenizerConfigJSON)
+        for (text, ids) in zip(texts, expected) {
+            XCTAssertEqual(tokenizer.encode(text, addSpecialTokens: true), ids, text)
+        }
+        // 長いチャットテンプレートも、このアプリの Jinja で描ける（考える・考えない の両方）
+        let template = try XCTUnwrap(tokenizer.chatTemplate)
+        let renderer = ChatTemplateRenderer(template: template, bosToken: tokenizer.bosToken, eosToken: tokenizer.eosToken)
+        let messages = [ChatMessage(role: .system, content: "You are helpful."), ChatMessage(role: .user, content: "こんにちは"),
+                        ChatMessage(role: .assistant, content: "やあ"), ChatMessage(role: .user, content: "1+1は？")]
+        for thinking in [true, false] {
+            let text = try renderer.render(messages: messages, addGenerationPrompt: true, enableThinking: thinking)
+            XCTAssertTrue(text.contains("<|im_start|>user\n1+1は？<|im_end|>"), text)
+            XCTAssertTrue(text.hasSuffix("<|im_start|>assistant\n") || text.contains("<|im_start|>assistant\n<think>"), text)
+        }
+        let config = try GGUFModelConfig(file: file)
+        XCTAssertEqual(config.family, .qwen35)
+        XCTAssertEqual(config.layers.count, 24)
+        XCTAssertEqual(config.layers.filter(\.deltaNet).count, 18)
+        XCTAssertFalse(config.layers[3].deltaNet)
+        XCTAssertEqual(config.deltaNet?.channels, 6144)
+        XCTAssertEqual(config.deltaNet?.valueHeads, 16)
+        XCTAssertTrue(config.attentionOutputGate)
+        XCTAssertFalse(config.hasFusedQKV)
+        XCTAssertEqual(config.ropeDimensions, 64)
+    }
+
     /// Gemma 4（"gemma4" 形式の BPE）: llama.cpp が分けたトークンと同じになる（Tools/gguf/make_token_fixtures.py が作った正解）
     func testGemma4TokenizerMatchesLlamaCpp() throws {
         guard let file = header("ggml-org__gemma-4-E2B-it-GGUF") else {

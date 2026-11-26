@@ -132,7 +132,7 @@ private struct RecommendedModelRow: View {
     }
 }
 
-/// Hugging Face の検索。1 ページ 50 件で、下の「さらに表示」で続きを読み込む。
+/// モデルの検索（Hugging Face と ModelScope）。1 ページ 50 件で、下の「さらに表示」で続きを読み込む。
 private struct ModelSearchView: View {
     @Environment(AppSettings.self) private var settings
 
@@ -278,6 +278,9 @@ private struct SearchFormSection: View {
             if source == .anemll {
                 Text(L("ANEMLL のモデルは、埋め込み・本体（複数のチャンク）・出力層に分かれています。まとめてダウンロードして Neural Engine で動かします。",
                        "ANEMLL models are split into embeddings, body chunks and an output head. They are downloaded together and run on the Neural Engine."))
+            } else if source == .all || source == .gguf || source == .modelScope {
+                Text(L("「すべて」と GGUF は、Hugging Face と ModelScope（modelscope.cn）の両方から探します。ModelScope からは GGUF のモデルだけが出ます。",
+                       "\"All\" and GGUF search both Hugging Face and ModelScope (modelscope.cn). ModelScope results are GGUF models only."))
             }
         }
     }
@@ -287,7 +290,7 @@ private struct DirectRepoSection: View {
     @Binding var directRepo: String
 
     var body: some View {
-        Section(L("リポジトリ ID を直接入力", "Enter a repository ID")) {
+        Section {
             HStack {
                 TextField("owner/name", text: $directRepo)
                     .textInputAutocapitalization(.never)
@@ -297,6 +300,10 @@ private struct DirectRepoSection: View {
                 }
                 .disabled(!directRepo.contains("/"))
             }
+        } header: {
+            Text(L("リポジトリ ID を直接入力", "Enter a repository ID"))
+        } footer: {
+            Text(L("ModelScope のリポジトリは「modelscope:owner/name」と入力します。", "For ModelScope, enter \"modelscope:owner/name\"."))
         }
     }
 }
@@ -306,9 +313,18 @@ private struct SearchResultRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(model.id)
-                .font(.callout.weight(.medium))
-                .lineLimit(2)
+            HStack(spacing: 6) {
+                if ModelScope.isModelScope(model.id) {
+                    Text("ModelScope")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.purple.opacity(0.18), in: Capsule())
+                }
+                Text(ModelScope.isModelScope(model.id) ? ModelScope.path(model.id) : model.id)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(2)
+            }
             HStack(spacing: 10) {
                 if let downloads = model.downloads {
                     Label("\(downloads)", systemImage: "arrow.down.circle")

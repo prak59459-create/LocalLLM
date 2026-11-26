@@ -207,6 +207,8 @@ struct GGUFWeightStore {
             if isMatrix && compact && GGUFModelConfig.isRawTensor(name) && tensor.type != nil { storage = .raw }
             let rows = isMatrix ? tensor.rows : 1
             let columns = isMatrix ? tensor.columns : tensor.elementCount
+            // 専門家の振り分けは小さく、選び方がずれないよう Float32 のまま
+            if storage == .int8Rows && name.hasSuffix("ffn_gate_inp.weight") { storage = .float32 }
             // 元が 4 ビットなら 4 ビット、5 ビットなら 5 ビットのまま（6 ビット以上は 8 ビット）
             if storage == .int8Rows, columns % GGUFGroupQuant.groupSize == 0,
                let type = tensor.type, let grouped = GGUFGroupQuant.storage(for: type) {

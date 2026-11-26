@@ -75,6 +75,10 @@ final class GGUFModel: GGUFEvaluator {
 
     /// 最後に logits を計算した位置の、出力層の前（最後の正規化のあと）の隠れ状態（先読みの入力）
     private(set) var lastHidden: [Float] = []
+    /// 先読み用のモデル（つないだときだけ）と、まとめて確かめた結果
+    private var drafter: GGUFDrafter?
+    private var verified: (logits: [[Float]], hidden: [[Float]]) = ([], [])
+    private var verifyStart = 0
 
     /// - Parameter chunkCount: 並列に計算するときのまとまりの数（nil ならコアの数から決める）
     init(store: GGUFWeightStore, maxContext: Int? = nil, chunkCount: Int? = nil) throws {
@@ -727,5 +731,33 @@ extension GGUFModel: GGUFDraftSource {
         let source = shapes[layer].kvLayer
         guard let key = keys[source], let value = values[source] else { return nil }
         return (UnsafePointer(key), UnsafePointer(value))
+    }
+}
+
+extension GGUFModel: GGUFSpeculativeEvaluator {
+    /// 先読み用のモデルをつなぐ
+    func attachDrafter(store: GGUFWeightStore) throws {
+        drafter = try GGUFDrafter(store: store, target: config)
+    }
+
+    var canDraft: Bool { drafter != nil }
+
+    func draft(after token: Int, hidden: [Float], count: Int) throws -> [Int] {
+        drafter?.draft(after: token, hidden: hidden, position: length, count: count, target: self) ?? []
+    }
+
+    func verify(_ tokens: [Int]) throws {
+        verifyStart = length
+        verified = try evaluateAll(tokens)
+    }
+
+    func verifiedLogits(_ index: Int) -> [Float] {
+        index < verified.logits.count ? verified.logits[index] : []
+    }
+
+    func accept(_ count: Int) {
+        guard count < verified.hidden.count else { return }
+        truncate(to: verifyStart + count + 1)
+        lastHidden = verified.hidden[count]
     }
 }

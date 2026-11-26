@@ -1,0 +1,158 @@
+#if canImport(Metal)
+import Metal
+import XCTest
+@testable import LocalLLMCore
+
+/// GPU（Metal）での Gemma 4 の MTP（先読み・推測デコード）が、CPU と numpy の正解と同じになるか（Mac の CI で動く）
+final class GGUFMetalDrafterTests: XCTestCase {
+    private func requireDevice() throws {
+        guard GGUFMetalModel.isAvailable else { throw XCTSkip("no Metal device") }
+    }
+
+    private func convert(_ name: String, compact: Bool, groups: GGUFMatrix.Storage? = nil) throws -> GGUFWeightStore {
+        let destination = GGUFFixtures.temporaryFile("metal-\(name).llw")
+        try GGUFConverter.convert(gguf: GGUFFixtures.root.appendingPathComponent("\(name).gguf"), to: destination, compact: compact,
+                                  groups: groups)
+        addTeardownBlock { try? FileManager.default.removeItem(at: destination) }
+        return try GGUFWeightStore(url: destination)
+    }
+
+    private func argmax(_ logits: [Float]) -> Int { GGUFDrafter.argmax(logits) ?? 0 }
+
+    /// GPU の先読みが、numpy の正解（Float32 の重み）と CPU の先読み（8 ビット・4 ビットの重み）と同じトークンを予想する
+    func testDraftsMatchNumpyAndCPU() throws {
+        try requireDevice()
+        let json = try GGUFFixtures.json("tiny-gemma4-assistant.json")
+        let tokens = try XCTUnwrap(json["tokens"] as? [Int])
+        let cases = try XCTUnwrap(json["cases"] as? [[String: Any]])
+        for (compact, groups) in [(false, nil), (true, nil), (true, GGUFMatrix.Storage.q4Groups)] as [(Bool, GGUFMatrix.Storage?)] {
+            let targetStore = try convert("tiny-gemma4", compact: compact, groups: groups)
+            let drafterStore = try convert("tiny-gemma4-assistant", compact: compact)
+            for item in cases {
+                let prefix = try XCTUnwrap(item["prefix"] as? Int)
+                let gpu = try GGUFMetalModel(store: targetStore)
+                try gpu.attachDrafter(store: drafterStore)
+                let cpu = try GGUFModel(store: targetStore)
+                try cpu.attachDrafter(store: drafterStore)
+                let first = argmax(try gpu.evaluate(Array(tokens.prefix(prefix))))
+                XCTAssertEqual(first, argmax(try cpu.evaluate(Array(tokens.prefix(prefix)))))
+                XCTAssertEqual(gpu.lastHidden.count, targetStore.config.embeddingSize)
+                let drafts = try gpu.draft(after: first, hidden: gpu.lastHidden, count: 3)
+                XCTAssertEqual(drafts, try cpu.draft(after: first, hidden: cpu.lastHidden, count: 3), "compact \(compact) prefix \(prefix)")
+                if !compact {
+                    XCTAssertEqual(first, item["first"] as? Int)
+                    XCTAssertEqual(drafts, item["drafts"] as? [Int], "prefix \(prefix)")
+                }
+                XCTAssertEqual(gpu.length, prefix)
+            }
+        }
+    }
+
+    /// GPU でまとめて確かめた logits と隠れ状態が、CPU と同じ。受け入れたあとも、続けて正しく計算できる
+    func testVerifyAndAcceptMatchCPU() throws {
+        try requireDevice()
+        let targetStore = try convert("tiny-gemma4", compact: true, groups: .q4Groups)
+        let gpu = try GGUFMetalModel(store: targetStore)
+        let cpu = try GGUFModel(store: targetStore)
+        let prompt = [1, 5, 9, 14, 3]
+        _ = try gpu.evaluate(prompt)
+        _ = try cpu.evaluate(prompt)
+        let batch = [7, 31, 2, 18]
+        try gpu.verify(batch)
+        try cpu.verify(batch)
+        for index in batch.indices {
+            XCTAssertLessThan(GGUFModelFactory.relativeDifference(gpu.verifiedLogits(index), cpu.verifiedLogits(index)), 0.002)
+        }
+        gpu.accept(1)
+        cpu.accept(1)
+        XCTAssertEqual(gpu.length, prompt.count + 2)
+        XCTAssertLessThan(GGUFModelFactory.relativeDifference(gpu.lastHidden, cpu.lastHidden), 0.002)
+        XCTAssertLessThan(GGUFModelFactory.relativeDifference(try gpu.evaluate([11]), try cpu.evaluate([11])), 0.002)
+    }
+
+    /// GPU で先読みを使っても、使わないときと同じ文章になる（予想の数を変えても）
+    func testSpeculativeGreedyMatchesPlainGreedy() throws {
+        try requireDevice()
+        let targetStore = try convert("tiny-gemma4", compact: true, groups: .q4Groups)
+        let drafterStore = try convert("tiny-gemma4-assistant", compact: true)
+        let prompt = [1, 5, 9, 14, 3]
+        let plain = try GGUFMetalModel(store: targetStore)
+        var logits = try plain.evaluate(prompt)
+        var expected: [Int] = []
+        for _ in 0..<24 {
+            let token = argmax(logits)
+            expected.append(token)
+            logits = try plain.evaluate([token])
+        }
+        for count in [1, 3, 4] {
+            let gpu = try GGUFMetalModel(store: targetStore)
+            try gpu.attachDrafter(store: drafterStore)
+            var generated = [argmax(try gpu.evaluate(prompt))]
+            while generated.count < expected.count {
+                generated += try GGUFSpeculation.round(target: gpu, first: generated.last!, count: count) { logits, _ in self.argmax(logits) }
+                XCTAssertEqual(gpu.length, prompt.count + generated.count - 1)
+            }
+            XCTAssertEqual(Array(generated.prefix(expected.count)), expected, "drafts \(count)")
+        }
+    }
+
+    /// 本物の Gemma 4 E2B と先読み用のモデル: GPU でも同じ文章になり、どれだけ当たって、どれだけ速くなるか
+    /// （LOCALLLM_GGUF_MODELS に gemma-4-E2B-it-Q4_0.gguf と mtp-gemma-4-E2B-it-Q8_0.gguf を置いたときだけ。速さを測る流れで動く）
+    func testRealGemma4SpeculationOnTheGPU() throws {
+        try requireDevice()
+        guard let directory = GGUFFixtures.realModels else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
+        let targetFile = directory.appendingPathComponent("gemma-4-E2B-it-Q4_0.gguf")
+        let drafterFile = directory.appendingPathComponent("mtp-gemma-4-E2B-it-Q8_0.gguf")
+        guard FileManager.default.fileExists(atPath: targetFile.path), FileManager.default.fileExists(atPath: drafterFile.path) else {
+            throw XCTSkip("Gemma 4 E2B and its MTP model are not in LOCALLLM_GGUF_MODELS")
+        }
+        func store(_ source: URL) throws -> GGUFWeightStore {
+            let destination = GGUFFixtures.temporaryFile(source.lastPathComponent + ".llw")
+            try GGUFConverter.convert(gguf: source, to: destination)
+            addTeardownBlock { try? FileManager.default.removeItem(at: destination) }
+            return try GGUFWeightStore(url: destination)
+        }
+        let targetStore = try store(targetFile)
+        let drafterStore = try store(drafterFile)
+        let mapped = try MappedFile(url: targetFile)
+        let file = try GGUFFile.parse(Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: mapped.pointer), count: mapped.count,
+                                           deallocator: .none))
+        let files = try GGUFTokenizer.files(from: file)
+        let tokenizer = try HFTokenizer(tokenizerJSON: files.tokenizerJSON, tokenizerConfigJSON: files.tokenizerConfigJSON)
+        let prompts = ["Write a short story about a cat who learns to swim.", "日本の四季について、短く説明してください。",
+                       "Explain in simple words how a rainbow forms."]
+        for text in prompts {
+            let prompt = tokenizer.encode("<bos><|turn>user\n\(text)<turn|>\n<|turn>model\n", addSpecialTokens: false)
+            let plain = try GGUFMetalModel(store: targetStore, maxContext: 1024)
+            var logits = try plain.evaluate(prompt)
+            var expected: [Int] = []
+            var started = Date()
+            for _ in 0..<64 {
+                let token = argmax(logits)
+                expected.append(token)
+                logits = try plain.evaluate([token])
+            }
+            let plainSpeed = 64 / Date().timeIntervalSince(started)
+            for count in [2, 3, 4] {
+                let gpu = try GGUFMetalModel(store: targetStore, maxContext: 1024)
+                try gpu.attachDrafter(store: drafterStore)
+                var generated = [argmax(try gpu.evaluate(prompt))]
+                var rounds = 0
+                started = Date()
+                while generated.count < expected.count + 1 {
+                    generated += try GGUFSpeculation.round(target: gpu, first: generated.last!, count: count) { logits, _ in
+                        self.argmax(logits)
+                    }
+                    rounds += 1
+                }
+                let speed = Double(generated.count - 1) / Date().timeIntervalSince(started)
+                let accepted = generated.count - 1 - rounds
+                XCTAssertEqual(Array(generated.prefix(expected.count)), expected, "\(text) drafts \(count)")
+                print(String(format: "SPEED-MTP drafts %d: %.1f tok/s (plain %.1f, x%.2f), %d of %d drafts accepted (%.0f%%) | %@",
+                             count, speed, plainSpeed, speed / plainSpeed, accepted, rounds * count,
+                             100 * Double(accepted) / Double(rounds * count), String(text.prefix(24))))
+            }
+        }
+    }
+}
+#endif

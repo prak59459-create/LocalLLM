@@ -75,7 +75,7 @@ final class GGUFDrafterTests: XCTestCase {
     func testSpeculativeGreedyMatchesPlainGreedy() throws {
         for compact in [false, true] {
             let targetStore = try convert("tiny-gemma4", compact: compact)
-            let drafter = try GGUFDrafter(store: try convert("tiny-gemma4-assistant", compact: compact), target: targetStore.config)
+            let drafterStore = try convert("tiny-gemma4-assistant", compact: compact)
             let prompt = [1, 5, 9, 14, 3]
             let plain = try GGUFModel(store: targetStore)
             var logits = try plain.evaluate(prompt)
@@ -87,16 +87,17 @@ final class GGUFDrafterTests: XCTestCase {
             }
             for count in [1, 2, 3, 5] {
                 let target = try GGUFModel(store: targetStore)
+                try target.attachDrafter(store: drafterStore)
                 let first = argmax(try target.evaluate(prompt))
-                var generated = [first], hidden = target.lastHidden
+                var generated = [first]
                 var accepted = 0, rounds = 0
                 while generated.count < expected.count {
-                    let (tokens, next) = try GGUFSpeculation.round(target: target, drafter: drafter, first: generated.last!,
-                                                                   hidden: hidden, count: count) { logits, _ in self.argmax(logits) }
+                    let tokens = try GGUFSpeculation.round(target: target, first: generated.last!, count: count) { logits, _ in
+                        self.argmax(logits)
+                    }
                     accepted += tokens.count - 1
                     rounds += 1
                     generated.append(contentsOf: tokens)
-                    hidden = next
                     // 本体は、選んだ最後のトークンの手前まで読んでいる
                     XCTAssertEqual(target.length, prompt.count + generated.count - 1)
                 }
@@ -137,7 +138,7 @@ final class GGUFDrafterTests: XCTestCase {
             return try GGUFWeightStore(url: destination)
         }
         let targetStore = try store(targetFile)
-        let drafter = try GGUFDrafter(store: try store(drafterFile), target: targetStore.config)
+        let drafterStore = try store(drafterFile)
         // チャットの形の問い（Gemma 4 のトークナイザで分ける）
         let mapped = try MappedFile(url: targetFile)
         let file = try GGUFFile.parse(Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: mapped.pointer), count: mapped.count,
@@ -155,16 +156,15 @@ final class GGUFDrafterTests: XCTestCase {
             logits = try plain.evaluate([token])
         }
         let target = try GGUFModel(store: targetStore, maxContext: 256)
+        try target.attachDrafter(store: drafterStore)
         let first = argmax(try target.evaluate(prompt))
-        var generated = [first], hidden = target.lastHidden
+        var generated = [first]
         var accepted = 0, drafted = 0
         while generated.count < expected.count {
-            let (tokens, next) = try GGUFSpeculation.round(target: target, drafter: drafter, first: generated.last!, hidden: hidden,
-                                                           count: 3) { logits, _ in self.argmax(logits) }
+            let tokens = try GGUFSpeculation.round(target: target, first: generated.last!, count: 3) { logits, _ in self.argmax(logits) }
             accepted += tokens.count - 1
             drafted += 3
             generated.append(contentsOf: tokens)
-            hidden = next
         }
         XCTAssertEqual(Array(generated.prefix(expected.count)), expected)
         let rate = Double(accepted) / Double(max(drafted, 1))

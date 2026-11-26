@@ -23,18 +23,22 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
 
-      - name: Download Gemma 4 E2B (Q4_0)
+      - name: Download Gemma 4 E2B (Q4_0) and its MTP model
         run: |
           mkdir -p "$RUNNER_TEMP/gguf"
           curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/gemma-4-E2B-it-Q4_0.gguf" \
             "https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf"
+          # MTP（先読み）用の小さなモデル
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/mtp-gemma-4-E2B-it-Q8_0.gguf" \
+            "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/MTP/mtp-gemma-4-E2B-it-Q8_0.gguf"
           ls -la "$RUNNER_TEMP/gguf"
 
       - name: GPU tests and benchmark
         env:
           LOCALLLM_GGUF_MODELS: ${{ runner.temp }}/gguf
-        run: swift test --filter "GGUFMetalTests" 2>&1 | tee bench.log
+        run: swift test --filter "GGUFMetal" 2>&1 | tee bench.log
 
       - name: Summary
         if: always()
-        run: grep -E "SPEED-GPU|TIME-GPU|PROFILE-GPU|GGUF Metal: (converted|prepared)|error|failed" bench.log || true
+        run: |
+          grep -E "SPEED-GPU|SPEED-MTP|TIME-GPU|PROFILE-GPU|GGUF Metal: (converted|prepared)|error|failed" bench.log || true

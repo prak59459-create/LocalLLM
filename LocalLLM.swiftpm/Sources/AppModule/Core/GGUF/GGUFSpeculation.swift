@@ -21,16 +21,22 @@ enum GGUFSpeculation {
         return (accepted, tokens)
     }
 
-    /// CPU の本体と先読みで 1 往復する（テストと、GPU が使えないとき用）。
-    /// first は本体がまだ読んでいないトークン、hidden はその前の位置の本体の隠れ状態。
-    /// 返すのは選んだトークン（1 個以上）と、次の往復に渡す隠れ状態。本体の KV キャッシュは、選んだ最後のトークンの手前まで進む
-    static func round(target: GGUFModel, drafter: GGUFDrafter, first: Int, hidden: [Float], count: Int,
-                      sample: (inout [Float], Int) -> Int) throws -> (tokens: [Int], hidden: [Float]) {
-        let position = target.length
-        let drafts = drafter.draft(after: first, hidden: hidden, position: position, count: count, target: target)
-        var (logits, states) = try target.evaluateAll([first] + drafts)
-        let (accepted, tokens) = accept(drafts: drafts, logits: &logits, sample: sample)
-        target.truncate(to: position + accepted + 1)
-        return (tokens, states[accepted])
+    /// 本体と先読みで 1 往復する。first は本体がまだ読んでいないトークン（隠れ状態は target.lastHidden）。
+    /// 返すのは選んだトークン（1 個以上）。本体の KV キャッシュは、選んだ最後のトークンの手前まで進む
+    static func round(target: GGUFSpeculativeEvaluator, first: Int, count: Int,
+                      sample: (inout [Float], Int) -> Int) throws -> [Int] {
+        let drafts = target.canDraft ? try target.draft(after: first, hidden: target.lastHidden, count: count) : []
+        try target.verify([first] + drafts)
+        var tokens: [Int] = []
+        var accepted = 0
+        while accepted <= drafts.count {
+            var logits = target.verifiedLogits(accepted)
+            let token = sample(&logits, accepted)
+            tokens.append(token)
+            guard accepted < drafts.count, token == drafts[accepted] else { break }
+            accepted += 1
+        }
+        target.accept(min(accepted, drafts.count))
+        return tokens
     }
 }

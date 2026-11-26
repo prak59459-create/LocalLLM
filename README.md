@@ -109,6 +109,9 @@ Swift Playgrounds（iPad）でそのまま開いて実行できます。
 - 🔧（ツール）をオンにすると、モデルが必要なときに自分で `web_search` / `fetch_page` / `current_time` を呼びます。
 - **設定 → コネクタ** で、検索サービス（DuckDuckGo・Wikipedia・Brave・SearXNG）を選んだり、
   Streamable HTTP の **MCP サーバー** を追加してそのツールを使わせたりできます。
+- ツールの呼び出しは、モデルごとの書き方を読み取ります: Qwen・Hermes の `<tool_call>{…}</tool_call>`、Llama 3 の JSON、
+  Mistral の `[TOOL_CALLS]`、**Gemma 4（E2B・E4B など）の `<|tool_call>call:名前{キー:<|"|>値<|"|>}<tool_call|>`**。
+  Gemma 4 は呼び出しのあとの `<|tool_response>` で止めて、結果を Gemma 4 の書き方（`response:名前{…}`）で返します。
 
 ### 分割モデル・ZIP のモデル
 

@@ -1,0 +1,330 @@
+{
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "web_search",
+    "description": "ウェブを検索する",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "query": {
+       "type": "string",
+       "description": "検索する言葉"
+      }
+     },
+     "required": [
+      "query"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "read_file",
+    "description": "Read a text file",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "File path"
+      },
+      "offset": {
+       "type": "integer",
+       "description": "First line"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  }
+ ],
+ "cases": [
+  {
+   "name": "plain",
+   "messages": [
+    {
+     "role": "user",
+     "content": "こんにちは"
+    }
+   ],
+   "tools": false,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>user\nこんにちは<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "あなたは親切です。"
+    },
+    {
+     "role": "user",
+     "content": "自己紹介して"
+    }
+   ],
+   "tools": false,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\nあなたは親切です。<turn|>\n<|turn>user\n自己紹介して<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "tools",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are helpful."
+    },
+    {
+     "role": "user",
+     "content": "東京の天気は？"
+    }
+   ],
+   "tools": true,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\nYou are helpful.<|tool>declaration:web_search{description:<|\"|>ウェブを検索する<|\"|>,parameters:{properties:{query:{description:<|\"|>検索する言葉<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:read_file{description:<|\"|>Read a text file<|\"|>,parameters:{properties:{offset:{description:<|\"|>First line<|\"|>,type:<|\"|>INTEGER<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\n東京の天気は？<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "tools_no_system",
+   "messages": [
+    {
+     "role": "user",
+     "content": "東京の天気は？"
+    }
+   ],
+   "tools": true,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\n<|tool>declaration:web_search{description:<|\"|>ウェブを検索する<|\"|>,parameters:{properties:{query:{description:<|\"|>検索する言葉<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:read_file{description:<|\"|>Read a text file<|\"|>,parameters:{properties:{offset:{description:<|\"|>First line<|\"|>,type:<|\"|>INTEGER<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\n東京の天気は？<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "tool_result",
+   "messages": [
+    {
+     "role": "user",
+     "content": "東京の天気は？"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call00001",
+       "type": "function",
+       "function": {
+        "name": "web_search",
+        "arguments": {
+         "query": "東京 天気"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "晴れ、25度",
+     "name": "web_search",
+     "tool_call_id": "call00001"
+    }
+   ],
+   "tools": true,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\n<|tool>declaration:web_search{description:<|\"|>ウェブを検索する<|\"|>,parameters:{properties:{query:{description:<|\"|>検索する言葉<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:read_file{description:<|\"|>Read a text file<|\"|>,parameters:{properties:{offset:{description:<|\"|>First line<|\"|>,type:<|\"|>INTEGER<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\n東京の天気は？<turn|>\n<|turn>model\n<|tool_call>call:web_search{query:<|\"|>東京 天気<|\"|>}<tool_call|><|tool_response>response:web_search{value:<|\"|>晴れ、25度<|\"|>}<tool_response|>"
+  },
+  {
+   "name": "tool_result_thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "東京の天気は？"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call00001",
+       "type": "function",
+       "function": {
+        "name": "web_search",
+        "arguments": {
+         "query": "東京 天気"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "晴れ、25度",
+     "name": "web_search",
+     "tool_call_id": "call00001"
+    }
+   ],
+   "tools": true,
+   "enableThinking": true,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\n<|think|>\n<|tool>declaration:web_search{description:<|\"|>ウェブを検索する<|\"|>,parameters:{properties:{query:{description:<|\"|>検索する言葉<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:read_file{description:<|\"|>Read a text file<|\"|>,parameters:{properties:{offset:{description:<|\"|>First line<|\"|>,type:<|\"|>INTEGER<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\n東京の天気は？<turn|>\n<|turn>model\n<|tool_call>call:web_search{query:<|\"|>東京 天気<|\"|>}<tool_call|><|tool_response>response:web_search{value:<|\"|>晴れ、25度<|\"|>}<tool_response|><|channel>thought\n"
+  },
+  {
+   "name": "after_tool_answer",
+   "messages": [
+    {
+     "role": "user",
+     "content": "東京の天気は？"
+    },
+    {
+     "role": "assistant",
+     "content": "調べます。",
+     "tool_calls": [
+      {
+       "id": "call00001",
+       "type": "function",
+       "function": {
+        "name": "web_search",
+        "arguments": {
+         "query": "東京 天気"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "晴れ、25度",
+     "name": "web_search",
+     "tool_call_id": "call00001"
+    },
+    {
+     "role": "assistant",
+     "content": "東京は晴れで 25 度です。"
+    },
+    {
+     "role": "user",
+     "content": "ありがとう"
+    }
+   ],
+   "tools": true,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\n<|tool>declaration:web_search{description:<|\"|>ウェブを検索する<|\"|>,parameters:{properties:{query:{description:<|\"|>検索する言葉<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:read_file{description:<|\"|>Read a text file<|\"|>,parameters:{properties:{offset:{description:<|\"|>First line<|\"|>,type:<|\"|>INTEGER<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\n東京の天気は？<turn|>\n<|turn>model\n<|tool_call>call:web_search{query:<|\"|>東京 天気<|\"|>}<tool_call|><|tool_response>response:web_search{value:<|\"|>晴れ、25度<|\"|>}<tool_response|>調べます。東京は晴れで 25 度です。<turn|>\n<|turn>user\nありがとう<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "mixed_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "読んで"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call00002",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": {
+         "path": "a \"b\" {c}, d.txt",
+         "offset": 3,
+         "all": true,
+         "tags": [
+          "x",
+          "y"
+         ],
+         "range": {
+          "from": 1,
+          "to": 2
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "line1\nline2",
+     "name": "read_file",
+     "tool_call_id": "call00002"
+    }
+   ],
+   "tools": true,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\n<|tool>declaration:web_search{description:<|\"|>ウェブを検索する<|\"|>,parameters:{properties:{query:{description:<|\"|>検索する言葉<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:read_file{description:<|\"|>Read a text file<|\"|>,parameters:{properties:{offset:{description:<|\"|>First line<|\"|>,type:<|\"|>INTEGER<|\"|>},path:{description:<|\"|>File path<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>path<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\n読んで<turn|>\n<|turn>model\n<|tool_call>call:read_file{all:true,offset:3,path:<|\"|>a \"b\" {c}, d.txt<|\"|>,range:{from:1,to:2},tags:[<|\"|>x<|\"|>,<|\"|>y<|\"|>]}<tool_call|><|tool_response>response:read_file{value:<|\"|>line1\nline2<|\"|>}<tool_response|>"
+  },
+  {
+   "name": "thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2は？"
+    }
+   ],
+   "tools": false,
+   "enableThinking": true,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n2+2は？<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "thinking_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2は？"
+    }
+   ],
+   "tools": false,
+   "enableThinking": false,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>user\n2+2は？<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "history_thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2は？"
+    },
+    {
+     "role": "assistant",
+     "content": "<|channel>thought\n2 と 2 を足す<channel|>4 です。"
+    },
+    {
+     "role": "user",
+     "content": "では 3+3 は？"
+    }
+   ],
+   "tools": false,
+   "enableThinking": null,
+   "addGenerationPrompt": true,
+   "output": "<bos><|turn>user\n2+2は？<turn|>\n<|turn>model\n4 です。<turn|>\n<|turn>user\nでは 3+3 は？<turn|>\n<|turn>model\n"
+  },
+  {
+   "name": "no_generation_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q"
+    },
+    {
+     "role": "assistant",
+     "content": "A"
+    }
+   ],
+   "tools": false,
+   "enableThinking": null,
+   "addGenerationPrompt": false,
+   "output": "<bos><|turn>user\nQ<turn|>\n<|turn>model\nA<turn|>\n"
+  }
+ ]
+}

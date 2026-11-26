@@ -99,6 +99,7 @@ struct ToolCall: Codable, Hashable, Sendable, Identifiable {
 /// - Mistral: `[TOOL_CALLS] [{"name": …, "arguments": {…}}]`
 /// - Llama 3.1 の別形式: `<function=名前>{…}</function>`
 /// - コードブロック: ```json {"name": …, "arguments": …} ```
+/// - Gemma 4: `<|tool_call>call:名前{キー:<|"|>値<|"|>}<tool_call|>`（Gemma4ToolSyntax）
 enum ToolCallParser {
     struct Result: Equatable {
         /// 呼び出し以外の本文
@@ -106,12 +107,26 @@ enum ToolCallParser {
         var calls: [ToolCall]
     }
 
-    static let markers = ["<tool_call>", "<function=", "<|python_tag|>", "[TOOL_CALLS]"]
+    static let markers = ["<tool_call>", "<function=", "<|python_tag|>", "[TOOL_CALLS]", Gemma4ToolSyntax.open]
 
     /// knownTools にある名前の呼び出しだけを取り出す（関係ない JSON を誤って呼び出しにしないため）。
     static func parse(_ text: String, knownTools: Set<String>) -> Result {
         var content = text
         var calls: [ToolCall] = []
+
+        // 0. Gemma 4: <|tool_call>call:名前{…}<tool_call|>
+        while let open = content.range(of: Gemma4ToolSyntax.open) {
+            let after = content[open.upperBound...]
+            let close = after.range(of: Gemma4ToolSyntax.close)
+            let inner = String(close.map { after[..<$0.lowerBound] } ?? after)
+            if let call = Gemma4ToolSyntax.call(in: inner, knownTools: knownTools) {
+                calls.append(call)
+            } else {
+                // JSON で書いてしまったとき
+                calls.append(contentsOf: interpret(inner, knownTools: knownTools))
+            }
+            content.removeSubrange(open.lowerBound..<(close?.upperBound ?? content.endIndex))
+        }
 
         // 1. <tool_call> … </tool_call>
         while let open = content.range(of: "<tool_call>") {
@@ -220,6 +235,8 @@ enum ToolCallParser {
     private static func tidy(_ text: String) -> String {
         text.replacingOccurrences(of: "<|python_tag|>", with: "")
             .replacingOccurrences(of: "[TOOL_CALLS]", with: "")
+            .replacingOccurrences(of: Gemma4ToolSyntax.responseMarker, with: "")
+            .replacingOccurrences(of: Gemma4ToolSyntax.close, with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

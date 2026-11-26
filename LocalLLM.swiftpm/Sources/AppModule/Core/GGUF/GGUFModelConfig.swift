@@ -13,6 +13,8 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         case phi2, gpt2, starcoder, starcoder2, stablelm, gptneox, falcon, codeshell, orion, nemotron, jais2
         case commandR = "command-r", cohere2, chatglm, glm4, lfm2, qwen35
         case qwen2moe, qwen3moe, olmoe, granitemoe
+        /// Gemma 4 の MTP（先読み）用の小さなモデル。本体の隠れ状態と KV キャッシュを使う
+        case gemma4Assistant = "gemma4-assistant"
     }
 
     enum Activation: String, Codable, Sendable { case silu, gelu, reluSquared }
@@ -191,6 +193,8 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
     var logitScale: Float
     /// 層ごとの入力埋め込みの大きさ（0 なら無い。Gemma 4 の E2B / E4B）
     var perLayerInputSize: Int
+    /// 先読み用のモデル（gemma4-assistant）なら、本体の隠れ状態の大きさ（それ以外は 0）
+    var drafterOutputSize = 0
     /// 直近だけを見る層の RoPE の次元数
     var slidingRopeDimensions: Int
     /// rope_freqs（周波数の割り算）を、直近だけを見る層にも使うか（Gemma 4 は全体を見る層だけ）
@@ -290,7 +294,7 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         case layerShapes, norm, feedForward, parallelResidual, hasPreNorms, qkNormIsFull, hasValueNorm
         case learnedPositions, residualScale, logitScale, perLayerInputSize, slidingRopeDimensions
         case ropeFactorsOnSlidingLayers, slidingRopeScale, qkNormAfterRope, convolutionLength, yarn
-        case deltaNet, attentionOutputGate, moe
+        case deltaNet, attentionOutputGate, moe, drafterOutputSize
     }
 
     init(from decoder: Decoder) throws {
@@ -345,5 +349,6 @@ struct GGUFModelConfig: Codable, Equatable, Sendable {
         deltaNet = try c.decodeIfPresent(DeltaNet.self, forKey: .deltaNet)
         attentionOutputGate = try c.decodeIfPresent(Bool.self, forKey: .attentionOutputGate) ?? false
         moe = try c.decodeIfPresent(MoE.self, forKey: .moe)
+        drafterOutputSize = try c.decodeIfPresent(Int.self, forKey: .drafterOutputSize) ?? 0
     }
 }

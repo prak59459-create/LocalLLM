@@ -12,10 +12,10 @@ final class GGUFMetalTests: XCTestCase {
         }
     }
 
-    private func convert(_ family: String, compact: Bool) throws -> URL {
+    private func convert(_ family: String, compact: Bool, groups: GGUFMatrix.Storage? = nil) throws -> URL {
         let source = GGUFFixtures.root.appendingPathComponent("tiny-\(family).gguf")
         let destination = GGUFFixtures.temporaryFile("metal-\(family).llw")
-        try GGUFConverter.convert(gguf: source, to: destination, compact: compact)
+        try GGUFConverter.convert(gguf: source, to: destination, compact: compact, groups: groups)
         return destination
     }
 
@@ -96,6 +96,51 @@ final class GGUFMetalTests: XCTestCase {
         }
     }
 
+    /// 4・5 ビットの重みでも、GPU と CPU の計算は同じ結果になる（1 トークンずつ・まとめて・8 個を超えるまとめ。
+    /// FFN の gate と up をまとめた計算、正規化と足し算・q k の正規化と RoPE をまとめた計算も通る）
+    func testGroupedWeightsMatchCPU() throws {
+        try requireDevice()
+        var failures: [String] = []
+        let families = (GGUFModelTests.families + GGUFModelTests.moreFamilies).filter { !Self.cpuOnlyFamilies.contains($0) }
+        for storage in [GGUFMatrix.Storage.q4Groups, .q5Groups] {
+            for family in families {
+                let file = try convert(family, compact: true, groups: storage)
+                defer { try? FileManager.default.removeItem(at: file) }
+                let store = try GGUFWeightStore(url: file)
+                let gpu = try GGUFMetalModel(store: store)
+                let cpu = try GGUFModel(store: store)
+                let tokens = try reference(family).tokens
+                var worst: Float = 0
+                for token in tokens.prefix(6) {
+                    worst = max(worst, GGUFModelFactory.relativeDifference(try gpu.evaluate([token]), try cpu.evaluate([token])))
+                }
+                // 8 個を超えるまとめ（まとめての計算は 8 トークンずつ）
+                let rest = Array(tokens.dropFirst(6))
+                let batched = GGUFModelFactory.relativeDifference(try gpu.evaluate(rest, batch: 64), try cpu.evaluate(rest, batch: 64))
+                if worst > 0.002 || batched > 0.002 { failures.append("\(family) \(storage): \(worst) / \(batched)") }
+            }
+        }
+        XCTAssertEqual(failures, [])
+    }
+
+    /// 1 回の計算の、部分ごとの GPU の時間が測れる（速さを調べる用）
+    func testProfileReportsSections() throws {
+        try requireDevice()
+        let file = try convert("gemma4", compact: true, groups: .q4Groups)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let gpu = try GGUFMetalModel(store: try GGUFWeightStore(url: file))
+        let tokens = try reference("gemma4").tokens
+        let expected = try gpu.evaluate(Array(tokens.prefix(4)))
+        gpu.truncate(to: 3)
+        let sections = try gpu.profile([tokens[3]])
+        XCTAssertTrue(["per-layer inputs", "attention", "feed-forward", "per-layer input", "output"].allSatisfy { sections[$0] != nil },
+                      "\(sections.keys.sorted())")
+        // 測ったあとも、同じ結果が続く
+        gpu.truncate(to: 3)
+        XCTAssertLessThan(GGUFModelFactory.relativeDifference(try gpu.evaluate([tokens[3]]), expected), 1e-4)
+        XCTAssertGreaterThan(gpu.lastGPUSeconds, 0)
+    }
+
     /// ほかの構造も、GPU と CPU で同じ logits になる（CPU は llama.cpp と一致することを GGUFModelTests で確かめている）
     /// GPU ではまだ計算しない構造
     static let cpuOnlyFamilies: Set<String> = ["qwen35", "qwen3moe", "qwen2moe", "olmoe", "granitemoe"]
@@ -160,7 +205,8 @@ final class GGUFMetalTests: XCTestCase {
     func testRealModelsOnTheGPU() throws {
         try requireDevice()
         guard let directory = GGUFFixtures.realModels else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
-        let names = ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0", "qwen2.5-0.5b-q4_k_m", "qwen2.5-1.5b-q4_k_m"]
+        // Gemma 4 E2B は大きいので、速さを測る専用の流れ（.github/workflows/bench.yml）だけで取ってくる
+        let names = ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0", "qwen2.5-0.5b-q4_k_m", "qwen2.5-1.5b-q4_k_m", "gemma-4-e2b-q4_0"]
         var checked = 0
         defer { print("GGUF Metal real models checked: \(checked)") }
         for name in names {
@@ -224,6 +270,29 @@ final class GGUFMetalTests: XCTestCase {
         XCTAssertTrue(logits.allSatisfy(\.isFinite), name)
         print(String(format: "SPEED-GPU %@: decode %.1f tok/s (after %d tokens: %.1f), prefill %.1f tok/s | CPU decode %.1f, prefill %.1f",
                      name, shortDecode, gpu.length, longDecode, prefill, cpuDecode, cpuPrefill))
+        try profile(name, gpu: gpu, store: store)
+    }
+
+    /// 1 トークンにかかる時間（全体・GPU が動いていた時間）と、GPU の時間の内訳
+    private func profile(_ name: String, gpu: GGUFMetalModel, store: GGUFWeightStore) throws {
+        gpu.truncate(to: 64)
+        var gpuSeconds = 0.0
+        let started = Date()
+        for index in 0..<16 {
+            _ = try gpu.evaluate([300 + index])
+            gpuSeconds += gpu.lastGPUSeconds
+        }
+        let wall = Date().timeIntervalSince(started) / 16
+        let megabytes = Double(store.header.dataBytes) / 1_048_576
+        print(String(format: "TIME-GPU %@: %.2f ms per token (GPU %.2f ms), weights file %.0f MB", name, wall * 1000,
+                     gpuSeconds / 16 * 1000, megabytes))
+        var sections: [String: Double] = [:]
+        for index in 0..<4 {
+            for (section, seconds) in try gpu.profile([400 + index]) { sections[section, default: 0] += seconds / 4 }
+        }
+        let parts = sections.sorted { $0.value > $1.value }.map { String(format: "%@ %.2f ms", $0.key, $0.value * 1000) }
+        print("PROFILE-GPU \(name): " + parts.joined(separator: ", ")
+              + String(format: " | total %.2f ms", sections.values.reduce(0, +) * 1000))
     }
 }
 #endif

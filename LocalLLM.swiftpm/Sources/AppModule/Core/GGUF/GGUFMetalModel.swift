@@ -247,10 +247,17 @@ final class GGUFMetalModel: GGUFEvaluator {
     // MARK: - 用意
 
     private func makePipelines() throws {
-        // simdgroup の行列の計算（まとめての線形層）は Apple7 以降の GPU だけ。コンパイルできなければ使わない
+        // simdgroup の行列の計算（まとめての線形層）は Apple7 以降と Mac2 の GPU だけ。コンパイルできなければ使わない
         var library: MTLLibrary?
-        if device.supportsFamily(.apple7) {
-            library = try? device.makeLibrary(source: GGUFMetalSource.code + GGUFMetalSource.matrixCode, options: nil)
+        if Self.supportsMatrices(device) {
+            do {
+                library = try device.makeLibrary(source: GGUFMetalSource.code + GGUFMetalSource.matrixCode, options: nil)
+                matrixNote = "compiled"
+            } catch {
+                matrixNote = "compile failed: \(error.localizedDescription)"
+            }
+        } else {
+            matrixNote = "GPU family without simdgroup matrices"
         }
         let withMatrices = library != nil
         if library == nil {
@@ -676,6 +683,14 @@ final class GGUFMetalModel: GGUFEvaluator {
                                  .gateUpQ4, .gateUpQ5, .linearQ8Rows, .linearQ8Tokens]
         return kernels.allSatisfy { pipelines[$0]?.threadExecutionWidth == 32 }
     }
+
+    /// simdgroup の行列の計算が使える GPU か（iPad・iPhone は A14 以降、Mac は Apple silicon の Mac2）
+    static func supportsMatrices(_ device: MTLDevice) -> Bool {
+        device.supportsFamily(.apple7) || device.supportsFamily(.mac2)
+    }
+
+    /// 行列の計算を用意したときのようす（調べる用）
+    private(set) var matrixNote = ""
 
     /// まとめての線形層を、simdgroup の行列の掛け算で計算できるか（Apple7 以降の GPU）
     var usesMatrixKernels: Bool {

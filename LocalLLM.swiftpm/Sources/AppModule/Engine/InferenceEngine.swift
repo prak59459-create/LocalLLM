@@ -320,6 +320,27 @@ actor InferenceEngine {
                     var scores = firstScores
                     let decodeStart = Date()
                     defer { decodeSeconds += Date().timeIntervalSince(decodeStart) }
+                    /// 選んだトークンを出力に足す（止めるときは false）
+                    func take(_ token: Int) -> Bool {
+                        if stopTokenIDs.contains(token) { reason = .endOfTurn; return false }
+                        history.append(token)
+                        generated.append(token)
+                        stats.generatedTokens = generated.count
+                        let piece = detokenizer.append(token)
+                        if !piece.isEmpty {
+                            let (emit, stopped) = stopMatcher.feed(piece)
+                            if !emit.isEmpty { continuation.yield(.text(emit)) }
+                            if stopped {
+                                reason = .endOfTurn
+                                stoppedByString = true
+                                return false
+                            }
+                        }
+                        if history.count >= limit { reason = .contextFull; return false }
+                        if generated.count >= parameters.maxNewTokens { reason = .maxTokens; return false }
+                        return true
+                    }
+                    let speculative = model as? SpeculativeRunner
                     generation: while generated.count < parameters.maxNewTokens {
                         if Task.isCancelled { reason = .cancelled; break }
                         let next: Int
@@ -327,31 +348,41 @@ actor InferenceEngine {
                         case .logits(var logits):
                             next = sampler.sample(logits: &logits, previousTokens: history)
                         case .token(let token):
-                            // 出力層が選んだトークン（温度などは効かない形式）
+                            // 出力層が選んだトークン（温度などは効かない形式）か、先読みを確かめたときに選んだもの
                             next = token
                         }
-                        if stopTokenIDs.contains(next) { reason = .endOfTurn; break }
-                        history.append(next)
-                        generated.append(next)
-                        stats.generatedTokens = generated.count
-
-                        let piece = detokenizer.append(next)
-                        if !piece.isEmpty {
-                            let (emit, stopped) = stopMatcher.feed(piece)
-                            if !emit.isEmpty { continuation.yield(.text(emit)) }
-                            if stopped {
-                                reason = .endOfTurn
-                                stoppedByString = true
-                                break generation
-                            }
-                        }
-                        if history.count >= limit { reason = .contextFull; break }
-                        if generated.count >= parameters.maxNewTokens { reason = .maxTokens; break }
+                        guard take(next) else { break }
                         progress.done = history.count
                         do {
                             // 落ちる前に止める（毎トークン、残りのメモリと減り方を確かめる）
                             try gate.check()
-                            scores = try await model.append(token: next)
+                            guard let speculative, speculative.speculates else {
+                                scores = try await model.append(token: next)
+                                continue
+                            }
+                            // 先読み: 予想を本体がまとめて確かめる。位置ごとに本体の logits から選び、予想と同じなら続ける
+                            // （選び方はふだんと同じなので、出てくる文章の確率は変わらない）
+                            let proposal = try await speculative.propose(after: next)
+                            stats.draftedTokens = (stats.draftedTokens ?? 0) + proposal.drafts.count
+                            var accepted = 0
+                            var decided: Int?
+                            while decided == nil {
+                                var logits = try await proposal.logits(accepted)
+                                let token = sampler.sample(logits: &logits, previousTokens: history)
+                                guard accepted < proposal.drafts.count, token == proposal.drafts[accepted] else {
+                                    decided = token
+                                    break
+                                }
+                                accepted += 1
+                                stats.acceptedDrafts = (stats.acceptedDrafts ?? 0) + 1
+                                guard take(token) else {
+                                    try await speculative.commit(accepted: accepted)
+                                    break generation
+                                }
+                            }
+                            try await speculative.commit(accepted: accepted)
+                            progress.done = history.count
+                            scores = .token(decided ?? 0)
                         } catch is CancellationError {
                             reason = .cancelled
                             break

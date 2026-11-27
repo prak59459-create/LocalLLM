@@ -7,15 +7,15 @@ on:
   push:
     branches: ['claude/**']
 
-concurrency:
-  group: bench-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   gemma4-gpu:
     name: Gemma 4 E2B on the GPU
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[bench]')
     runs-on: macos-15
+    # [bench] の無いプッシュで、測っている途中のものを止めないように（ジョブが動くときだけ並びを作る）
+    concurrency:
+      group: bench-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +36,8 @@ jobs:
       - name: GPU tests and benchmark
         env:
           LOCALLLM_GGUF_MODELS: ${{ runner.temp }}/gguf
-        run: swift test --filter "GGUFMetal" 2>&1 | tee bench.log
+        # 速さを測るので最適化して作る（@testable import のため -enable-testing）
+        run: swift test -c release -Xswiftc -enable-testing --filter "GGUFMetal" 2>&1 | tee bench.log
 
       - name: Summary
         if: always()

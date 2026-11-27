@@ -8,6 +8,64 @@ struct GGUFModelFiles: Sendable {
     var context: Int
     /// 重みのメモリへの置き方
     var memory = GGUFMemoryOptions()
+    /// 先読み（MTP）用のモデルを変換したファイル（あるときだけ）
+    var drafter: URL? = nil
+    /// 先読みで 1 回に予想するトークンの数の上限（0 なら使わない。当たり方を見て、この中で増やしたり減らしたりする）
+    var drafts = 0
+
+    static let draftsKey = "gguf.mtpDrafts"
+    static let defaultDrafts = 3
+
+    /// 保存してある「先読みの数」（無ければ既定）
+    static var storedDrafts: Int {
+        guard let value = UserDefaults.standard.object(forKey: draftsKey) as? Int else { return defaultDrafts }
+        return max(0, min(value, 4))
+    }
+}
+
+/// 先読みの数を、当たり方から決める。位置ごとの当たる割合（直前まで当たったときの）を覚えておき、
+/// 「1 回の往復で進めるトークンの数 ÷ その手間」がいちばん大きくなる数を選ぶ
+struct DraftPlanner {
+    /// 予想 1 つの手間（本体の 1 回を 1 とする。先読みは小さく、まとめての確かめも重みを読むのは 1 回）
+    static let draftCost = 0.08
+    static let verifyCost = 0.04
+
+    let maximum: Int
+    /// i 番目の予想が当たる割合（i − 1 番目まで当たったとき）
+    private(set) var rates: [Double]
+
+    init(maximum: Int) {
+        self.maximum = max(0, maximum)
+        rates = Array(repeating: 0.5, count: self.maximum)
+    }
+
+    /// 今使う予想の数
+    var count: Int {
+        guard maximum > 0 else { return 0 }
+        var best = 0
+        var bestValue = 1.0
+        var expected = 1.0, chance = 1.0
+        for k in 1...maximum {
+            chance *= rates[k - 1]
+            expected += chance
+            let value = expected / (1 + Double(k) * (Self.draftCost + Self.verifyCost))
+            if value > bestValue {
+                bestValue = value
+                best = k
+            }
+        }
+        // 当たらなくなっても、ときどきは 1 つ予想して割合を確かめ直す
+        return max(best, 1)
+    }
+
+    /// drafted 個予想して、accepted 個当たった
+    mutating func record(drafted: Int, accepted: Int) {
+        for index in 0..<min(drafted, maximum) {
+            guard index <= accepted else { break }
+            let hit: Double = index < accepted ? 1 : 0
+            rates[index] = rates[index] * 0.8 + hit * 0.2
+        }
+    }
 }
 
 /// 途中で止めるための旗（計算は専用のスレッドで動くので、Task の取り消しを自分で伝える）
@@ -32,7 +90,7 @@ private final class CancellationFlag: @unchecked Sendable {
 ///
 /// GPU（Metal）で計算できるときは GPU、できないときは CPU（Accelerate）で計算する。
 /// GPU の計算が途中で失敗したとき（アプリが裏に回った など）は、その回は CPU で計算し直す。
-final class GGUFLanguageModel: LanguageModelRunner {
+final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
     private var model: any GGUFEvaluator
     /// GPU 用のモデル（GPU を使わないときは nil）
     private let metal: (any GGUFEvaluator)?
@@ -52,13 +110,22 @@ final class GGUFLanguageModel: LanguageModelRunner {
         metal = isMetal ? model : nil
         self.files = files
         self.note = note
+        planner = DraftPlanner(maximum: files.drafts)
     }
+
+    /// 先読み: 予想の数の決め方と、確かめているトークン（[最後に選んだもの, 予想 …]）
+    private var planner: DraftPlanner
+    private var proposed: [Int] = []
+    private var proposedDrafts = 0
+    /// 先読みで予想した数と当たった数（画面に出す）
+    private(set) var draftedTotal = 0
+    private(set) var acceptedTotal = 0
 
     static func load(files: GGUFModelFiles, useGPU: Bool = true) async throws -> GGUFLanguageModel {
         let available = DeviceMemory.availableBytes
         let made = try await InferenceQueue.run {
             try GGUFModelFactory.make(store: files.store, context: files.context, useGPU: useGPU, memory: files.memory,
-                                      availableBytes: available)
+                                      availableBytes: available, drafter: files.drafts > 0 ? files.drafter : nil)
         }
         return GGUFLanguageModel(model: made.model, isMetal: made.isMetal, files: files, note: made.note)
     }
@@ -75,6 +142,59 @@ final class GGUFLanguageModel: LanguageModelRunner {
     var computeDescription: String {
         guard let note else { return model.computeDescription }
         return model.computeDescription + "（" + note + "）"
+    }
+
+    // MARK: - 先読み（MTP）
+
+    var speculates: Bool {
+        planner.maximum > 0 && (model as? GGUFSpeculativeEvaluator)?.canDraft == true
+    }
+
+    func propose(after token: Int) async throws -> SpeculativeProposal {
+        guard cachedTokens.count < maxContext else { throw EngineError.contextOverflow(cachedTokens.count + 1, maxContext) }
+        guard let target = model as? GGUFSpeculativeEvaluator, target.canDraft else {
+            let scores = try await append(token: token)
+            return SpeculativeProposal(drafts: []) { _ in
+                if case .logits(let logits) = scores { return logits }
+                return []
+            }
+        }
+        // 予想の数（当たり方と、コンテキストの残りから）
+        let room = max(0, maxContext - cachedTokens.count - 1)
+        let count = min(planner.count, room)
+        do {
+            let drafts = try await InferenceQueue.run { () throws -> [Int] in
+                let drafts = try target.draft(after: token, hidden: target.lastHidden, count: count)
+                try target.verify([token] + drafts)
+                return drafts
+            }
+            proposed = [token] + drafts
+            proposedDrafts = drafts.count
+            return SpeculativeProposal(drafts: drafts) { index in
+                try await InferenceQueue.run { target.verifiedLogits(index) }
+            }
+        } catch let error as GGUFMetalError {
+            // GPU が使えなくなった: ここまでの系列ごと CPU で計算し直して、予想はやめる
+            proposed = []
+            let tokens = cachedTokens + [token]
+            try await switchToCPU(error)
+            let scores = try await read(tokens, chunkSize: GGUFModel.maxBatch, progress: nil).scores
+            return SpeculativeProposal(drafts: []) { _ in
+                if case .logits(let logits) = scores { return logits }
+                return []
+            }
+        }
+    }
+
+    func commit(accepted: Int) async throws {
+        guard !proposed.isEmpty, let target = model as? GGUFSpeculativeEvaluator else { return }
+        let kept = min(accepted, proposedDrafts)
+        try await InferenceQueue.run { target.accept(kept) }
+        cachedTokens.append(contentsOf: proposed.prefix(kept + 1))
+        planner.record(drafted: proposedDrafts, accepted: kept)
+        draftedTotal += proposedDrafts
+        acceptedTotal += kept
+        proposed = []
     }
 
     func resetCache() {

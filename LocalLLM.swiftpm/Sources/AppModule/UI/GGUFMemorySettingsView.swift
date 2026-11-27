@@ -51,6 +51,7 @@ struct GGUFMemorySettingsView: View {
 
     var body: some View {
         Form {
+            SpeculationSection()
             ResidencySection()
             MixtureSection()
             DenseSection()
@@ -63,6 +64,25 @@ struct GGUFMemorySettingsView: View {
             }
         }
         .navigationTitle(L("GGUF のメモリ", "GGUF memory"))
+    }
+}
+
+private struct SpeculationSection: View {
+    @Environment(AppSettings.self) private var settings
+
+    var body: some View {
+        @Bindable var settings = settings
+        Section {
+            Picker(L("1 回に予想するトークン", "Tokens drafted per step"), selection: $settings.ggufDrafts) {
+                Text(L("使わない", "Off")).tag(0)
+                ForEach(1...4, id: \.self) { count in Text(L("最大 \(count)", "Up to \(count)")).tag(count) }
+            }
+        } header: {
+            Text(L("先読み（MTP）", "Multi-token prediction (MTP)"))
+        } footer: {
+            Text(L("Gemma 4 などに付いている小さな先読み用のモデルが続きのトークンを予想し、本体がまとめて確かめます。当たった分だけ速くなり、答えの内容は変わりません。予想の数は、当たり方を見て自動で増やしたり減らしたりします。GPU で計算するときに使います（モデルといっしょにダウンロードされます）。",
+                   "A small draft model shipped with Gemma 4 and others predicts the next tokens and the main model checks them in one pass. Correct guesses make it faster; the answers do not change. The number of drafts adapts to how often they are right. Used when computing on the GPU (downloaded with the model)."))
+        }
     }
 }
 

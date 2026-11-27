@@ -16,6 +16,10 @@ enum GGUFMetalSource {
         case linearF32 = "linear_f32"
         case linearF32Batch = "linear_f32_batch"
         case linearQ8Vector = "linear_q8_vector"
+        case linearQ8Rows = "linear_q8_rows"
+        case linearQ8Tokens = "linear_q8_tokens"
+        case argmax = "argmax"
+        case embeddingRow = "embedding_row"
         case linearF32Vector = "linear_f32_vector"
         case linearQ4Vector = "linear_q4_vector"
         case linearQ5Vector = "linear_q5_vector"
@@ -62,6 +66,8 @@ enum GGUFMetalSource {
 
     /// 線形層の SIMD グループ 1 つが受け持つ行（1 トークン・まとめて）と、threadgroup の SIMD グループの数
     static let vectorRows = 4
+    /// 8 ビットの線形層（1 トークン）の、SIMD グループ 1 つが受け持つ行
+    static let q8Rows = 4
     static let batchRows = 2
     static let gateUpRows = 2
     static let simdGroups = 2
@@ -99,6 +105,7 @@ enum GGUFMetalSource {
     };
 
     #define VECTOR_ROWS 4u
+    #define Q8_ROWS 4u
     #define BATCH_ROWS 2u
     #define GATE_UP_ROWS 2u
     #define SIMD_GROUPS 2u
@@ -316,6 +323,180 @@ enum GGUFMetalSource {
                                   uint row [[threadgroup_position_in_grid]],
                                   uint lane [[thread_index_in_simdgroup]]) {
         linear_vector((device const packed_float4 *)(weights + a.weightSkip), scales, bias, input, output, aux, a, row, lane);
+    }
+
+    // 8 ビットの重み（行ごとの倍率）を 16 個ずつ（16 バイト）読む。列は 16 の倍数、行の先頭は 16 バイトの境目にあること
+    inline float dot16(uint4 w, float4 x0, float4 x1, float4 x2, float4 x3) {
+        return dot(float4(as_type<char4>(w.x)), x0) + dot(float4(as_type<char4>(w.y)), x1)
+             + dot(float4(as_type<char4>(w.z)), x2) + dot(float4(as_type<char4>(w.w)), x3);
+    }
+
+    // 1 トークン: SIMD グループ 1 つで Q8_ROWS 行。スレッドは 16 個ずつを受け持ち、入力は 1 回読んで何行にも使う
+    kernel void linear_q8_rows(device const char *weights [[buffer(0)]],
+                               device const float *scales [[buffer(1)]],
+                               device const float *bias [[buffer(2)]],
+                               device const float *input [[buffer(3)]],
+                               device float *output [[buffer(4)]],
+                               device const float *aux [[buffer(6)]],
+                               constant Args &a [[buffer(7)]],
+                               uint group [[threadgroup_position_in_grid]],
+                               uint simd [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+        uint first = (group * SIMD_GROUPS + simd) * Q8_ROWS;
+        if (first >= a.rows) { return; }
+        uint rows = min(Q8_ROWS, a.rows - first);
+        uint chunks = a.columns >> 4u;
+        device const uint4 *w = (device const uint4 *)(weights + a.weightSkip) + first * chunks;
+        device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
+        float acc[Q8_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint c = lane; c < chunks; c += 32u) {
+            float4 x0 = float4(x[c * 4u]);
+            float4 x1 = float4(x[c * 4u + 1u]);
+            float4 x2 = float4(x[c * 4u + 2u]);
+            float4 x3 = float4(x[c * 4u + 3u]);
+            for (uint r = 0u; r < Q8_ROWS; r++) {
+                if (r < rows) { acc[r] += dot16(w[r * chunks + c], x0, x1, x2, x3); }
+            }
+        }
+        for (uint r = 0u; r < Q8_ROWS; r++) {
+            if (r < rows) {
+                float sum = simd_sum(acc[r]);
+                if (lane == 0u) {
+                    if ((a.flags & 1u) != 0u) { sum *= scales[first + r]; }
+                    linear_store(output, bias, aux, a, first + r, 0u, sum);
+                }
+            }
+        }
+    }
+
+    // まとめて（トークン BATCH_TOKENS 個まで。先読みの確かめなど）: SIMD グループ 1 つで BATCH_ROWS 行。
+    // 重みは 1 回読んで、全部のトークンに使う。threadgroup の y = トークン ÷ BATCH_TOKENS
+    kernel void linear_q8_tokens(device const char *weights [[buffer(0)]],
+                                 device const float *scales [[buffer(1)]],
+                                 device const float *bias [[buffer(2)]],
+                                 device const float *input [[buffer(3)]],
+                                 device float *output [[buffer(4)]],
+                                 device const float *aux [[buffer(6)]],
+                                 constant Args &a [[buffer(7)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint simd [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        uint first = (group.x * SIMD_GROUPS + simd) * BATCH_ROWS;
+        uint t0 = group.y * BATCH_TOKENS;
+        if (first >= a.rows || t0 >= a.count) { return; }
+        uint rows = min(BATCH_ROWS, a.rows - first);
+        uint tokens = min(BATCH_TOKENS, a.count - t0);
+        uint chunks = a.columns >> 4u;
+        device const uint4 *w = (device const uint4 *)(weights + a.weightSkip) + first * chunks;
+        device const float *base = input + a.inOffset + t0 * a.inStride;
+        float acc[BATCH_ROWS][BATCH_TOKENS];
+        for (uint r = 0u; r < BATCH_ROWS; r++) {
+            for (uint t = 0u; t < BATCH_TOKENS; t++) { acc[r][t] = 0.0f; }
+        }
+        for (uint c = lane; c < chunks; c += 32u) {
+            float4 w0[BATCH_ROWS];
+            float4 w1[BATCH_ROWS];
+            float4 w2[BATCH_ROWS];
+            float4 w3[BATCH_ROWS];
+            for (uint r = 0u; r < BATCH_ROWS; r++) {
+                uint4 q = (r < rows) ? w[r * chunks + c] : uint4(0u);
+                w0[r] = float4(as_type<char4>(q.x));
+                w1[r] = float4(as_type<char4>(q.y));
+                w2[r] = float4(as_type<char4>(q.z));
+                w3[r] = float4(as_type<char4>(q.w));
+            }
+            for (uint t = 0u; t < BATCH_TOKENS; t++) {
+                if (t < tokens) {
+                    device const packed_float4 *x = (device const packed_float4 *)(base + t * a.inStride) + c * 4u;
+                    float4 x0 = float4(x[0]);
+                    float4 x1 = float4(x[1]);
+                    float4 x2 = float4(x[2]);
+                    float4 x3 = float4(x[3]);
+                    for (uint r = 0u; r < BATCH_ROWS; r++) {
+                        acc[r][t] += dot(w0[r], x0) + dot(w1[r], x1) + dot(w2[r], x2) + dot(w3[r], x3);
+                    }
+                }
+            }
+        }
+        for (uint r = 0u; r < BATCH_ROWS; r++) {
+            if (r < rows) {
+                float scale = ((a.flags & 1u) != 0u) ? scales[first + r] : 1.0f;
+                for (uint t = 0u; t < BATCH_TOKENS; t++) {
+                    if (t < tokens) {
+                        float sum = simd_sum(acc[r][t]);
+                        if (lane == 0u) { linear_store(output, bias, aux, a, first + r, t0 + t, sum * scale); }
+                    }
+                }
+            }
+        }
+    }
+
+    // いちばん大きい値の位置（同じ値なら前のもの）を result[outOffset] に書く。threadgroup 1 つで values[inOffset …] の count 個を見る
+    kernel void argmax(device const float *values [[buffer(0)]],
+                       device uint *result [[buffer(1)]],
+                       constant Args &a [[buffer(2)]],
+                       uint tid [[thread_position_in_threadgroup]],
+                       uint threads [[threads_per_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint simd [[simdgroup_index_in_threadgroup]],
+                       uint simds [[simdgroups_per_threadgroup]]) {
+        threadgroup float bestValues[32];
+        threadgroup uint bestIndices[32];
+        device const float *v = values + a.inOffset;
+        float best = -3.0e38f;
+        uint index = 0xFFFFFFFFu;
+        for (uint i = tid; i < a.count; i += threads) {
+            float x = v[i];
+            if (x > best) {
+                best = x;
+                index = i;
+            }
+        }
+        float top = simd_max(best);
+        uint first = simd_min(best == top ? index : 0xFFFFFFFFu);
+        if (lane == 0u) {
+            bestValues[simd] = top;
+            bestIndices[simd] = first;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            float value = lane < simds ? bestValues[lane] : -3.0e38f;
+            uint position = lane < simds ? bestIndices[lane] : 0xFFFFFFFFu;
+            float overall = simd_max(value);
+            uint chosen = simd_min(value == overall ? position : 0xFFFFFFFFu);
+            if (lane == 0u) { result[a.outOffset] = chosen == 0xFFFFFFFFu ? 0u : chosen; }
+        }
+    }
+
+    // 埋め込みの表の 1 行 × scale を output[outOffset …] に書く。行の番号は GPU の tokens[start] から読む（先読みで使う）。
+    // size: 32 = Float32、8 = 8 ビット（flags の 1 があれば行ごとの倍率 scales）、4・5 = 組（scales は倍率と下限、high は 5 ビット目）
+    kernel void embedding_row(device const char *weights [[buffer(0)]],
+                              device const float *scales [[buffer(1)]],
+                              device const uint *tokens [[buffer(2)]],
+                              device float *output [[buffer(3)]],
+                              device const uint *high [[buffer(4)]],
+                              constant Args &a [[buffer(5)]],
+                              uint i [[thread_position_in_grid]]) {
+        if (i >= a.columns) { return; }
+        uint row = tokens[a.start];
+        device const char *base = weights + a.weightSkip;
+        float value;
+        if (a.size == 4u || a.size == 5u) {
+            uint groups = a.columns >> 5u;
+            uint g = i >> 5u;
+            uint j = i & 31u;
+            device const uint *words = (device const uint *)base + (row * groups + g) * 4u;
+            uint q = (words[j >> 3u] >> ((j & 7u) * 4u)) & 15u;
+            if (a.size == 5u) { q += ((high[row * groups + g] >> j) & 1u) * 16u; }
+            float2 p = float2(((device const half2 *)scales)[row * groups + g]);
+            value = (float(q) * p.x + p.y) * a.scale;
+        } else if (a.size == 8u) {
+            float rowScale = ((a.flags & 1u) != 0u) ? scales[row] : 1.0f;
+            value = float(base[row * a.columns + i]) * (a.scale * rowScale);
+        } else {
+            value = ((device const float *)base)[row * a.columns + i] * a.scale;
+        }
+        output[a.outOffset + i] = value;
     }
 
     // 4・5 ビットの重み（GGUFGroupQuant）。32 個ずつの組: 下位 4 ビット 16 バイト（j 番目は j ÷ 8 番目の uint の 4 × (j % 8) ビット目）、

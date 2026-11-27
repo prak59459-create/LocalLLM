@@ -664,7 +664,7 @@ final class GGUFMetalModel: GGUFEvaluator {
     /// SIMD グループが 32 スレッドの GPU（Apple の GPU）なら、線形層を SIMD グループで何行かずつ計算する
     private var usesSimdRows: Bool {
         let kernels: [Kernel] = [.linearQ8Vector, .linearF32Vector, .linearQ4Rows, .linearQ5Rows, .linearQ4Batch, .linearQ5Batch,
-                                 .gateUpQ4, .gateUpQ5]
+                                 .gateUpQ4, .gateUpQ5, .linearQ8Rows, .linearQ8Tokens]
         return kernels.allSatisfy { pipelines[$0]?.threadExecutionWidth == 32 }
     }
 
@@ -720,6 +720,19 @@ final class GGUFMetalModel: GGUFEvaluator {
         }
         let bindings: [Binding] = [(weights.buffer, weights.offset), vector(weights.scales), vector(weights.bias), (input, 0),
                                    (output, 0), vector(nil), aux]
+        if weights.isInt8 && usesSimdRows && weights.columns % 16 == 0 && weights.skip % 16 == 0 {
+            let threads = 32 * GGUFMetalSource.simdGroups
+            if batched {
+                let rows = GGUFMetalSource.batchRows * GGUFMetalSource.simdGroups
+                let tokens = GGUFMetalSource.batchTokens
+                run(.linearQ8Tokens, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
+                    height: (count + tokens - 1) / tokens, threads: threads)
+            } else {
+                let rows = GGUFMetalSource.q8Rows * GGUFMetalSource.simdGroups
+                run(.linearQ8Rows, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows, threads: threads)
+            }
+            return
+        }
         if !batched && usesSimdRows {
             // 1 トークン: 32 スレッドで 1 行
             run(weights.isInt8 ? .linearQ8Vector : .linearF32Vector, encoder, bindings, arguments, groups: weights.rows, threads: 32)
@@ -1128,7 +1141,11 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
         let sources: (sliding: Int, full: Int)
         let fullRope: GGUFRope.Table, slidingRope: GGUFRope.Table
         let input: MTLBuffer, current: MTLBuffer, normed: MTLBuffer, projected: MTLBuffer, queries: MTLBuffer, attended: MTLBuffer
-        let gate: MTLBuffer, up: MTLBuffer, logits: MTLBuffer, next: MTLBuffer, rotation: MTLBuffer, slidingRotation: MTLBuffer
+        let gate: MTLBuffer, up: MTLBuffer, logits: MTLBuffer, rotation: MTLBuffer, slidingRotation: MTLBuffer
+        /// 予想したトークン（0 番目は本体が最後に選んだもの。GPU が 1 つずつ書き足す）
+        let tokens: MTLBuffer
+        /// 1 回に予想するトークンの数の上限
+        static let maxDrafts = 8
 
         init(config: GGUFModelConfig, store: GGUFWeightStore, layers: [Layer], preProjection: Weights, postProjection: Weights,
              output: Weights, outputNorm: Norm, sources: (sliding: Int, full: Int), ropeFactors: UnsafePointer<Float>?,
@@ -1153,7 +1170,11 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
             gate = try GGUFMetalModel.floats(device, config.maxFeedForwardSize)
             up = try GGUFMetalModel.floats(device, config.maxFeedForwardSize)
             logits = try GGUFMetalModel.floats(device, output.rows)
-            next = try GGUFMetalModel.floats(device, outer)
+            guard let tokens = device.makeBuffer(length: (Self.maxDrafts + 1) * MemoryLayout<UInt32>.size,
+                                                 options: .storageModeShared) else {
+                throw GGUFMetalError.unavailable("draft token buffer")
+            }
+            self.tokens = tokens
             rotation = try GGUFMetalModel.floats(device, max(fullRope.pairs, 1) * 2)
             slidingRotation = try GGUFMetalModel.floats(device, max(slidingRope.pairs, 1) * 2)
         }
@@ -1202,28 +1223,73 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
     func draft(after token: Int, hidden state: [Float], count: Int) throws -> [Int] {
         guard let drafter, count > 0, length > 0 else { return [] }
         let position = length, outer = drafter.config.drafterOutputSize
+        let steps = min(count, Drafter.maxDrafts)
         try reserveScores(drafter.config.maxHeadCount * position)
         fill(drafter.rotation, drafter.fullRope, start: position, count: 1)
         fill(drafter.slidingRotation, drafter.slidingRope, start: position, count: 1)
+        // 入力: [本体の埋め込み × √(本体の大きさ), 隠れ状態（最初は本体の、あとは前の予想の。予想の計算がそこに書く）]
         let input = drafter.input.contents().assumingMemoryBound(to: Float.self)
-        let next = drafter.next.contents().assumingMemoryBound(to: Float.self)
         state.withUnsafeBufferPointer { (input + outer).update(from: $0.baseAddress!, count: min(outer, $0.count)) }
+        let tokens = drafter.tokens.contents().assumingMemoryBound(to: UInt32.self)
+        tokens[0] = UInt32(token)
+        let scale = Float(outer).squareRoot()
+        // 本体の埋め込みの表が GPU にあれば（出力層と同じ表）、全部の予想を 1 つの命令列で計算する（CPU と往復しない）
+        if config.tiedOutput, let embedding = outputWeights {
+            let commands = try Commands(queue: queue, profile: nil)
+            for step in 0..<steps {
+                encodeEmbedding(commands.encoder, embedding, tokens: drafter.tokens, slot: step, scale: scale, into: drafter.input)
+                encodeDraftStep(commands.encoder, drafter, position: position)
+                encodeArgmax(commands.encoder, drafter.logits, count: drafter.output.rows, into: drafter.tokens, slot: step + 1)
+            }
+            try commands.finish()
+            lastGPUSeconds = commands.gpuSeconds
+            return (1...steps).map { Int(tokens[$0]) }
+        }
         var drafts: [Int] = []
         var current = token
-        for step in 0..<count {
-            // 入力: [本体の埋め込み × √(本体の大きさ), 隠れ状態（最初は本体の、あとは前の予想の）]
-            GGUFKernels.embeddingRow(globals.embedding, row: current, scale: Float(outer).squareRoot(), into: input)
-            if step > 0 { (input + outer).update(from: next, count: outer) }
+        for _ in 0..<steps {
+            GGUFKernels.embeddingRow(globals.embedding, row: current, scale: scale, into: input)
             let commands = try Commands(queue: queue, profile: nil)
             encodeDraftStep(commands.encoder, drafter, position: position)
+            encodeArgmax(commands.encoder, drafter.logits, count: drafter.output.rows, into: drafter.tokens, slot: 1)
             try commands.finish()
-            let logits = drafter.logits.contents().assumingMemoryBound(to: Float.self)
-            var best = 0
-            for index in 1..<drafter.output.rows where logits[index] > logits[best] { best = index }
-            drafts.append(best)
-            current = best
+            current = Int(tokens[1])
+            drafts.append(current)
         }
         return drafts
+    }
+
+    /// 埋め込みの表の 1 行（行の番号は GPU の tokens[slot]）× scale を output の先頭に書く
+    private func encodeEmbedding(_ encoder: MTLComputeCommandEncoder, _ weights: Weights, tokens: MTLBuffer, slot: Int, scale: Float,
+                                 into output: MTLBuffer) {
+        var arguments = GGUFMetalArgs()
+        arguments.columns = UInt32(weights.columns)
+        arguments.start = UInt32(slot)
+        arguments.weightSkip = UInt32(weights.skip)
+        arguments.scale = scale
+        var rowScales: Binding = vector(nil)
+        var high: Binding = vector(nil)
+        if weights.groupBits > 0, let params = weights.params {
+            arguments.size = UInt32(weights.groupBits)
+            rowScales = params
+            if let bits = weights.high { high = (bits.buffer, bits.offset) }
+        } else if weights.isInt8 {
+            arguments.size = 8
+            rowScales = vector(weights.scales)
+            if weights.scales != nil { arguments.flags |= Flag.scales }
+        } else {
+            arguments.size = 32
+        }
+        run(.embeddingRow, encoder, [(weights.buffer, weights.offset), rowScales, (tokens, 0), (output, 0), high], arguments,
+            width: weights.columns)
+    }
+
+    /// values の count 個のうち、いちばん大きいものの位置を result[slot] に書く
+    private func encodeArgmax(_ encoder: MTLComputeCommandEncoder, _ values: MTLBuffer, count: Int, into result: MTLBuffer, slot: Int) {
+        var arguments = GGUFMetalArgs()
+        arguments.count = UInt32(count)
+        arguments.outOffset = UInt32(slot)
+        run(.argmax, encoder, [(values, 0), (result, 0)], arguments, groups: 1, threads: 1024)
     }
 
     func verify(_ tokens: [Int]) throws {
@@ -1247,7 +1313,7 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
         lastHidden = verifiedHidden[count]
     }
 
-    /// 先読み 1 回（入力は drafter.input、logits は drafter.logits、次の隠れ状態は drafter.next）
+    /// 先読み 1 回（入力は drafter.input、logits は drafter.logits、次の隠れ状態は drafter.input の後ろ半分）
     private func encodeDraftStep(_ encoder: MTLComputeCommandEncoder, _ drafter: Drafter, position: Int) {
         let config = drafter.config, d = config.embeddingSize, outer = config.drafterOutputSize
         linear(encoder, drafter.preProjection, input: drafter.input, inStride: 2 * outer, count: 1, output: drafter.current, outStride: d)
@@ -1270,7 +1336,9 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
         }
         normalize(encoder, drafter.current, drafter.outputNorm, into: drafter.normed, rows: 1, columns: d)
         linear(encoder, drafter.output, input: drafter.normed, inStride: d, count: 1, output: drafter.logits, outStride: drafter.output.rows)
-        linear(encoder, drafter.postProjection, input: drafter.normed, inStride: d, count: 1, output: drafter.next, outStride: outer)
+        // 次の隠れ状態は、そのまま次の予想の入力の後ろ半分に書く
+        linear(encoder, drafter.postProjection, input: drafter.normed, inStride: d, count: 1, output: drafter.input, outOffset: outer,
+               outStride: outer)
     }
 
     /// 先読みの q のヘッドごとの正規化と RoPE（位置は本体がまだ読んでいない位置。表の 0 行目）

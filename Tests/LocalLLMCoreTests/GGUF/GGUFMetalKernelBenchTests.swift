@@ -83,6 +83,40 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         }
     }
 
+    /// 行（出力）の少ない行列（FFN の down・注意の o など）は、SIMD グループの数が足りずにメモリを読みきれていない（23〜31 GB/s。
+    /// 行の多い gate+up は 50 GB/s）。1 つの行の組を threadgroup の S 個の SIMD グループで列を分けて計算し、最後に足すと速くなるか
+    func testSplitColumnsForMatricesWithFewRows() throws {
+        guard GGUFMetalModel.isAvailable else { throw XCTSkip("no Metal device") }
+        guard GGUFFixtures.realModels != nil else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let library = try device.makeLibrary(source: GGUFMetalSource.code + "\n" + Self.source, options: nil)
+        var pipelines: [String: MTLComputePipelineState] = [:]
+        func pipeline(_ name: String) throws -> MTLComputePipelineState {
+            if let pipeline = pipelines[name] { return pipeline }
+            let pipeline = try device.makeComputePipelineState(function: try XCTUnwrap(library.makeFunction(name: name), name))
+            pipelines[name] = pipeline
+            return pipeline
+        }
+        let candidates: [Candidate] = [
+            Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: 2 * GGUFMetalSource.vectorRows, tokensPerGroup: 0,
+                      threads: 64, counts: [1]),
+        ] + [2, 4, 8].map { split in
+            Candidate(label: "x-split\(split)", function: "xq4_split\(split)", rowsPerGroup: 2, tokensPerGroup: 0, threads: 32 * split,
+                      counts: [1])
+        }
+        var random = SplitMix64(seed: 13)
+        let shapes: [(String, Int, Int)] = [("ffn-down", 1536, 12288), ("ffn-down", 1536, 6144), ("attn-o", 1536, 4096), ("attn-o", 1536, 2048),
+                                            ("attn-q", 2048, 1536), ("attn-k", 256, 1536), ("ffn-up", 12288, 1536)]
+        for (name, rows, columns) in shapes {
+            let bytes = GGUFGroupQuant.nibbleBytes(rows: rows, columns: columns) + GGUFGroupQuant.paramBytes(rows: rows, columns: columns)
+            let matrix = try makeMatrix(device, name: name, rows: rows, columns: columns, int8: false,
+                                        copies: max(2, (32 << 20) / bytes + 1), random: &random)
+            try measure(matrix, candidates: candidates, reference: "linear_q4_batch", device: device, queue: queue, pipeline: pipeline,
+                        random: &random)
+        }
+    }
+
     /// Gemma 4 E2B の 1 トークンの計算のうち、線形層だけにかかる GPU の時間を、行列の形と数から見積もる。
     /// ほかの計算（注意・正規化など）と、計算を 1 つ並べるごとの手間（小さな計算 1 回の時間）も測る。
     /// 全体（TIME-GPU）との差で、線形層以外にどれだけかかっているかが分かる
@@ -475,6 +509,64 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
 
     typedef decltype(xq4_mask<2>) xq4_mask_t;
     template [[host_name("xq4_mask4")]] kernel xq4_mask_t xq4_mask<4>;
+
+    // 4 ビット・1 トークン: threadgroup 1 つで 2 行。S 個の SIMD グループで列（組の半分）を分けて計算し、最後に threadgroup で足す。
+    // 行の少ない行列でも、SIMD グループの数が S 倍になる
+    template <uint S>
+    kernel void xq4_split(device const uchar *nibbles [[buffer(0)]],
+                          device const half2 *params [[buffer(1)]],
+                          device const float *bias [[buffer(2)]],
+                          device const float *input [[buffer(3)]],
+                          device float *output [[buffer(4)]],
+                          device const uint *high [[buffer(5)]],
+                          device const float *aux [[buffer(6)]],
+                          constant Args &a [[buffer(7)]],
+                          uint group [[threadgroup_position_in_grid]],
+                          uint simd [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup float partial[S][2];
+        uint first = group * 2u;
+        if (first >= a.rows) { return; }
+        uint rows = min(2u, a.rows - first);
+        uint groups = a.columns >> 5u;
+        uint halves = groups * 2u;
+        device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
+        device const uint2 *words = (device const uint2 *)nibbles;
+        float acc[2] = {0.0f, 0.0f};
+        for (uint h = simd * 32u + lane; h < halves; h += 32u * S) {
+            float4 x0 = float4(x[h * 4u]);
+            float4 x1 = float4(x[h * 4u + 1u]);
+            float4 x2 = float4(x[h * 4u + 2u]);
+            float4 x3 = float4(x[h * 4u + 3u]);
+            float xs = sum4(x0 + x1 + x2 + x3);
+            float4 y0 = x0 * NIBBLE_SCALES;
+            float4 y1 = x1 * NIBBLE_SCALES;
+            float4 y2 = x2 * NIBBLE_SCALES;
+            float4 y3 = x3 * NIBBLE_SCALES;
+            uint part = h & 1u;
+            uint block = first * groups + (h >> 1u);
+            for (uint r = 0u; r < 2u; r++) {
+                uint b = block + min(r, rows - 1u) * groups;
+                float2 p = float2(params[b]);
+                acc[r] += p.x * masked_dot(words[b * 2u + part], y0, y1, y2, y3) + p.y * xs;
+            }
+        }
+        for (uint r = 0u; r < 2u; r++) {
+            float sum = simd_sum(acc[r]);
+            if (lane == 0u) { partial[simd][r] = sum; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u && lane < rows) {
+            float sum = 0.0f;
+            for (uint s = 0u; s < S; s++) { sum += partial[s][lane]; }
+            linear_store(output, bias, aux, a, first + lane, 0u, sum);
+        }
+    }
+
+    typedef decltype(xq4_split<2>) xq4_split_t;
+    template [[host_name("xq4_split2")]] kernel xq4_split_t xq4_split<2>;
+    template [[host_name("xq4_split4")]] kernel xq4_split_t xq4_split<4>;
+    template [[host_name("xq4_split8")]] kernel xq4_split_t xq4_split<8>;
 
     // 8 ビット・1 トークン: SIMD グループ 1 つで R 行（アプリは Q8_ROWS 行）
     template <uint R>

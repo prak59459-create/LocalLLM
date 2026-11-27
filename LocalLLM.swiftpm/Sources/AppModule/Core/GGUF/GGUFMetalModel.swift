@@ -499,6 +499,10 @@ final class GGUFMetalModel: GGUFEvaluator {
         encodePerLayerInputs(commands.encoder, count: n)
         for index in layers.indices {
             try encodeLayer(commands, layer: index, start: start, count: n)
+            // 先頭の 2 層を並べたところと、そのあと 12 層ごとに、そこまでを GPU に渡しておく
+            // （1 トークンで 600 個ほどの計算を CPU が並べ終わるのを待たずに、GPU が先に計算を始められる）
+            let encoded = index + 1
+            if Self.overlapsEncoding && encoded < layers.count && (encoded == 2 || encoded % 12 == 0) { try commands.flush() }
         }
         if wantsLogits {
             try commands.begin("output")
@@ -527,7 +531,10 @@ final class GGUFMetalModel: GGUFEvaluator {
         return profile.seconds
     }
 
-    /// GPU に渡す命令列。ふだんは 1 つにまとめる。測るときは部分ごとに分けて、それぞれの GPU の時間を足していく
+    /// 1 回の計算の命令を、何層かずつ先に GPU に渡すか（false なら全部並べてから渡す。速さを比べるときだけ変える）
+    static var overlapsEncoding = true
+
+    /// GPU に渡す命令列。ふだんは 1 つにまとめる（flush で途中まで先に渡せる）。測るときは部分ごとに分けて、それぞれの GPU の時間を足していく
     private final class Commands {
         final class Profile {
             var seconds: [String: Double] = [:]
@@ -539,6 +546,8 @@ final class GGUFMetalModel: GGUFEvaluator {
         private(set) var encoder: MTLComputeCommandEncoder
         private var section = ""
         private(set) var gpuSeconds = 0.0
+        /// 先に渡して、まだ終わるのを待っていない命令列
+        private var pending: [MTLCommandBuffer] = []
 
         init(queue: MTLCommandQueue, profile: Profile?) throws {
             guard let buffer = queue.makeCommandBuffer(), let encoder = buffer.makeComputeCommandEncoder() else {
@@ -566,15 +575,34 @@ final class GGUFMetalModel: GGUFEvaluator {
             section = name
         }
 
-        /// 命令列を GPU に渡して、終わるまで待つ
+        /// ここまでの命令を GPU に渡しておき（待たない）、続きは新しい命令列に並べる。
+        /// 同じキューの命令列は渡した順に動くので、続きは前の結果を使える。部分ごとに測るときは何もしない
+        func flush() throws {
+            guard profile == nil else { return }
+            encoder.endEncoding()
+            buffer.commit()
+            pending.append(buffer)
+            guard let next = queue.makeCommandBuffer(), let nextEncoder = next.makeComputeCommandEncoder() else {
+                throw GGUFMetalError.failed("command buffer")
+            }
+            buffer = next
+            encoder = nextEncoder
+        }
+
+        /// 命令列を GPU に渡して、（先に渡したものも含めて）終わるまで待つ
         func finish() throws {
             encoder.endEncoding()
             buffer.commit()
             buffer.waitUntilCompleted()
-            if let error = buffer.error { throw GGUFMetalError.failed(error.localizedDescription) }
-            let seconds = max(0, buffer.gpuEndTime - buffer.gpuStartTime)
-            gpuSeconds += seconds
-            profile?.seconds[section, default: 0] += seconds
+            let all = pending + [buffer]
+            pending = []
+            for done in all {
+                done.waitUntilCompleted()
+                if let error = done.error { throw GGUFMetalError.failed(error.localizedDescription) }
+                let seconds = max(0, done.gpuEndTime - done.gpuStartTime)
+                gpuSeconds += seconds
+                profile?.seconds[section, default: 0] += seconds
+            }
         }
     }
 

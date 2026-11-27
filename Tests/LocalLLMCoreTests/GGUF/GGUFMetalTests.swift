@@ -286,6 +286,26 @@ final class GGUFMetalTests: XCTestCase {
         let megabytes = Double(store.header.dataBytes) / 1_048_576
         print(String(format: "TIME-GPU %@: %.2f ms per token (GPU %.2f ms), weights file %.0f MB", name, wall * 1000,
                      gpuSeconds / 16 * 1000, megabytes))
+        // 命令を何層かずつ先に GPU に渡すとき・全部並べてから渡すときを、交互に 4 回ずつ（8 トークンずつ）測る
+        defer { GGUFMetalModel.overlapsEncoding = true }
+        var times: [Bool: (wall: Double, gpu: Double)] = [true: (0, 0), false: (0, 0)]
+        for round in 0..<8 {
+            let overlap = round % 2 == 0
+            GGUFMetalModel.overlapsEncoding = overlap
+            let begin = Date()
+            var seconds = 0.0
+            for index in 0..<8 {
+                _ = try gpu.evaluate([500 + round * 8 + index])
+                seconds += gpu.lastGPUSeconds
+            }
+            let previous = times[overlap]!
+            times[overlap] = (previous.wall + Date().timeIntervalSince(begin), previous.gpu + seconds)
+        }
+        for overlap in [true, false] {
+            let value = times[overlap]!
+            print(String(format: "TIME-GPU %@ %@: %.2f ms per token (GPU %.2f ms)", name,
+                         overlap ? "commands sent in parts" : "commands sent at once", value.wall / 32 * 1000, value.gpu / 32 * 1000))
+        }
         var sections: [String: Double] = [:]
         for index in 0..<4 {
             for (section, seconds) in try gpu.profile([400 + index]) { sections[section, default: 0] += seconds / 4 }

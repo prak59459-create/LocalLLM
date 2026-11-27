@@ -48,14 +48,16 @@ def report_files(stats_dir, top):
         except (OSError, ValueError):
             continue
         value = lambda key: data.get(f"time.swift.{key}.wall", 0.0)
-        rows.append((value("SIL-and-LLVM-processing") + value("SILGen"), value("Type checking and Semantic analysis"),
-                     value("SIL-processing"), data.get("IRModule.NumIRInsts", 0), match.group(1)))
+        # ジョブ全体の時間（型チェック・コード生成・LLVM・書き出しの全部）
+        total = data.get("Frontend.WallClockMicroseconds", 0) / 1e6
+        rows.append((total, value("Type checking and Semantic analysis"), value("SILGen") + value("IRGen"),
+                     data.get("IRModule.NumIRInsts", 0), match.group(1)))
     if not rows:
         return
-    print(f"\n== ファイルごとのコード生成（SILGen・SIL・LLVM）と型チェック（上位 {top}、秒）")
-    print("  生成   型   SIL  IR命令  ファイル")
-    for generate, sema, sil, insts, name in sorted(rows, reverse=True)[:top]:
-        print(f"{generate:6.2f} {sema:5.2f} {sil:5.2f} {insts:7d}  {name}")
+    print(f"\n== ファイルごとのコンパイル時間（1 ファイルずつのとき。上位 {top}、秒）: 合計 {sum(r[0] for r in rows):.1f} 秒")
+    print("  全体   型  SILGen+IRGen  IR命令  ファイル")
+    for total, sema, generate, insts, name in sorted(rows, reverse=True)[:top]:
+        print(f"{total:6.2f} {sema:5.2f} {generate:6.2f} {insts:8d}  {name}")
 
 
 def functions(path):

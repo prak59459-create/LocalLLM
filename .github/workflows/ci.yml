@@ -145,6 +145,7 @@ jobs:
             -swift-version 5 \
             -parse-as-library \
             -module-name AppModule \
+            -enable-upcoming-feature MemberImportVisibility \
             -Xfrontend -warn-long-function-bodies=100 \
             -Xfrontend -warn-long-expression-type-checking=80 \
             $(cat sources.txt) 2> typecheck.log
@@ -180,21 +181,6 @@ jobs:
           fi
           echo "No slow type-checking over the limits."
 
-      # 実験: MemberImportVisibility（各ファイルが import したモジュールのメンバーだけを探す）で型チェックが速くなるか
-      - name: Typecheck with MemberImportVisibility (experiment)
-        if: always()
-        continue-on-error: true
-        run: |
-          SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
-          set +e
-          /usr/bin/time -p xcrun --sdk iphonesimulator swiftc -typecheck -sdk "$SDK" -target arm64-apple-ios18.0-simulator \
-            -swift-version 5 -parse-as-library -module-name AppModule -enable-upcoming-feature MemberImportVisibility \
-            $(cat sources.txt) 2> visibility.log
-          echo "status $?"
-          echo "errors: $(grep -c 'error:' visibility.log)"
-          grep "error:" visibility.log | sort | uniq -c | sort -rn | head -40
-          tail -3 visibility.log
-
       # ビルド時間（Swift Playgrounds と同じく最適化なし・arm64）と、その内訳（段階ごと・ファイルごと・関数ごと）
       - name: Build time report
         if: always()
@@ -205,7 +191,8 @@ jobs:
           sed "s|^|$GITHUB_WORKSPACE/|" sources.txt > "$RUNNER_TEMP/sources.txt"
           build() {
             (cd "$RUNNER_TEMP/objs" && xcrun --sdk iphoneos swiftc -c -Onone -g -enable-batch-mode -j 3 \
-              -sdk "$SDK" -target arm64-apple-ios18.0 -swift-version 5 -parse-as-library -module-name AppModule "$@" \
+              -sdk "$SDK" -target arm64-apple-ios18.0 -swift-version 5 -parse-as-library -module-name AppModule \
+              -enable-upcoming-feature MemberImportVisibility "$@" \
               $(cat "$RUNNER_TEMP/sources.txt") > "$GITHUB_WORKSPACE/functions.txt" 2>&1)
           }
           # 1 回目は SDK のモジュールのキャッシュを作る分が入るので、2 回目を測る（iPad では 2 回目以降と同じ）
@@ -213,7 +200,13 @@ jobs:
           start=$(date +%s)
           build -stats-output-dir "$RUNNER_TEMP/stats" -Xfrontend -debug-time-function-bodies
           echo "BUILD-TIME: $(( $(date +%s) - start )) s (swiftc, arm64, -Onone -g, batch mode, 3 jobs)"
-          python3 Tools/build_time_report.py "$RUNNER_TEMP/stats" functions.txt --top 80
+          python3 Tools/build_time_report.py "$RUNNER_TEMP/stats" functions.txt --top 60
+          # ファイルごとにコンパイルの時間（型チェック・コード生成・LLVM の全部）を測って、重いファイルを出す
+          mkdir -p "$RUNNER_TEMP/files"
+          (cd "$RUNNER_TEMP/objs" && xcrun --sdk iphoneos swiftc -c -Onone -g -j 3 -stats-output-dir "$RUNNER_TEMP/files" \
+            -sdk "$SDK" -target arm64-apple-ios18.0 -swift-version 5 -parse-as-library -module-name AppModule \
+            -enable-upcoming-feature MemberImportVisibility $(cat "$RUNNER_TEMP/sources.txt") > /dev/null 2>&1) || true
+          python3 Tools/build_time_report.py "$RUNNER_TEMP/files" /dev/null --per-file --top 30 | sed -n '/ファイルごとのコンパイル時間/,$p' | head -34
 
       - name: Build the Swift Playgrounds app package with xcodebuild
         if: always()
@@ -227,26 +220,3 @@ jobs:
           echo "XCODEBUILD-TIME: $(( $(date +%s) - start )) s (Debug, arm64 iOS device)"
           grep -E "BUILD (SUCCEEDED|FAILED)|error:" build.log | head -20
           sed -n '/Build Timing Summary/,$p' build.log | head -40
-          # もう一度（中間ファイルは消して、キャッシュは残す）
-          rm -rf ~/Library/Developer/Xcode/DerivedData/LocalLLM-*/Build
-          start=$(date +%s)
-          xcodebuild -scheme LocalLLM -destination 'generic/platform=iOS' -showBuildTimingSummary \
-            CODE_SIGNING_ALLOWED=NO build > build2.log 2>&1 || true
-          echo "XCODEBUILD-TIME (again): $(( $(date +%s) - start )) s"
-          sed -n '/Build Timing Summary/,$p' build2.log | grep "|" | head -8
-
-      # 実験: 仮のアイコン（.placeholder）の代わりに、アイコン無しで作ると、アセットカタログの時間が減るか
-      - name: Build without the placeholder icon (experiment)
-        if: always()
-        continue-on-error: true
-        run: |
-          cp -R LocalLLM.swiftpm "$RUNNER_TEMP/NoIcon.swiftpm"
-          cd "$RUNNER_TEMP/NoIcon.swiftpm"
-          sed -i '' '/appIcon: /d; /accentColor: /d' Package.swift
-          grep -n "appIcon\|accentColor" Package.swift || echo "icon and accent color removed"
-          start=$(date +%s)
-          xcodebuild -scheme LocalLLM -destination 'generic/platform=iOS' -showBuildTimingSummary \
-            CODE_SIGNING_ALLOWED=NO build > build.log 2>&1 || true
-          echo "XCODEBUILD-TIME (no placeholder icon): $(( $(date +%s) - start )) s"
-          grep -E "BUILD (SUCCEEDED|FAILED)|error:" build.log | head -10
-          sed -n '/Build Timing Summary/,$p' build.log | grep "|" | head -8

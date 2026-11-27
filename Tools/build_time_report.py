@@ -36,6 +36,28 @@ def phases(stats_dir):
     return jobs, totals
 
 
+def report_files(stats_dir, top):
+    """ジョブがファイルごとのとき（バッチにしないとき）: ファイルごとの段階の時間"""
+    rows = []
+    for path in glob.glob(os.path.join(stats_dir, "*.json")):
+        match = re.search(r"swift-frontend-[^-]+-(.+?\.swift)-", os.path.basename(path))
+        if not match:
+            continue
+        try:
+            data = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        value = lambda key: data.get(f"time.swift.{key}.wall", 0.0)
+        rows.append((value("SIL-and-LLVM-processing") + value("SILGen"), value("Type checking and Semantic analysis"),
+                     value("SIL-processing"), data.get("IRModule.NumIRInsts", 0), match.group(1)))
+    if not rows:
+        return
+    print(f"\n== ファイルごとのコード生成（SILGen・SIL・LLVM）と型チェック（上位 {top}、秒）")
+    print("  生成   型   SIL  IR命令  ファイル")
+    for generate, sema, sil, insts, name in sorted(rows, reverse=True)[:top]:
+        print(f"{generate:6.2f} {sema:5.2f} {sil:5.2f} {insts:7d}  {name}")
+
+
 def functions(path):
     rows = []
     pattern = re.compile(r"\s*([\d.]+)ms\t([^\t:]+):(\d+):\d+\t(.*)")
@@ -54,9 +76,11 @@ def main():
     top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 40
     jobs, totals = phases(stats_dir)
     print(f"== 段階ごとの時間（{jobs} ジョブの合計、秒）")
-    for name, seconds in totals.most_common(14):
+    for name, seconds in totals.most_common(30):
         print(f"{seconds:9.2f}  {name}")
 
+    if "--per-file" in sys.argv:
+        report_files(stats_dir, top)
     rows = functions(times)
     total = sum(r[0] for r in rows)
     print(f"\n== 関数の本体の型チェック: {len(rows)} 個、合計 {total / 1000:.1f} 秒")

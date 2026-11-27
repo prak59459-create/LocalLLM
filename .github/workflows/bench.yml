@@ -2,6 +2,7 @@ name: GPU benchmark
 
 # Gemma 4 E2B を GPU（Metal）で動かして、正しさ（llama.cpp と同じ続き）と速さ・時間の内訳を測る。
 # モデルが大きい（約 3GB）ので、ふだんの CI とは別にして、手で動かすか、コミットのメッセージに [bench] があるときだけ動かす。
+# [kernels] のときは、モデルを使わずに線形層の計算の速さだけを測る（GGUFMetalKernelBenchTests。早く終わる）。
 on:
   workflow_dispatch:
   push:
@@ -10,7 +11,9 @@ on:
 jobs:
   gemma4-gpu:
     name: Gemma 4 E2B on the GPU
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[bench]')
+    if: >-
+      github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[bench]')
+      || contains(github.event.head_commit.message, '[kernels]')
     runs-on: macos-15
     # [bench] の無いプッシュで、測っている途中のものを止めないように（ジョブが動くときだけ並びを作る）
     concurrency:
@@ -24,6 +27,7 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
 
       - name: Download Gemma 4 E2B (Q4_0) and its MTP model
+        if: ${{ !contains(github.event.head_commit.message, '[kernels]') }}
         run: |
           mkdir -p "$RUNNER_TEMP/gguf"
           curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/gemma-4-E2B-it-Q4_0.gguf" \
@@ -36,10 +40,13 @@ jobs:
       - name: GPU tests and benchmark
         env:
           LOCALLLM_GGUF_MODELS: ${{ runner.temp }}/gguf
-        # 速さを測るので最適化して作る（@testable import のため -enable-testing）
-        run: swift test -c release -Xswiftc -enable-testing --filter "GGUFMetal" 2>&1 | tee bench.log
+          FILTER: ${{ contains(github.event.head_commit.message, '[kernels]') && 'GGUFMetalKernelBench' || 'GGUFMetal' }}
+        # 速さを測るので最適化して作る（@testable import のため -enable-testing）。テストが失敗したらジョブも失敗にする
+        run: |
+          set -o pipefail
+          swift test -c release -Xswiftc -enable-testing --filter "$FILTER" 2>&1 | tee bench.log
 
       - name: Summary
         if: always()
         run: |
-          grep -E "SPEED-GPU|SPEED-MTP|TIME-GPU|PROFILE-GPU|GGUF Metal: (converted|prepared)|error|failed" bench.log || true
+          grep -E "SPEED-GPU|SPEED-MTP|COST-MTP|TIME-GPU|PROFILE-GPU|KERNEL|GGUF Metal: (converted|prepared)|error|failed" bench.log || true

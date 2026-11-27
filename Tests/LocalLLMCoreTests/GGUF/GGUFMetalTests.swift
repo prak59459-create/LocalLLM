@@ -221,7 +221,7 @@ final class GGUFMetalTests: XCTestCase {
             let store = try GGUFWeightStore(url: destination)
             started = Date()
             let gpu = try GGUFMetalModel(store: store, maxContext: 1024)
-            print("GGUF Metal: prepared \(name) in \(Date().timeIntervalSince(started)) s, mapped weights \(gpu.usesMappedWeights), batch \(gpu.batchCapacity)")
+            print("GGUF Metal: prepared \(name) in \(Date().timeIntervalSince(started)) s, mapped weights \(gpu.usesMappedWeights), batch \(gpu.batchCapacity), matrix kernels \(gpu.usesMatrixKernels) (\(gpu.matrixNote))")
             try check(name, json: json, gpu: gpu, store: store)
             checked += 1
         }

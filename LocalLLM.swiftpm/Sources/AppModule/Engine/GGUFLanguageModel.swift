@@ -14,58 +14,14 @@ struct GGUFModelFiles: Sendable {
     var drafts = 0
 
     static let draftsKey = "gguf.mtpDrafts"
-    /// 既定は使わない（今の GPU の作りでは、先読みを使うとかえって遅くなる。速くできたら既定で使う）
-    static let defaultDrafts = 0
+    /// 既定は最大 3 個（実際の数は、当たり方と測った時間から毎回決める。速くならなければ予想しない）。
+    /// CI の Mac の Gemma 4 E2B では、2 トークンをまとめて確かめても 1 トークンとほぼ同じ時間で、予想 2 個で 1.1 倍ほど速くなった
+    static let defaultDrafts = 3
 
     /// 保存してある「先読みの数」（無ければ既定）
     static var storedDrafts: Int {
         guard let value = UserDefaults.standard.object(forKey: draftsKey) as? Int else { return defaultDrafts }
         return max(0, min(value, 4))
-    }
-}
-
-/// 先読みの数を、当たり方から決める。位置ごとの当たる割合（直前まで当たったときの）を覚えておき、
-/// 「1 回の往復で進めるトークンの数 ÷ その手間」がいちばん大きくなる数を選ぶ
-struct DraftPlanner {
-    /// 予想 1 つの手間（本体の 1 回を 1 とする。先読みは小さく、まとめての確かめも重みを読むのは 1 回）
-    static let draftCost = 0.08
-    static let verifyCost = 0.04
-
-    let maximum: Int
-    /// i 番目の予想が当たる割合（i − 1 番目まで当たったとき）
-    private(set) var rates: [Double]
-
-    init(maximum: Int) {
-        self.maximum = max(0, maximum)
-        rates = Array(repeating: 0.5, count: self.maximum)
-    }
-
-    /// 今使う予想の数
-    var count: Int {
-        guard maximum > 0 else { return 0 }
-        var best = 0
-        var bestValue = 1.0
-        var expected = 1.0, chance = 1.0
-        for k in 1...maximum {
-            chance *= rates[k - 1]
-            expected += chance
-            let value = expected / (1 + Double(k) * (Self.draftCost + Self.verifyCost))
-            if value > bestValue {
-                bestValue = value
-                best = k
-            }
-        }
-        // 当たらなくなっても、ときどきは 1 つ予想して割合を確かめ直す
-        return max(best, 1)
-    }
-
-    /// drafted 個予想して、accepted 個当たった
-    mutating func record(drafted: Int, accepted: Int) {
-        for index in 0..<min(drafted, maximum) {
-            guard index <= accepted else { break }
-            let hit: Double = index < accepted ? 1 : 0
-            rates[index] = rates[index] * 0.8 + hit * 0.2
-        }
     }
 }
 
@@ -160,15 +116,18 @@ final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
                 return []
             }
         }
-        // 予想の数（当たり方と、コンテキストの残りから）
+        // 予想の数（当たり方・測った時間と、コンテキストの残りから。0 なら予想せずに 1 つだけ確かめる）
         let room = max(0, maxContext - cachedTokens.count - 1)
-        let count = min(planner.count, room)
+        let count = min(planner.next(), room)
         do {
-            let drafts = try await InferenceQueue.run { () throws -> [Int] in
-                let drafts = try target.draft(after: token, hidden: target.lastHidden, count: count)
+            let (drafts, draftTime, verifyTime) = try await InferenceQueue.run { () throws -> ([Int], Double, Double) in
+                let start = Date()
+                let drafts = count > 0 ? try target.draft(after: token, hidden: target.lastHidden, count: count) : []
+                let drafted = Date()
                 try target.verify([token] + drafts)
-                return drafts
+                return (drafts, drafted.timeIntervalSince(start), Date().timeIntervalSince(drafted))
             }
+            planner.recordTimes(drafted: drafts.count, draftTime: draftTime, verified: drafts.count + 1, verifyTime: verifyTime)
             proposed = [token] + drafts
             proposedDrafts = drafts.count
             return SpeculativeProposal(drafts: drafts) { index in

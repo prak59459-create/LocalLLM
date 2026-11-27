@@ -121,6 +121,8 @@ final class GGUFMetalDrafterTests: XCTestCase {
         let tokenizer = try HFTokenizer(tokenizerJSON: files.tokenizerJSON, tokenizerConfigJSON: files.tokenizerConfigJSON)
         let prompts = ["Write a short story about a cat who learns to swim.", "日本の四季について、短く説明してください。",
                        "Explain in simple words how a rainbow forms."]
+        try measureCosts(targetStore: targetStore, drafterStore: drafterStore,
+                         prompt: tokenizer.encode("<bos><|turn>user\n\(prompts[0])<turn|>\n<|turn>model\n", addSpecialTokens: false))
         for text in prompts {
             let prompt = tokenizer.encode("<bos><|turn>user\n\(text)<turn|>\n<|turn>model\n", addSpecialTokens: false)
             let plain = try GGUFMetalModel(store: targetStore, maxContext: 1024)
@@ -133,26 +135,96 @@ final class GGUFMetalDrafterTests: XCTestCase {
                 logits = try plain.evaluate([token])
             }
             let plainSpeed = 64 / Date().timeIntervalSince(started)
-            for count in [2, 3, 4] {
+            // 予想の数を決め打ちしたもの（1・2・3 個）と、アプリと同じく DraftPlanner が決めるもの（最大 3 個。0 は auto）
+            for count in [1, 2, 3, 0] {
                 let gpu = try GGUFMetalModel(store: targetStore, maxContext: 1024)
                 try gpu.attachDrafter(store: drafterStore)
+                var planner = DraftPlanner(maximum: 3)
                 var generated = [argmax(try gpu.evaluate(prompt))]
-                var rounds = 0
+                var rounds = 0, drafted = 0, accepted = 0
                 started = Date()
                 while generated.count < expected.count + 1 {
-                    generated += try GGUFSpeculation.round(target: gpu, first: generated.last!, count: count) { logits, _ in
-                        self.argmax(logits)
+                    let wanted = count > 0 ? count : planner.next()
+                    let roundStart = Date()
+                    let drafts = wanted > 0 ? try gpu.draft(after: generated.last!, hidden: gpu.lastHidden, count: wanted) : []
+                    let draftEnd = Date()
+                    try gpu.verify([generated.last!] + drafts)
+                    planner.recordTimes(drafted: drafts.count, draftTime: draftEnd.timeIntervalSince(roundStart), verified: drafts.count + 1,
+                                        verifyTime: Date().timeIntervalSince(draftEnd))
+                    var hits = 0
+                    while true {
+                        let token = argmax(gpu.verifiedLogits(hits))
+                        generated.append(token)
+                        guard hits < drafts.count, token == drafts[hits] else { break }
+                        hits += 1
                     }
+                    gpu.accept(hits)
+                    planner.record(drafted: drafts.count, accepted: hits)
                     rounds += 1
+                    drafted += drafts.count
+                    accepted += hits
                 }
                 let speed = Double(generated.count - 1) / Date().timeIntervalSince(started)
-                let accepted = generated.count - 1 - rounds
-                XCTAssertEqual(Array(generated.prefix(expected.count)), expected, "\(text) drafts \(count)")
-                print(String(format: "SPEED-MTP drafts %d: %.1f tok/s (plain %.1f, x%.2f), %d of %d drafts accepted (%.0f%%) | %@",
-                             count, speed, plainSpeed, speed / plainSpeed, accepted, rounds * count,
-                             100 * Double(accepted) / Double(rounds * count), String(text.prefix(24))))
+                let name = count > 0 ? "drafts \(count)" : "auto (up to 3)"
+                XCTAssertEqual(Array(generated.prefix(expected.count)), expected, "\(text) \(name)")
+                print(String(format: "SPEED-MTP %@: %.1f tok/s (plain %.1f, x%.2f), %d of %d drafts accepted (%.0f%%), %d rounds | %@",
+                             name, speed, plainSpeed, speed / plainSpeed, accepted, drafted,
+                             100 * Double(accepted) / Double(max(drafted, 1)), rounds, String(text.prefix(24))))
             }
         }
+    }
+
+    /// 1 回の手間を測る: ふつうの 1 トークン、n 個まとめての確かめ、k 個の予想（時計の時間と GPU の時間、ミリ秒）
+    private func measureCosts(targetStore: GGUFWeightStore, drafterStore: GGUFWeightStore, prompt: [Int]) throws {
+        let model = try GGUFMetalModel(store: targetStore, maxContext: 1024)
+        try model.attachDrafter(store: drafterStore)
+        var token = argmax(try model.evaluate(prompt))
+        func time(_ body: () throws -> Void) rethrows -> (wall: Double, gpu: Double) {
+            var wall = 0.0, gpu = 0.0
+            for _ in 0..<6 {
+                let start = Date()
+                try body()
+                wall += Date().timeIntervalSince(start)
+                gpu += model.lastGPUSeconds
+            }
+            return (wall / 6 * 1000, gpu / 6 * 1000)
+        }
+        let plain = try time {
+            token = argmax(try model.evaluate([token]))
+        }
+        print(String(format: "COST-MTP plain step: %.1f ms (GPU %.1f)", plain.wall, plain.gpu))
+        // まとめての計算のしかたごとに: n 個の確かめと、64 トークンのプロンプトの読み込み
+        let choices: [(String, GGUFMetalModel.BatchKernel?)] = [("auto", nil), ("few", .few), ("matrix", .matrix), ("legacy", .legacy)]
+        defer { GGUFMetalModel.batchKernelOverride = nil }
+        for (name, choice) in choices {
+            GGUFMetalModel.batchKernelOverride = choice
+            for n in 1...5 {
+                let verify = try time {
+                    try model.verify(Array(repeating: token, count: n))
+                    model.accept(0)
+                }
+                print(String(format: "COST-MTP %@ verify %d: %.1f ms (GPU %.1f) = x%.2f of a plain step", name, n, verify.wall,
+                             verify.gpu, verify.wall / plain.wall))
+            }
+            let prefillModel = try GGUFMetalModel(store: targetStore, maxContext: 1024)
+            let long = Array((prompt + prompt + prompt + prompt + prompt).prefix(64))
+            let start = Date()
+            _ = try prefillModel.evaluate(long)
+            print(String(format: "COST-MTP %@ prefill 64 tokens: %.0f ms (%.1f tok/s)", name, Date().timeIntervalSince(start) * 1000,
+                         64 / Date().timeIntervalSince(start)))
+        }
+        for k in 1...4 {
+            let draft = try time {
+                _ = try model.draft(after: token, hidden: model.lastHidden, count: k)
+            }
+            print(String(format: "COST-MTP draft %d: %.1f ms (GPU %.1f) = x%.2f of a plain step", k, draft.wall, draft.gpu,
+                         draft.wall / plain.wall))
+        }
+        var logits = try model.evaluate([token])
+        let start = Date()
+        for _ in 0..<20 { token = argmax(logits) }
+        print(String(format: "COST-MTP CPU argmax over %d logits: %.2f ms", logits.count, Date().timeIntervalSince(start) * 1000 / 20))
+        logits = []
     }
 }
 #endif

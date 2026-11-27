@@ -175,10 +175,29 @@ jobs:
           fi
           echo "No slow type-checking over the limits."
 
+      # ビルド時間（Swift Playgrounds と同じく最適化なし・arm64）と、その内訳（段階ごと・ファイルごと・関数ごと）
+      - name: Build time report
+        continue-on-error: true
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p "$RUNNER_TEMP/objs" "$RUNNER_TEMP/stats"
+          sed "s|^|$GITHUB_WORKSPACE/|" sources.txt > "$RUNNER_TEMP/sources.txt"
+          start=$(date +%s)
+          (cd "$RUNNER_TEMP/objs" && xcrun --sdk iphoneos swiftc -c -Onone -g -enable-batch-mode -j 3 \
+            -sdk "$SDK" -target arm64-apple-ios18.0 -swift-version 5 -parse-as-library -module-name AppModule \
+            -stats-output-dir "$RUNNER_TEMP/stats" -Xfrontend -debug-time-function-bodies \
+            $(cat "$RUNNER_TEMP/sources.txt") > "$GITHUB_WORKSPACE/functions.txt" 2>&1)
+          echo "BUILD-TIME: $(( $(date +%s) - start )) s (swiftc, arm64, -Onone -g, batch mode, 3 jobs)"
+          python3 Tools/build_time_report.py "$RUNNER_TEMP/stats" functions.txt --top 80
+
       - name: Build the Swift Playgrounds app package with xcodebuild
         working-directory: LocalLLM.swiftpm
         continue-on-error: true
         run: |
-          xcodebuild -list || true
-          xcodebuild -scheme LocalLLM -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO build | tail -50
+          xcodebuild -list > /dev/null || true
+          start=$(date +%s)
+          xcodebuild -scheme LocalLLM -destination 'generic/platform=iOS' -showBuildTimingSummary \
+            CODE_SIGNING_ALLOWED=NO build > build.log 2>&1 || true
+          echo "XCODEBUILD-TIME: $(( $(date +%s) - start )) s (Debug, arm64 iOS device)"
+          grep -E "BUILD (SUCCEEDED|FAILED)|error:" build.log | head -20
+          sed -n '/Build Timing Summary/,$p' build.log | head -40

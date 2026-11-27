@@ -14,8 +14,9 @@ struct GGUFModelFiles: Sendable {
     var drafts = 0
 
     static let draftsKey = "gguf.mtpDrafts"
-    /// 既定は使わない（今の GPU の作りでは、先読みを使うとかえって遅くなる。速くできたら既定で使う）
-    static let defaultDrafts = 0
+    /// 既定は最大 3 個（実際の数は、当たり方と測った時間から毎回決める。速くならなければ予想しない）。
+    /// CI の Mac の Gemma 4 E2B では、2 トークンをまとめて確かめても 1 トークンとほぼ同じ時間で、予想 2 個で 1.1 倍ほど速くなった
+    static let defaultDrafts = 3
 
     /// 保存してある「先読みの数」（無ければ既定）
     static var storedDrafts: Int {

@@ -157,11 +157,11 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
             encoder.dispatchThreadgroups(MTLSize(width: groups, height: height, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: candidate.threads, height: 1, depth: 1))
         }
-        /// 1 回の命令列で何回か計算して、1 回あたりの GPU の時間（いちばん短かったもの、秒）
+        /// 1 回の命令列で何回か計算して、1 回あたりの GPU の時間（2 回のうち短いほう、秒）
         func time(_ candidate: Candidate, count: Int) throws -> Double {
             let repeats = max(2, matrix.weights.count * 2)
             var best = Double.infinity
-            for _ in 0..<3 {
+            for _ in 0..<2 {
                 let buffer = try XCTUnwrap(queue.makeCommandBuffer())
                 let encoder = try XCTUnwrap(buffer.makeComputeCommandEncoder())
                 for index in 0..<repeats { try encode(encoder, candidate, count: count, copy: index % matrix.weights.count, into: output) }
@@ -183,14 +183,12 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
             buffer.commit()
             buffer.waitUntilCompleted()
         }
-
-        var baseline = 0.0
-        if !matrix.int8 && matrix.weights.count >= 2 {
-            // FFN の gate と up を一度に（1 トークン。2 つの行列を読む）: 隣どうしの写しを gate と up にする
-            let gateUp = try pipeline("gate_up_q4")
+        /// FFN の gate と up を一度に（1 トークン。2 つの行列を読む）: 隣どうしの写しを gate と up にする
+        let gateUp = try pipeline("gate_up_q4")
+        func timeGateUp() throws -> Double {
             var best = Double.infinity
             let repeats = matrix.weights.count
-            for _ in 0..<3 {
+            for _ in 0..<2 {
                 let buffer = try XCTUnwrap(queue.makeCommandBuffer())
                 let encoder = try XCTUnwrap(buffer.makeComputeCommandEncoder())
                 for index in 0..<repeats {
@@ -211,12 +209,13 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
                 buffer.waitUntilCompleted()
                 best = min(best, (buffer.gpuEndTime - buffer.gpuStartTime) / Double(repeats))
             }
-            print(String(format: "KERNEL %@ %@ n=1 app-gateup (2 matrices): %.3f ms = %.1f GB/s", kind, shape, best * 1000,
-                         Double(2 * matrix.bytes) / best / 1e9))
+            return best
         }
+
+        // まず全部の結果を、前からある形（行の組ごとに入力を読み直す）と比べる（GPU も温まる）
+        var configurations: [(candidate: Candidate, count: Int, difference: Float)] = []
         for candidate in candidates {
             for count in candidate.counts {
-                // 前からある形（1 行ずつ入力を読み直す）の結果と比べる
                 try run(reference, rowsPerGroup: 4, tokensPerGroup: 8, threads: 64, count: count, into: expected)
                 memset(output.contents(), 0, count * matrix.rows * 4)
                 try run(candidate.function, rowsPerGroup: candidate.rowsPerGroup, tokensPerGroup: candidate.tokensPerGroup,
@@ -230,13 +229,29 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
                 }
                 let relative = difference / max(largest, 1e-12)
                 XCTAssertLessThan(relative, 1e-4, "\(kind) \(shape) \(candidate.label) n=\(count)")
-
-                let seconds = try time(candidate, count: count)
-                if candidate.label == "app-rows" { baseline = seconds }
-                print(String(format: "KERNEL %@ %@ n=%d %@: %.3f ms = %.1f GB/s (x%.2f of app-rows n=1, per token x%.2f) diff %.1e",
-                             kind, shape, count, candidate.label, seconds * 1000, Double(matrix.bytes) / seconds / 1e9,
-                             seconds / max(baseline, 1e-12), seconds / max(baseline, 1e-12) / Double(count), relative))
+                configurations.append((candidate, count, relative))
             }
+        }
+        // 先に測るものほど遅く出る（GPU の速さが上がりきっていない）ので、全部を順に 3 周して、それぞれいちばん速かった回を取る
+        let withGateUp = !matrix.int8 && matrix.weights.count >= 2
+        var best = [Double](repeating: .infinity, count: configurations.count)
+        var gateUpBest = Double.infinity
+        for _ in 0..<3 {
+            for (index, configuration) in configurations.enumerated() {
+                best[index] = min(best[index], try time(configuration.candidate, count: configuration.count))
+            }
+            if withGateUp { gateUpBest = min(gateUpBest, try timeGateUp()) }
+        }
+        let baseline = zip(configurations, best).first { $0.0.candidate.label == "app-rows" }?.1 ?? best[0]
+        if withGateUp {
+            print(String(format: "KERNEL %@ %@ n=1 app-gateup (2 matrices): %.3f ms = %.1f GB/s", kind, shape, gateUpBest * 1000,
+                         Double(2 * matrix.bytes) / gateUpBest / 1e9))
+        }
+        for (configuration, seconds) in zip(configurations, best) {
+            print(String(format: "KERNEL %@ %@ n=%d %@: %.3f ms = %.1f GB/s (x%.2f of app-rows n=1, per token x%.2f) diff %.1e",
+                         kind, shape, configuration.count, configuration.candidate.label, seconds * 1000,
+                         Double(matrix.bytes) / seconds / 1e9, seconds / max(baseline, 1e-12),
+                         seconds / max(baseline, 1e-12) / Double(configuration.count), configuration.difference))
         }
     }
 

@@ -135,24 +135,41 @@ final class GGUFMetalDrafterTests: XCTestCase {
                 logits = try plain.evaluate([token])
             }
             let plainSpeed = 64 / Date().timeIntervalSince(started)
-            for count in [2, 3, 4] {
+            // 予想の数を決め打ちしたもの（1・2・3 個）と、アプリと同じく DraftPlanner が決めるもの（最大 3 個。0 は auto）
+            for count in [1, 2, 3, 0] {
                 let gpu = try GGUFMetalModel(store: targetStore, maxContext: 1024)
                 try gpu.attachDrafter(store: drafterStore)
+                var planner = DraftPlanner(maximum: 3)
                 var generated = [argmax(try gpu.evaluate(prompt))]
-                var rounds = 0
+                var rounds = 0, drafted = 0, accepted = 0
                 started = Date()
                 while generated.count < expected.count + 1 {
-                    generated += try GGUFSpeculation.round(target: gpu, first: generated.last!, count: count) { logits, _ in
-                        self.argmax(logits)
+                    let wanted = count > 0 ? count : planner.next()
+                    let roundStart = Date()
+                    let drafts = wanted > 0 ? try gpu.draft(after: generated.last!, hidden: gpu.lastHidden, count: wanted) : []
+                    let draftEnd = Date()
+                    try gpu.verify([generated.last!] + drafts)
+                    planner.recordTimes(drafted: drafts.count, draftTime: draftEnd.timeIntervalSince(roundStart), verified: drafts.count + 1,
+                                        verifyTime: Date().timeIntervalSince(draftEnd))
+                    var hits = 0
+                    while true {
+                        let token = argmax(gpu.verifiedLogits(hits))
+                        generated.append(token)
+                        guard hits < drafts.count, token == drafts[hits] else { break }
+                        hits += 1
                     }
+                    gpu.accept(hits)
+                    planner.record(drafted: drafts.count, accepted: hits)
                     rounds += 1
+                    drafted += drafts.count
+                    accepted += hits
                 }
                 let speed = Double(generated.count - 1) / Date().timeIntervalSince(started)
-                let accepted = generated.count - 1 - rounds
-                XCTAssertEqual(Array(generated.prefix(expected.count)), expected, "\(text) drafts \(count)")
-                print(String(format: "SPEED-MTP drafts %d: %.1f tok/s (plain %.1f, x%.2f), %d of %d drafts accepted (%.0f%%) | %@",
-                             count, speed, plainSpeed, speed / plainSpeed, accepted, rounds * count,
-                             100 * Double(accepted) / Double(rounds * count), String(text.prefix(24))))
+                let name = count > 0 ? "drafts \(count)" : "auto (up to 3)"
+                XCTAssertEqual(Array(generated.prefix(expected.count)), expected, "\(text) \(name)")
+                print(String(format: "SPEED-MTP %@: %.1f tok/s (plain %.1f, x%.2f), %d of %d drafts accepted (%.0f%%), %d rounds | %@",
+                             name, speed, plainSpeed, speed / plainSpeed, accepted, drafted,
+                             100 * Double(accepted) / Double(max(drafted, 1)), rounds, String(text.prefix(24))))
             }
         }
     }

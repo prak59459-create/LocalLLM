@@ -59,6 +59,23 @@ final class DraftPlannerTests: XCTestCase {
         XCTAssertEqual(plain, 1)
     }
 
+    /// 最初の 1 回だけ遅くても（重みを初めて読む など）、速く測れればすぐに見積もりを直す。遅くなるほうはゆっくり追う
+    func testRecoversQuicklyFromASlowFirstMeasurement() {
+        var planner = DraftPlanner(maximum: 2)
+        planner.recordTimes(drafted: 1, draftTime: 0.030, verified: 2, verifyTime: 0.300)
+        planner.recordTimes(drafted: 1, draftTime: 0.003, verified: 2, verifyTime: 0.035)
+        // 速い値には 8 割の重み
+        XCTAssertEqual(planner.draftCost, 0.030 * 0.2 + 0.003 * 0.8, accuracy: 1e-9)
+        XCTAssertEqual(planner.verifyCost(2), 0.300 * 0.2 + 0.035 * 0.8, accuracy: 1e-9)
+        for _ in 0..<2 { planner.recordTimes(drafted: 1, draftTime: 0.003, verified: 2, verifyTime: 0.035) }
+        XCTAssertLessThan(planner.verifyCost(2), 0.040)
+        XCTAssertLessThan(planner.draftCost, 0.004)
+        // 1 回だけ遅くても、見積もりは 2 割しか動かない
+        let before = planner.verifyCost(2)
+        planner.recordTimes(drafted: 1, draftTime: 0.003, verified: 2, verifyTime: 0.100)
+        XCTAssertEqual(planner.verifyCost(2), before * 0.8 + 0.100 * 0.2, accuracy: 1e-9)
+    }
+
     func testEstimatesUnmeasuredBatchesFromMeasuredOnes() {
         var planner = DraftPlanner(maximum: 3)
         planner.recordTimes(drafted: 2, draftTime: 0.004, verified: 3, verifyTime: 0.039)

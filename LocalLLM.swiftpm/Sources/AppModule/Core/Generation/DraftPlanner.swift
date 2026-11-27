@@ -21,8 +21,11 @@ struct DraftPlanner {
     static let exploreEvery = 16
     /// 予想し続けても、この回数ごとに予想しない回を入れて、ふつうの 1 回の時間を測り直す
     static let plainEvery = 48
-    /// 新しく測った値の重み
+    /// 新しく測った値の重み（時間が今の見積もりより長いとき）
     static let smoothing = 0.2
+    /// 時間が今の見積もりより短いときの重み。最初の 1 回（重みを初めて読む・GPU が温まっていない）などの遅い値を、すぐに直す。
+    /// 遅くなるほうはゆっくり追う（たまたま割り込まれた 1 回で、予想をやめてしまわないように）
+    static let fasterSmoothing = 0.8
 
     init(maximum: Int) {
         self.maximum = max(0, maximum)
@@ -96,11 +99,16 @@ struct DraftPlanner {
     /// 測った時間を覚える: drafted 個の予想に draftTime 秒、verified 個の確かめに verifyTime 秒
     mutating func recordTimes(drafted: Int, draftTime: Double, verified: Int, verifyTime: Double) {
         if drafted > 0, draftTime > 0 {
-            let perDraft: Double = draftTime / Double(drafted)
-            draftSeconds = draftSeconds > 0 ? draftSeconds * (1 - Self.smoothing) + perDraft * Self.smoothing : perDraft
+            draftSeconds = Self.blend(draftSeconds, draftTime / Double(drafted))
         }
         guard verified >= 1, verified < verifySeconds.count, verifyTime > 0 else { return }
-        let old: Double = verifySeconds[verified]
-        verifySeconds[verified] = old > 0 ? old * (1 - Self.smoothing) + verifyTime * Self.smoothing : verifyTime
+        verifySeconds[verified] = Self.blend(verifySeconds[verified], verifyTime)
+    }
+
+    /// 今の見積もり old（0 はまだ無い）に、新しく測った value を混ぜる
+    private static func blend(_ old: Double, _ value: Double) -> Double {
+        guard old > 0 else { return value }
+        let weight: Double = value < old ? fasterSmoothing : smoothing
+        return old * (1 - weight) + value * weight
     }
 }

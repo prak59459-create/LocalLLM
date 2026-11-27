@@ -26,6 +26,9 @@ struct DraftPlanner {
     static let plainEvery = 48
     /// 新しく測った値の重み（時間が今の見積もりより長いとき）
     static let smoothing = 0.2
+    /// 当たる割合を混ぜる重み。2 割だと、たまたま 5〜6 回続けて外れただけで「予想しても得をしない」まで下がり、
+    /// しばらく予想しなくなっていた（当たる割合は 4〜5 割、得になるのは 1〜2 割から）。1 割なら 11 回ほど続けて外れないと下がらない
+    static let rateSmoothing = 0.1
     /// 時間が今の見積もりより短いときの重み。最初の 1 回（重みを初めて読む・GPU が温まっていない）などの遅い値を、すぐに直す。
     /// 遅くなるほうはゆっくり追う（たまたま割り込まれた 1 回で、予想をやめてしまわないように）
     static let fasterSmoothing = 0.8
@@ -95,7 +98,7 @@ struct DraftPlanner {
         for index in 0..<Swift.min(drafted, maximum) {
             guard index <= accepted else { break }
             let hit: Double = index < accepted ? 1 : 0
-            rates[index] = rates[index] * (1 - Self.smoothing) + hit * Self.smoothing
+            rates[index] = rates[index] * (1 - Self.rateSmoothing) + hit * Self.rateSmoothing
         }
     }
 

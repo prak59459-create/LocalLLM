@@ -78,6 +78,23 @@ final class DraftPlannerTests: XCTestCase {
         XCTAssertEqual(planner.draftCost, 0.003 * 0.8 + 0.030 * 0.2, accuracy: 1e-9)
     }
 
+    /// 当たる割合が 45% なら、たまたま 7 回続けて外れても予想をやめない（得になるのは当たる割合が 12.5% より上のとき。
+    /// 前の 2 割ずつ動かすやり方では、ここで 10.8% まで下がってやめていた）
+    func testKeepsDraftingThroughAShortStreakOfMisses() {
+        var planner = DraftPlanner(maximum: 1)
+        // ふつうの 1 回 48 ms、2 個の確かめ 49 ms、予想 1 つ 5 ms（最初の予想の時間は使われない）
+        planner.recordTimes(drafted: 0, draftTime: 0, verified: 1, verifyTime: 0.048)
+        planner.recordTimes(drafted: 1, draftTime: 0.050, verified: 2, verifyTime: 0.049)
+        planner.recordTimes(drafted: 1, draftTime: 0.005, verified: 2, verifyTime: 0.049)
+        let hits = [1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1]
+        for _ in 0..<2 {
+            for hit in hits { planner.record(drafted: 1, accepted: hit) }
+        }
+        for _ in 0..<7 { planner.record(drafted: 1, accepted: 0) }
+        XCTAssertGreaterThan(planner.rates[0], 0.125)
+        XCTAssertEqual(planner.next(), 1)
+    }
+
     func testEstimatesUnmeasuredBatchesFromMeasuredOnes() {
         var planner = DraftPlanner(maximum: 3)
         // 最初の予想の時間は使われない（読み込んだ直後の 1 回）

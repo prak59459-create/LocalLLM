@@ -1,0 +1,45 @@
+name: GPU benchmark
+
+# Gemma 4 E2B を GPU（Metal）で動かして、正しさ（llama.cpp と同じ続き）と速さ・時間の内訳を測る。
+# モデルが大きい（約 3GB）ので、ふだんの CI とは別にして、手で動かすか、コミットのメッセージに [bench] があるときだけ動かす。
+on:
+  workflow_dispatch:
+  push:
+    branches: ['claude/**']
+
+jobs:
+  gemma4-gpu:
+    name: Gemma 4 E2B on the GPU
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[bench]')
+    runs-on: macos-15
+    # [bench] の無いプッシュで、測っている途中のものを止めないように（ジョブが動くときだけ並びを作る）
+    concurrency:
+      group: bench-${{ github.ref }}
+      cancel-in-progress: true
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
+
+      - name: Download Gemma 4 E2B (Q4_0) and its MTP model
+        run: |
+          mkdir -p "$RUNNER_TEMP/gguf"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/gemma-4-E2B-it-Q4_0.gguf" \
+            "https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf"
+          # MTP（先読み）用の小さなモデル
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/gguf/mtp-gemma-4-E2B-it-Q8_0.gguf" \
+            "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/MTP/mtp-gemma-4-E2B-it-Q8_0.gguf"
+          ls -la "$RUNNER_TEMP/gguf"
+
+      - name: GPU tests and benchmark
+        env:
+          LOCALLLM_GGUF_MODELS: ${{ runner.temp }}/gguf
+        # 速さを測るので最適化して作る（@testable import のため -enable-testing）
+        run: swift test -c release -Xswiftc -enable-testing --filter "GGUFMetal" 2>&1 | tee bench.log
+
+      - name: Summary
+        if: always()
+        run: |
+          grep -E "SPEED-GPU|SPEED-MTP|TIME-GPU|PROFILE-GPU|GGUF Metal: (converted|prepared)|error|failed" bench.log || true

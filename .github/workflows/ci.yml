@@ -145,6 +145,7 @@ jobs:
             -swift-version 5 \
             -parse-as-library \
             -module-name AppModule \
+            -enable-upcoming-feature MemberImportVisibility \
             -Xfrontend -warn-long-function-bodies=100 \
             -Xfrontend -warn-long-expression-type-checking=80 \
             $(cat sources.txt) 2> typecheck.log
@@ -164,9 +165,14 @@ jobs:
           grep -E "Sources/AppModule/.*took [0-9]+ms to type-check" typecheck.log | sed -E 's/^.*Sources\/AppModule\///' | sort -u > slow.txt || true
           echo "----- slow-ish (warning only) -----"
           cat slow.txt
-          fail=$(awk '
-            /expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 150) print }
-            /(function|getter|method|closure|initializer).*took/ && !/expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 200) print }
+          # CI の Mac は日によって速さが違う（同じコードで型チェック全体が 79 秒のときも 118 秒のときもある）ので、
+          # 全体が 80 秒より遅いときは、その分だけ上限を広げる
+          real=$(awk '/^real/ { print $2 }' typecheck.log | tail -1)
+          factor=$(awk -v r="${real:-80}" 'BEGIN { f = r / 80; if (f < 1) f = 1; printf "%.2f", f }')
+          echo "whole typecheck: ${real:-?} s, limits scaled by $factor"
+          fail=$(awk -v f="$factor" '
+            /expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 150 * f) print }
+            /(function|getter|method|closure|initializer).*took/ && !/expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 200 * f) print }
           ' slow.txt)
           if [ -n "$fail" ]; then
             echo "$fail"
@@ -175,10 +181,42 @@ jobs:
           fi
           echo "No slow type-checking over the limits."
 
+      # ビルド時間（Swift Playgrounds と同じく最適化なし・arm64）と、その内訳（段階ごと・ファイルごと・関数ごと）
+      - name: Build time report
+        if: always()
+        continue-on-error: true
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p "$RUNNER_TEMP/objs" "$RUNNER_TEMP/stats"
+          sed "s|^|$GITHUB_WORKSPACE/|" sources.txt > "$RUNNER_TEMP/sources.txt"
+          build() {
+            (cd "$RUNNER_TEMP/objs" && xcrun --sdk iphoneos swiftc -c -Onone -g -enable-batch-mode -j 3 \
+              -sdk "$SDK" -target arm64-apple-ios18.0 -swift-version 5 -parse-as-library -module-name AppModule \
+              -enable-upcoming-feature MemberImportVisibility "$@" \
+              $(cat "$RUNNER_TEMP/sources.txt") > "$GITHUB_WORKSPACE/functions.txt" 2>&1)
+          }
+          # 1 回目は SDK のモジュールのキャッシュを作る分が入るので、2 回目を測る（iPad では 2 回目以降と同じ）
+          start=$(date +%s); build; echo "BUILD-TIME (cold module cache): $(( $(date +%s) - start )) s"
+          start=$(date +%s)
+          build -stats-output-dir "$RUNNER_TEMP/stats" -Xfrontend -debug-time-function-bodies
+          echo "BUILD-TIME: $(( $(date +%s) - start )) s (swiftc, arm64, -Onone -g, batch mode, 3 jobs)"
+          python3 Tools/build_time_report.py "$RUNNER_TEMP/stats" functions.txt --top 60
+          # ファイルごとにコンパイルの時間（型チェック・コード生成・LLVM の全部）を測って、重いファイルを出す
+          mkdir -p "$RUNNER_TEMP/files"
+          (cd "$RUNNER_TEMP/objs" && xcrun --sdk iphoneos swiftc -c -Onone -g -j 3 -stats-output-dir "$RUNNER_TEMP/files" \
+            -sdk "$SDK" -target arm64-apple-ios18.0 -swift-version 5 -parse-as-library -module-name AppModule \
+            -enable-upcoming-feature MemberImportVisibility $(cat "$RUNNER_TEMP/sources.txt") > /dev/null 2>&1) || true
+          python3 Tools/build_time_report.py "$RUNNER_TEMP/files" /dev/null --per-file --top 30 | sed -n '/ファイルごとのコンパイル時間/,$p' | head -34
+
       - name: Build the Swift Playgrounds app package with xcodebuild
+        if: always()
         working-directory: LocalLLM.swiftpm
         continue-on-error: true
         run: |
-          xcodebuild -list || true
-          xcodebuild -scheme LocalLLM -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO build | tail -50
+          xcodebuild -list > /dev/null || true
+          start=$(date +%s)
+          xcodebuild -scheme LocalLLM -destination 'generic/platform=iOS' -showBuildTimingSummary \
+            CODE_SIGNING_ALLOWED=NO build > build.log 2>&1 || true
+          echo "XCODEBUILD-TIME: $(( $(date +%s) - start )) s (Debug, arm64 iOS device)"
+          grep -E "BUILD (SUCCEEDED|FAILED)|error:" build.log | head -20
+          sed -n '/Build Timing Summary/,$p' build.log | head -40

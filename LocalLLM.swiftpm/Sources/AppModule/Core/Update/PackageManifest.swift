@@ -10,11 +10,12 @@ enum PackageManifest {
 
     /// `key:` の値の範囲（`"0.3"` や `.placeholder(icon: .chatMessage)` のような式全体）
     static func valueRange(of key: String, in text: String) -> Range<String.Index>? {
-        var searchStart = text.startIndex
-        while let found = text.range(of: key + ":", range: searchStart..<text.endIndex) {
+        let needle: String = key + ":"
+        var searchStart: String.Index = text.startIndex
+        while let found: Range<String.Index> = text.range(of: needle, range: searchStart..<text.endIndex) {
             searchStart = found.upperBound
             if found.lowerBound > text.startIndex {
-                let previous = text[text.index(before: found.lowerBound)]
+                let previous: Character = text[text.index(before: found.lowerBound)]
                 if previous.isLetter || previous.isNumber || previous == "_" { continue }
             }
             if isInComment(found.lowerBound, in: text) { continue }

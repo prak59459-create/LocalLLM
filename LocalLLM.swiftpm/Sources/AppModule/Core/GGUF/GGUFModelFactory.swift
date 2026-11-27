@@ -16,8 +16,9 @@ enum GGUFModelFactory {
     /// - Parameters:
     ///   - memory: 重みのメモリへの置き方（使う分だけ置くときは CPU で計算する）
     ///   - availableBytes: 空いているメモリ（使う分だけ置くときに、残す層の数を決めるのに使う）
+    ///   - drafter: 先読み（MTP）用のモデルを変換したファイル（GPU のときにつなぐ。つなげなければ使わない）
     static func make(store url: URL, context: Int, useGPU: Bool, memory: GGUFMemoryOptions = GGUFMemoryOptions(),
-                     availableBytes: Int64? = nil) throws -> Made {
+                     availableBytes: Int64? = nil, drafter: URL? = nil) throws -> Made {
         let store = try GGUFWeightStore(url: url)
         let residency = GGUFResidency(store: store, options: memory, availableBytes: availableBytes)
         defer { residency.prepare() }
@@ -31,7 +32,15 @@ enum GGUFModelFactory {
             do {
                 let model = try GGUFMetalModel(store: store, maxContext: context)
                 try verifyOnce(model, store: store, key: url.path + "|\(store.header.dataBytes)")
-                return Made(model: model, isMetal: true, note: nil)
+                var note: String?
+                if let drafter {
+                    do {
+                        try model.attachDrafter(store: try GGUFWeightStore(url: drafter))
+                    } catch {
+                        note = L("先読み（MTP）は使えません", "Draft model (MTP) unavailable")
+                    }
+                }
+                return Made(model: model, isMetal: true, note: note)
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription ?? "\(error)"
                 return Made(model: try cpu(), isMetal: false, note: reason)

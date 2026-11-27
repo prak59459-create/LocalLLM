@@ -196,8 +196,9 @@ struct GGUFWeightStore {
         layout(file: file, config: config, compact: compact).dataBytes + 8192
     }
 
-    /// 重みの置き場所を決める
-    static func layout(file: GGUFFile, config: GGUFModelConfig, compact: Bool) -> (entries: [Entry], dataBytes: Int) {
+    /// 重みの置き場所を決める。groups があれば、8 ビットにする行列をその形（4・5 ビット）にする（テストで GPU の計算を確かめる用）
+    static func layout(file: GGUFFile, config: GGUFModelConfig, compact: Bool,
+                       groups: GGUFMatrix.Storage? = nil) -> (entries: [Entry], dataBytes: Int) {
         var entries: [Entry] = []
         var offset = 0
         for name in config.tensorNames(in: file) {
@@ -211,7 +212,7 @@ struct GGUFWeightStore {
             if storage == .int8Rows && name.hasSuffix("ffn_gate_inp.weight") { storage = .float32 }
             // 元が 4 ビットなら 4 ビット、5 ビットなら 5 ビットのまま（6 ビット以上は 8 ビット）
             if storage == .int8Rows, columns % GGUFGroupQuant.groupSize == 0,
-               let type = tensor.type, let grouped = GGUFGroupQuant.storage(for: type) {
+               let type = tensor.type, let grouped = groups ?? GGUFGroupQuant.storage(for: type) {
                 storage = grouped
             }
             offset = aligned(offset, to: alignment)
@@ -254,7 +255,8 @@ enum GGUFConverter {
     ///   - progress: 0〜1
     ///   - isCancelled: true を返すと CancellationError で止まる
     @discardableResult
-    static func convert(gguf source: URL, to destination: URL, compact: Bool = true,
+    ///   - groups: 8 ビットにする行列を、この形（4・5 ビット）にする（テスト用）
+    static func convert(gguf source: URL, to destination: URL, compact: Bool = true, groups: GGUFMatrix.Storage? = nil,
                         progress: ((Double) -> Void)? = nil, isCancelled: (() -> Bool)? = nil) throws -> GGUFModelConfig {
         let mapped = try MappedFile(url: source)
         let file = try GGUFFile.parse(Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: mapped.pointer), count: mapped.count,
@@ -265,7 +267,7 @@ enum GGUFConverter {
         }
         let config = try GGUFModelConfig(file: file)
         guard file.expectedFileSize <= mapped.count else { throw GGUFError.truncated(needed: file.expectedFileSize) }
-        let (entries, dataBytes) = GGUFWeightStore.layout(file: file, config: config, compact: compact)
+        let (entries, dataBytes) = GGUFWeightStore.layout(file: file, config: config, compact: compact, groups: groups)
         let header = GGUFWeightStore.Header(config: config, entries: entries, sourceBytes: mapped.count, dataBytes: dataBytes)
         let headerData = try JSONEncoder().encode(header)
 

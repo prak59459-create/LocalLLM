@@ -73,6 +73,13 @@ final class GGUFModel: GGUFEvaluator {
     /// 1 回にまとめて計算するトークン数の上限
     static let maxBatch = 64
 
+    /// 最後に logits を計算した位置の、出力層の前（最後の正規化のあと）の隠れ状態（先読みの入力）
+    private(set) var lastHidden: [Float] = []
+    /// 先読み用のモデル（つないだときだけ）と、まとめて確かめた結果
+    private var drafter: GGUFDrafter?
+    private var verified: (logits: [[Float]], hidden: [[Float]]) = ([], [])
+    private var verifyStart = 0
+
     /// - Parameter chunkCount: 並列に計算するときのまとまりの数（nil ならコアの数から決める）
     init(store: GGUFWeightStore, maxContext: Int? = nil, chunkCount: Int? = nil) throws {
         self.store = store
@@ -639,6 +646,7 @@ final class GGUFModel: GGUFEvaluator {
         let d = config.embeddingSize
         let h = normed.reserve(d)
         normalize(last, weight: globals.outputNorm, bias: globals.outputNormBias, rows: 1, columns: d, into: h)
+        lastHidden = Array(UnsafeBufferPointer(start: h, count: d))
         var result = [Float](repeating: 0, count: max(config.vocabSize, globals.output.rows))
         result.withUnsafeMutableBufferPointer { buffer in
             guard let base = buffer.baseAddress else { return }
@@ -647,6 +655,24 @@ final class GGUFModel: GGUFEvaluator {
         }
         if result.count > config.vocabSize { result.removeLast(result.count - config.vocabSize) }
         return result
+    }
+
+    // MARK: - 先読み（MTP）
+
+    /// tokens をまとめて計算し、どの位置の logits と隠れ状態（出力層の前）も返す（先読みの確かめに使う）
+    func evaluateAll(_ tokens: [Int]) throws -> (logits: [[Float]], hidden: [[Float]]) {
+        try validate(tokens)
+        guard !tokens.isEmpty else { return ([], []) }
+        guard !config.hasRecurrentState else { throw GGUFError.invalid("evaluateAll on a recurrent model") }
+        let n = tokens.count, d = config.embeddingSize
+        _ = forward(tokens, wantsLogits: false)
+        let x = hidden.pointer
+        var logits: [[Float]] = [], states: [[Float]] = []
+        for row in 0..<n {
+            logits.append(self.logits(from: x + row * d))
+            states.append(lastHidden)
+        }
+        return (logits, states)
     }
 
     // MARK: - RoPE
@@ -692,5 +718,46 @@ final class GGUFModel: GGUFEvaluator {
                                    cos: cos + index * pairs, sin: sin + index * pairs, scratch: work)
             }
         }
+    }
+}
+
+extension GGUFModel: GGUFDraftSource {
+    func embeddingRow(_ token: Int, into output: UnsafeMutablePointer<Float>) {
+        GGUFKernels.embeddingRow(globals.embedding, row: token, scale: 1, into: output)
+    }
+
+    func draftCache(layer: Int) -> (keys: UnsafePointer<Float>, values: UnsafePointer<Float>)? {
+        guard layer >= 0, layer < shapes.count, shapes[layer].kvHeadCount == 1 else { return nil }
+        let source = shapes[layer].kvLayer
+        guard let key = keys[source], let value = values[source] else { return nil }
+        return (UnsafePointer(key), UnsafePointer(value))
+    }
+}
+
+extension GGUFModel: GGUFSpeculativeEvaluator {
+    /// 先読み用のモデルをつなぐ
+    func attachDrafter(store: GGUFWeightStore) throws {
+        drafter = try GGUFDrafter(store: store, target: config)
+    }
+
+    var canDraft: Bool { drafter != nil }
+
+    func draft(after token: Int, hidden: [Float], count: Int) throws -> [Int] {
+        drafter?.draft(after: token, hidden: hidden, position: length, count: count, target: self) ?? []
+    }
+
+    func verify(_ tokens: [Int]) throws {
+        verifyStart = length
+        verified = try evaluateAll(tokens)
+    }
+
+    func verifiedLogits(_ index: Int) -> [Float] {
+        index < verified.logits.count ? verified.logits[index] : []
+    }
+
+    func accept(_ count: Int) {
+        guard count < verified.hidden.count else { return }
+        truncate(to: verifyStart + count + 1)
+        lastHidden = verified.hidden[count]
     }
 }

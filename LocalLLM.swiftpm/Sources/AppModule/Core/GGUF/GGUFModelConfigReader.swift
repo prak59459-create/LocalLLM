@@ -38,7 +38,7 @@ extension GGUFModelConfig {
             break
         case .plamo:
             rules.parallel = true
-        case .gemma, .gemma2, .gemma3, .gemma4:
+        case .gemma, .gemma2, .gemma3, .gemma4, .gemma4Assistant:
             rules.activation = .gelu
             rules.gemmaEmbedding = true
         case .olmo2, .exaone4:
@@ -130,7 +130,7 @@ extension GGUFModelConfig {
         slidingRopeDimensions = rope.slidingDimensions
         ropeBase = rope.base
         slidingRopeBase = rope.slidingBase
-        ropeFactorsOnSlidingLayers = family != .gemma4
+        ropeFactorsOnSlidingLayers = family != .gemma4 && family != .gemma4Assistant
         ropeScale = rope.scale
         yarn = rope.yarn
         slidingRopeScale = rope.slidingScale
@@ -152,6 +152,9 @@ extension GGUFModelConfig {
         hasValueNorm = family == .gemma4
         qkNormAfterRope = family == .maincoder
         perLayerInputSize = file.has("per_layer_token_embd.weight") ? (file.archInt("embedding_length_per_layer_input") ?? 0) : 0
+        if family == .gemma4Assistant {
+            drafterOutputSize = try Self.require(file, "embedding_length_out")
+        }
         applyScales(family: family, file: file, headSize: fullHead, gemmaEmbedding: rules.gemmaEmbedding)
 
         if family == .baichuan && layerCount != 32 {
@@ -344,7 +347,7 @@ extension GGUFModelConfig {
         switch family {
         case .gemma2: return (window > 0 ? window : 4096, slidingPattern(file: file, layers: layers, defaultPeriod: 2))
         case .gemma3: period = 6
-        case .gemma4: period = 5
+        case .gemma4, .gemma4Assistant: period = 5
         case .cohere2, .olmo2: period = 4
         case .lfm2:
             // 注意の層はすべて直近だけを見る
@@ -422,7 +425,7 @@ extension GGUFModelConfig {
     private mutating func applyScales(family: Family, file: GGUFFile, headSize: Int, gemmaEmbedding: Bool) {
         attentionScale = 1 / Float(headSize).squareRoot()
         if let scale = file.archDouble("attention.scale"), scale != 0 { attentionScale = Float(scale) }
-        if family == .gemma4 { attentionScale = 1 }
+        if family == .gemma4 || family == .gemma4Assistant { attentionScale = 1 }
         if gemmaEmbedding { embeddingScale = Float(embeddingSize).squareRoot() }
         switch family {
         case .gemma2:
@@ -459,6 +462,11 @@ extension GGUFModelConfig {
         if let output = file.tensor("output.weight") {
             guard output.columns == embeddingSize, output.rows <= vocabSize else { throw GGUFError.invalid("output.weight shape") }
         }
+        if drafterOutputSize > 0 {
+            // 先読み用: 入力（本体の埋め込みと隠れ状態をつなげたもの）の射影と、次の隠れ状態の射影
+            try check(file, "nextn.pre_projection.weight", rows: embeddingSize, columns: 2 * drafterOutputSize)
+            try check(file, "nextn.post_projection.weight", rows: drafterOutputSize, columns: embeddingSize)
+        }
         if perLayerInputSize > 0 {
             try check(file, "per_layer_token_embd.weight", rows: vocabSize, columns: perLayerInputSize * layerCount)
             try check(file, "per_layer_model_proj.weight", rows: perLayerInputSize * layerCount, columns: embeddingSize)
@@ -472,7 +480,8 @@ extension GGUFModelConfig {
     private func validateLayer(_ file: GGUFFile, layer: Int, shape: Layer) throws {
         let prefix = "blk.\(layer)."
         let d = embeddingSize, q = shape.querySize, kv = shape.kvSize, ff = shape.feedForwardSize
-        let ownsCache = shape.kvLayer == layer
+        // 先読み用のモデルは k・v を持たない（本体の KV キャッシュを使う）
+        let ownsCache = shape.kvLayer == layer && drafterOutputSize == 0
         if shape.deltaNet, let delta = deltaNet {
             try validateDeltaNet(file, prefix: prefix, delta: delta, feedForward: ff)
             return
@@ -594,7 +603,7 @@ extension GGUFModelConfig {
         var names = ["token_embd.weight"]
         let optional = ["output_norm.weight", "output_norm.bias", "token_embd_norm.weight", "output.weight", "output.bias", "rope_freqs.weight",
                         "position_embd.weight", "per_layer_token_embd.weight", "per_layer_model_proj.weight",
-                        "per_layer_proj_norm.weight"]
+                        "per_layer_proj_norm.weight", "nextn.pre_projection.weight", "nextn.post_projection.weight"]
         names.append(contentsOf: optional.filter { file.has($0) })
         let perLayer = [
             "attn_norm.weight", "attn_norm.bias", "attn_norm_2.weight", "attn_norm_2.bias",

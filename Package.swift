@@ -19,7 +19,9 @@ let package = Package(
     targets: [
         .target(
             name: "LocalLLMCore",
-            path: "LocalLLM.swiftpm/Sources/AppModule/Core"
+            path: "LocalLLM.swiftpm/Sources/AppModule/Core",
+            // アプリ（LocalLLM.swiftpm）と同じ設定
+            swiftSettings: [.enableUpcomingFeature("MemberImportVisibility")]
         ),
         .testTarget(
             name: "LocalLLMCoreTests",

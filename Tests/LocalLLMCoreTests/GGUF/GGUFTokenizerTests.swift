@@ -160,6 +160,16 @@ final class GGUFRepositoryTests: XCTestCase {
         XCTAssertTrue(GGUFNaming.isStandaloneModel("a/Model-Q4_K_M.gguf"))
         XCTAssertFalse(GGUFNaming.isStandaloneModel("mmproj-model-f16.gguf"))
         XCTAssertFalse(GGUFNaming.isStandaloneModel("mtp-gemma-4-E2B-it-Q4_0.gguf"))
+        // 先読み（MTP）用のモデル: 浅い場所の 8 ビットのものを選び、Gemma 4 のものだけ
+        let entries = ["gemma-4-E2B-it-Q4_0.gguf", "MTP/mtp-gemma-4-E2B-it-BF16.gguf", "MTP/mtp-gemma-4-E2B-it-Q8_0.gguf",
+                       "mtp-gemma-4-E2B-it.gguf"].map { HFFileEntry(path: $0, size: 10, lfsSHA256: nil) }
+        XCTAssertEqual(GGUFNaming.drafterFile(in: entries)?.path, "mtp-gemma-4-E2B-it.gguf")
+        XCTAssertEqual(GGUFNaming.drafterFile(in: Array(entries.prefix(3)))?.path, "MTP/mtp-gemma-4-E2B-it-Q8_0.gguf")
+        XCTAssertNil(GGUFNaming.drafterFile(in: [HFFileEntry(path: "mtp-Qwen3.6-27B.gguf", size: 10, lfsSHA256: nil)]))
+        let analysis = RepoAnalysis.analyze(files: entries, repoName: "gemma-4-E2B-it-GGUF")
+        let variant = analysis.variants.first { $0.kind == .gguf }
+        XCTAssertEqual(variant?.files.map(\.path), ["gemma-4-E2B-it-Q4_0.gguf", "mtp-gemma-4-E2B-it.gguf"])
+        XCTAssertEqual(variant?.totalBytes, 20)
         XCTAssertFalse(GGUFNaming.isStandaloneModel("Model-Q4_K_M-00001-of-00003.gguf"))
         XCTAssertFalse(GGUFNaming.isStandaloneModel("Model.imatrix"))
         XCTAssertTrue(GGUFNaming.isReadable(quantization: "Q4_K_M"))

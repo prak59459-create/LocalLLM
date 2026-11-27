@@ -476,6 +476,15 @@ struct GenerationStats: Codable, Hashable, Sendable {
     var prefillSeconds: Double = 0
     var decodeSeconds: Double = 0
     var stopReason: StopReason? = nil
+    /// 先読み（MTP）で予想したトークンの数と、そのうち当たって使った数
+    var draftedTokens: Int? = nil
+    var acceptedDrafts: Int? = nil
+
+    /// 先読みの予想が当たった割合（先読みを使っていなければ nil）
+    var draftAcceptance: Double? {
+        guard let drafted = draftedTokens, drafted > 0 else { return nil }
+        return Double(acceptedDrafts ?? 0) / Double(drafted)
+    }
 
     var prefillTokensPerSecond: Double {
         let computed = promptTokens - reusedPromptTokens

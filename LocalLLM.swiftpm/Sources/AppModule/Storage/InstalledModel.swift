@@ -33,6 +33,8 @@ struct InstalledModel: Codable, Identifiable, Hashable, Sendable {
     var gguf: GGUFSummary?
     /// GGUF を変換したあとの重みファイル（モデルのフォルダからの相対パス）。変換が済むまでは nil
     var ggufStorePath: String?
+    /// 先読み（MTP）用のモデルを変換したファイル（あるときだけ）
+    var ggufDrafterPath: String?
 
     /// 端末上でのパス（リポジトリ内のパスから）
     func localPath(for repoPath: String) -> String {

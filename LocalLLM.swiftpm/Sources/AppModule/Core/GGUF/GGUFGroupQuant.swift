@@ -36,29 +36,7 @@ enum GGUFGroupQuant {
     // MARK: - 半精度への変換
 
     /// Float → 半精度（最も近い値。丸めは偶数へ）
-    static func half(_ value: Float) -> UInt16 {
-        let bits = value.bitPattern
-        let sign = UInt16((bits >> 16) & 0x8000)
-        let exponent = Int((bits >> 23) & 0xFF) - 127 + 15
-        var mantissa = bits & 0x7F_FFFF
-        if value.isNaN { return sign | 0x7E00 }
-        if exponent >= 31 { return sign | 0x7C00 }
-        if exponent <= 0 {
-            // 非正規化数（小さすぎるものは 0）
-            guard exponent >= -10 else { return sign }
-            mantissa |= 0x80_0000
-            let shift = UInt32(14 - exponent)
-            var result = mantissa >> shift
-            let remainder = mantissa & ((1 << shift) - 1)
-            let halfway = UInt32(1) << (shift - 1)
-            if remainder > halfway || (remainder == halfway && (result & 1) != 0) { result += 1 }
-            return sign | UInt16(result)
-        }
-        var result = UInt32(exponent) << 10 | (mantissa >> 13)
-        let remainder = mantissa & 0x1FFF
-        if remainder > 0x1000 || (remainder == 0x1000 && (result & 1) != 0) { result += 1 }
-        return sign | UInt16(result)
-    }
+    static func half(_ value: Float) -> UInt16 { Half.fromFloat(value) }
 
     // MARK: - 元の形式から作る
 

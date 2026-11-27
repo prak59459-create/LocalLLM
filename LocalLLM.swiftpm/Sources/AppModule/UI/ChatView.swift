@@ -20,7 +20,10 @@ struct ChatView: View {
     @FocusState private var composerFocused: Bool
 
     private var isGeneratingHere: Bool {
-        chat.progress?.conversationID == conversation.id
+        // Optional どうしの == は候補が多く型チェックが遅いので、取り出してから比べる
+        guard let progress: GenerationProgress = chat.progress else { return false }
+        let id: UUID = conversation.id
+        return progress.conversationID == id
     }
 
     var body: some View {
@@ -128,8 +131,9 @@ struct ChatView: View {
     }
 
     private func delete(_ message: StoredMessage) {
-        if chat.progress?.messageID == message.id { chat.stopGenerating() }
-        conversation.messages.removeAll { $0.id == message.id }
+        let id: UUID = message.id
+        if let progress: GenerationProgress = chat.progress, progress.messageID == id { chat.stopGenerating() }
+        conversation.messages.removeAll { (stored: StoredMessage) -> Bool in stored.id == id }
         context.delete(message)
         try? context.save()
     }

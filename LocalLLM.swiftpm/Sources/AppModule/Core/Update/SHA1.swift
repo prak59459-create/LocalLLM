@@ -103,11 +103,11 @@ enum SHA1 {
     }
 
     private static func bigEndianWord(_ bytes: [UInt8], at offset: Int) -> UInt32 {
-        var value = UInt32(bytes[offset]) << 24
-        value |= UInt32(bytes[offset + 1]) << 16
-        value |= UInt32(bytes[offset + 2]) << 8
-        value |= UInt32(bytes[offset + 3])
-        return value
+        // 型を決めてから組み立てる（リテラルを含む式を短くして、型チェックを速くする）
+        let b0: UInt32 = UInt32(bytes[offset]), b1: UInt32 = UInt32(bytes[offset + 1])
+        let b2: UInt32 = UInt32(bytes[offset + 2]), b3: UInt32 = UInt32(bytes[offset + 3])
+        let shift8: UInt32 = 8
+        return ((b0 << shift8 | b1) << shift8 | b2) << shift8 | b3
     }
 
     private static func appendBigEndian(_ value: UInt32, to output: inout [UInt8]) {

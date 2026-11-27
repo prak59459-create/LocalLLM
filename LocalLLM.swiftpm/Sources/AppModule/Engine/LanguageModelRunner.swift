@@ -35,6 +35,22 @@ protocol LanguageModelRunner: AnyObject {
     var gate: MemoryGate? { get set }
 }
 
+/// 推測デコード（MTP の先読み）ができる実行。使い方: propose → 位置ごとに logits から選ぶ → commit
+protocol SpeculativeRunner: AnyObject {
+    /// 今、予想を使うか（使える本体と先読み用のモデルがあって、使う設定のとき）
+    var speculates: Bool { get }
+    /// token（まだ本体が読んでいない、最後に選んだトークン）を本体に読ませ、続きを予想して、まとめて確かめる
+    func propose(after token: Int) async throws -> SpeculativeProposal
+    /// propose のうち、accepted 個の予想を受け入れた（本体の KV キャッシュを、その後ろまで戻す）
+    func commit(accepted: Int) async throws
+}
+
+/// 予想と、それを本体が確かめた結果（位置 i の logits = token と予想 1 … i を読んだあとの、次のトークンのスコア）
+struct SpeculativeProposal {
+    var drafts: [Int]
+    var logits: (Int) async throws -> [Float]
+}
+
 extension MLMultiArrayDataType {
     /// 1 要素のバイト数
     var byteCount: Int {

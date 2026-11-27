@@ -107,6 +107,10 @@ final class AppSettings {
     var ggufMemory: GGUFMemoryOptions {
         didSet { ggufMemory.save() }
     }
+    /// 先読み（MTP。Gemma 4 など）で 1 回に予想するトークンの数の上限（0 なら使わない。次の読み込みから）
+    var ggufDrafts: Int {
+        didSet { defaults.set(ggufDrafts, forKey: GGUFModelFiles.draftsKey) }
+    }
     /// Hugging Face のアクセストークン（ゲート付きモデル用。任意）
     var huggingFaceToken: String {
         didSet { Keychain.set(huggingFaceToken, for: Keys.huggingFaceToken) }
@@ -132,6 +136,7 @@ final class AppSettings {
         toolsEnabled = defaults.object(forKey: Keys.toolsEnabled) as? Bool ?? true
         contextLimit = max(0, defaults.integer(forKey: Keys.contextLimit))
         ggufMemory = .stored
+        ggufDrafts = GGUFModelFiles.storedDrafts
     }
 
     /// 生成パラメータを既定値に戻す。

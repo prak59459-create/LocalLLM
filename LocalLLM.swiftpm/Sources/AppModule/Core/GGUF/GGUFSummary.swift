@@ -106,6 +106,29 @@ enum GGUFNaming {
         return !(quantization.hasPrefix("IQ1") || quantization.hasPrefix("TQ"))
     }
 
+    /// 先読み（MTP）用のモデルのファイルか（"mtp-….gguf"）
+    static func isDrafter(_ path: String) -> Bool {
+        let name = (path as NSString).lastPathComponent.lowercased()
+        return name.hasPrefix("mtp-") && name.hasSuffix(".gguf")
+    }
+
+    /// リポジトリの中の、先読み（MTP）用のモデル（あれば 1 つ。今は Gemma 4 のものだけ）。
+    /// 浅い場所の、8 ビット（Q8_0）か量子化の書いていないものを選ぶ
+    static func drafterFile(in files: [HFFileEntry]) -> HFFileEntry? {
+        files.filter { file in
+            let name = (file.path as NSString).lastPathComponent.lowercased()
+            return isDrafter(file.path) && (name.contains("gemma-4") || name.contains("gemma4"))
+        }.min { lhs, rhs in
+            func key(_ file: HFFileEntry) -> (Int, Int, Int64) {
+                let depth = file.path.split(separator: "/").count
+                let quantization = quantization(of: file.path)
+                let kind = quantization == "Q8_0" ? 0 : (quantization == nil ? 1 : 2)
+                return (depth, kind, file.size)
+            }
+            return key(lhs) < key(rhs)
+        }
+    }
+
     /// 並べる順（小さいほど先）: まず定番の Q4_K_M、そのあとは軽い順
     static func rank(of path: String) -> Int {
         let order = ["Q4_K_M", "Q4_K_S", "Q4_0", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "Q3_K_M", "Q3_K_L", "Q3_K_S", "IQ4_XS",

@@ -282,6 +282,22 @@ struct GGUFGlobalWeights {
     }
 }
 
+/// 推測デコード（MTP の先読み）ができる本体。使い方: draft → verify → verifiedLogits（受け入れを決める）→ accept
+protocol GGUFSpeculativeEvaluator: GGUFEvaluator {
+    /// 先読み用のモデルがつながっているか
+    var canDraft: Bool { get }
+    /// 最後に計算した位置（受け入れたあとは、最後に受け入れた位置）の、出力層の前の隠れ状態
+    var lastHidden: [Float] { get }
+    /// token（位置 length の、まだ読んでいないトークン）と、その前の位置の隠れ状態 hidden から、count 個を貪欲に予想する
+    func draft(after token: Int, hidden: [Float], count: Int) throws -> [Int]
+    /// tokens（まだ読んでいないトークンと予想）をまとめて読む。どの位置の logits も、次の計算まで verifiedLogits で取り出せる
+    func verify(_ tokens: [Int]) throws
+    /// verify した i 番目の位置の、次のトークンの logits
+    func verifiedLogits(_ index: Int) -> [Float]
+    /// verify した tokens のうち、先頭の count + 1 個だけを残す（count = 受け入れた予想の数）
+    func accept(_ count: Int)
+}
+
 /// GGUF のモデルを計算するもの（CPU 用の GGUFModel と、GPU 用の GGUFMetalModel）。
 protocol GGUFEvaluator: AnyObject {
     var config: GGUFModelConfig { get }

@@ -149,6 +149,10 @@ private struct AssistantMessageView: View {
                     Text(name)
                 }
                 Text(String(format: "%.1f tok/s", stats.decodeTokensPerSecond))
+                if let acceptance = stats.draftAcceptance {
+                    // 先読み（MTP）の予想が当たった割合
+                    Text(L("先読み", "MTP") + String(format: " %.0f%%", acceptance * 100))
+                }
                 Text(L("\(stats.generatedTokens) トークン", "\(stats.generatedTokens) tokens"))
                 if let reason = stats.stopReason {
                     Text(reason.label)

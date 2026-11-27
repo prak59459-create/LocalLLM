@@ -159,11 +159,14 @@ struct RepoAnalysis: Hashable, Sendable {
                          displayName: ((file.path as NSString).lastPathComponent as NSString).deletingPathExtension)
         }
 
-        // 6. GGUF（1 ファイルで 1 つのモデル。量子化の違うファイルが並んでいることが多い）
+        // 6. GGUF（1 ファイルで 1 つのモデル。量子化の違うファイルが並んでいることが多い）。
+        // 先読み（MTP）用のモデルがあれば、いっしょにダウンロードする（どの量子化の本体とも組になる）
+        let drafter = GGUFNaming.drafterFile(in: loose)
         let ggufs = loose.filter { GGUFNaming.isStandaloneModel($0.path) }
             .sorted { (GGUFNaming.rank(of: $0.path), $0.size, $0.path) < (GGUFNaming.rank(of: $1.path), $1.size, $1.path) }
             .map { file in
-                ModelVariant(path: file.path, kind: .gguf, files: [file], totalBytes: file.size,
+                ModelVariant(path: file.path, kind: .gguf, files: [file] + (drafter.map { [$0] } ?? []),
+                             totalBytes: file.size + (drafter?.size ?? 0),
                              displayName: ((file.path as NSString).lastPathComponent as NSString).deletingPathExtension)
             }
 

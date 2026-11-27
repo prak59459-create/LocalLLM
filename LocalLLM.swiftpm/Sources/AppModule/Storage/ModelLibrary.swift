@@ -285,6 +285,8 @@ final class ModelLibrary {
     nonisolated static let localRepoID = "local"
     /// GGUF を変換したあとの重みのファイル名
     nonisolated static let ggufStoreName = "model." + GGUFWeightStore.fileExtension
+    /// 先読み（MTP）用のモデルを変換したファイル名
+    nonisolated static let ggufDrafterName = "drafter." + GGUFWeightStore.fileExtension
 
     /// ダウンロード（または取り込み）した GGUF を、このアプリ用の形に変換する
     private func startGGUFConversion(_ model: InstalledModel) {
@@ -351,12 +353,34 @@ final class ModelLibrary {
             try? header.write(to: folder.appendingPathComponent("header.gguf"), options: .atomic)
         }
         try? fileManager.removeItem(at: source)
+        model.ggufDrafterPath = convertDrafter(of: model, in: folder) ?? model.ggufDrafterPath
         let size = (try? fileManager.attributesOfItem(atPath: store.path)[.size] as? NSNumber)?.int64Value
         model.gguf = summary
         model.ggufStorePath = ggufStoreName
         model.totalBytes = size ?? summary.storeBytes
         model.maxContext = min(model.maxContext ?? summary.defaultContext, summary.contextLength)
         return model
+    }
+
+    /// いっしょにダウンロードした先読み（MTP）用のモデルを変換する（組にならない・変換できないときは使わない。元のファイルは消す）
+    nonisolated private static func convertDrafter(of model: InstalledModel, in folder: URL) -> String? {
+        let fileManager = FileManager.default
+        guard let entry = model.files.first(where: { GGUFNaming.isDrafter($0.path) }) else { return nil }
+        let source = folder.appendingPathComponent(model.localPath(for: entry.path))
+        guard fileManager.fileExists(atPath: source.path) else { return nil }
+        defer { try? fileManager.removeItem(at: source) }
+        let store = folder.appendingPathComponent(ggufDrafterName)
+        do {
+            let config = try GGUFConverter.convert(gguf: source, to: store, isCancelled: { Task.isCancelled })
+            guard config.family == .gemma4Assistant else {
+                try? fileManager.removeItem(at: store)
+                return nil
+            }
+            return ggufDrafterName
+        } catch {
+            try? fileManager.removeItem(at: store)
+            return nil
+        }
     }
 
     /// 「ファイル」アプリなどから GGUF を取り込む（コピーしてから変換する）
@@ -614,7 +638,10 @@ final class ModelLibrary {
         return ModelFiles(
             modelID: model.id,
             displayName: model.displayName,
-            source: .gguf(GGUFModelFiles(store: store, context: context, memory: .stored)),
+            source: .gguf(GGUFModelFiles(store: store, context: context, memory: .stored,
+                                         drafter: model.ggufDrafterPath.map { folder.appendingPathComponent($0) }
+                                             .flatMap { fileManager.fileExists(atPath: $0.path) ? $0 : nil },
+                                         drafts: GGUFModelFiles.storedDrafts)),
             tokenizerJSON: tokenizer,
             tokenizerConfigJSON: optional("tokenizer_config.json"),
             generationConfigJSON: optional("generation_config.json"),

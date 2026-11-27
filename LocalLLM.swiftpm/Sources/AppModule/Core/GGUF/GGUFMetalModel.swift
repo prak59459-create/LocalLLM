@@ -23,7 +23,10 @@ struct GGUFMetalArgs {
     var epsilon: Float = 0
     var scale: Float = 0
     var softcap: Float = 0
-    var pad: Float = 0
+    /// 足し算の倍率など（計算ごとの意味は GGUFMetalSource を見る）
+    var extra: Float = 0
+    var auxOffset: UInt32 = 0
+    var auxStride: UInt32 = 0
 }
 
 enum GGUFMetalError: Error, LocalizedError, Equatable {
@@ -113,6 +116,15 @@ final class GGUFMetalModel: GGUFEvaluator {
     private(set) var length = 0
     /// 重みをコピーせずに GPU へ渡せたか（false のときはコピーしている）
     private(set) var usesMappedWeights = true
+    /// 最後の計算で GPU が動いていた時間（秒。速さを調べる用）
+    private(set) var lastGPUSeconds = 0.0
+    /// 最後に logits を計算した位置（受け入れたあとは、最後に受け入れた位置）の、出力層の前の隠れ状態（先読みの入力）
+    private(set) var lastHidden: [Float] = []
+    /// 先読み用のモデル（つないだときだけ）と、まとめて確かめた結果
+    private var drafter: Drafter?
+    private var verifiedLogitsBuffer: MTLBuffer?
+    private var verifiedHidden: [[Float]] = []
+    private var verifyStart = 0
     let deviceName: String
 
     private let store: GGUFWeightStore
@@ -169,7 +181,8 @@ final class GGUFMetalModel: GGUFEvaluator {
         if config.deltaNet != nil || config.attentionOutputGate { throw GGUFMetalError.unavailable("Gated DeltaNet") }
         // 専門家の混合（MoE）も、まだ GPU では計算しない
         if config.moe != nil { throw GGUFMetalError.unavailable("mixture of experts") }
-        for shape in shapes where shape.headSize % 4 != 0 || shape.headCount % shape.kvHeadCount != 0 {
+        // 注意の足し合わせは、ヘッドの大きさ ÷ 4 個のスレッドを 1 つの threadgroup に入れる（256 まで）
+        for shape in shapes where shape.headSize % 4 != 0 || shape.headSize > 1024 || shape.headCount % shape.kvHeadCount != 0 {
             throw GGUFMetalError.unavailable("head size \(shape.headSize)")
         }
         self.store = store
@@ -452,7 +465,8 @@ final class GGUFMetalModel: GGUFEvaluator {
         return count
     }
 
-    private func forward(_ tokens: [Int], wantsLogits: Bool) throws -> [Float] {
+    /// all: どの位置の logits と隠れ状態も計算する（先読みの確かめ。logits は verifiedLogitsBuffer に入る）
+    private func forward(_ tokens: [Int], wantsLogits: Bool, all: Bool = false, profile: Commands.Profile? = nil) throws -> [Float] {
         let n = tokens.count
         let start = length
         if cacheCapacity == 0 { try allocateCache(min(maxContext, Self.initialCache)) }
@@ -461,22 +475,88 @@ final class GGUFMetalModel: GGUFEvaluator {
         embed(tokens, start: start)
         fillRotations(start: start, count: n)
 
-        guard let commands = queue.makeCommandBuffer(), let encoder = commands.makeComputeCommandEncoder() else {
-            throw GGUFMetalError.failed("command buffer")
-        }
-        encodePerLayerInputs(encoder, count: n)
+        let commands = try Commands(queue: queue, profile: profile)
+        try commands.begin("per-layer inputs")
+        encodePerLayerInputs(commands.encoder, count: n)
         for index in layers.indices {
-            encodeLayer(encoder, layer: index, start: start, count: n)
+            try encodeLayer(commands, layer: index, start: start, count: n)
         }
-        if wantsLogits { encodeOutput(encoder, count: n) }
-        encoder.endEncoding()
-        commands.commit()
-        commands.waitUntilCompleted()
-        if let error = commands.error {
-            throw GGUFMetalError.failed(error.localizedDescription)
+        if wantsLogits {
+            try commands.begin("output")
+            encodeOutput(commands.encoder, count: n, all: all)
         }
+        try commands.finish()
+        lastGPUSeconds = commands.gpuSeconds
         length = start + n
-        return wantsLogits ? readLogits() : []
+        guard wantsLogits else { return [] }
+        // 出力層の前の隠れ状態（正規化したもの）を覚えておく
+        let d = config.embeddingSize
+        let rows = normed.contents().assumingMemoryBound(to: Float.self)
+        if all {
+            verifiedHidden = (0..<n).map { Array(UnsafeBufferPointer(start: rows + $0 * d, count: d)) }
+            return []
+        }
+        lastHidden = Array(UnsafeBufferPointer(start: rows, count: d))
+        return readLogits()
+    }
+
+    /// 1 回の計算の、部分ごとの GPU の時間（秒）を測る（速さを調べる用。部分ごとに命令列を分けるので、全体は少し遅くなる）
+    func profile(_ tokens: [Int]) throws -> [String: Double] {
+        try validate(tokens)
+        let profile = Commands.Profile()
+        _ = try forward(tokens, wantsLogits: true, profile: profile)
+        return profile.seconds
+    }
+
+    /// GPU に渡す命令列。ふだんは 1 つにまとめる。測るときは部分ごとに分けて、それぞれの GPU の時間を足していく
+    private final class Commands {
+        final class Profile {
+            var seconds: [String: Double] = [:]
+        }
+
+        private let queue: MTLCommandQueue
+        private let profile: Profile?
+        private var buffer: MTLCommandBuffer
+        private(set) var encoder: MTLComputeCommandEncoder
+        private var section = ""
+        private(set) var gpuSeconds = 0.0
+
+        init(queue: MTLCommandQueue, profile: Profile?) throws {
+            guard let buffer = queue.makeCommandBuffer(), let encoder = buffer.makeComputeCommandEncoder() else {
+                throw GGUFMetalError.failed("command buffer")
+            }
+            self.queue = queue
+            self.profile = profile
+            self.buffer = buffer
+            self.encoder = encoder
+        }
+
+        /// ここから先を name の部分として測る（測らないときは何もしない）
+        func begin(_ name: String) throws {
+            guard profile != nil, name != section else { return }
+            if section.isEmpty {
+                section = name
+                return
+            }
+            try finish()
+            guard let buffer = queue.makeCommandBuffer(), let encoder = buffer.makeComputeCommandEncoder() else {
+                throw GGUFMetalError.failed("command buffer")
+            }
+            self.buffer = buffer
+            self.encoder = encoder
+            section = name
+        }
+
+        /// 命令列を GPU に渡して、終わるまで待つ
+        func finish() throws {
+            encoder.endEncoding()
+            buffer.commit()
+            buffer.waitUntilCompleted()
+            if let error = buffer.error { throw GGUFMetalError.failed(error.localizedDescription) }
+            let seconds = max(0, buffer.gpuEndTime - buffer.gpuStartTime)
+            gpuSeconds += seconds
+            profile?.seconds[section, default: 0] += seconds
+        }
     }
 
     private func reserveScores(_ needed: Int) throws {
@@ -513,9 +593,9 @@ final class GGUFMetalModel: GGUFEvaluator {
         }
     }
 
-    private func readLogits() -> [Float] {
+    private func readLogits(from buffer: MTLBuffer? = nil, row: Int = 0) -> [Float] {
         let rows = globals.output.rows
-        let source = logits.contents().assumingMemoryBound(to: Float.self)
+        let source = (buffer ?? logits).contents().assumingMemoryBound(to: Float.self) + row * rows
         var result = [Float](repeating: 0, count: max(config.vocabSize, rows))
         result.withUnsafeMutableBufferPointer { buffer in
             guard let base = buffer.baseAddress else { return }
@@ -555,43 +635,60 @@ final class GGUFMetalModel: GGUFEvaluator {
     private func run(_ kernel: Kernel, _ encoder: MTLComputeCommandEncoder, _ bindings: [Binding], _ arguments: GGUFMetalArgs,
                      width: Int, height: Int = 1) {
         guard let pipeline = pipelines[kernel], width > 0, height > 0 else { return }
-        encoder.setComputePipelineState(pipeline)
-        for (index, binding) in bindings.enumerated() {
-            encoder.setBuffer(binding.buffer, offset: binding.offset, index: index)
-        }
-        var values = arguments
-        encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: bindings.count)
+        bind(pipeline, encoder, bindings, arguments)
         let group = max(1, pipeline.threadExecutionWidth)
         let groups = MTLSize(width: (width + group - 1) / group, height: height, depth: 1)
         encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: MTLSize(width: group, height: 1, depth: 1))
     }
 
-    /// threadgroup の数を決めて並べる（1 つの threadgroup に threads 個のスレッド）
+    /// threadgroup の数を決めて並べる（1 つの threadgroup に threads 個のスレッド。GPU の上限までに抑える）
     private func run(_ kernel: Kernel, _ encoder: MTLComputeCommandEncoder, _ bindings: [Binding], _ arguments: GGUFMetalArgs,
-                     groups: Int, threads: Int) {
-        guard let pipeline = pipelines[kernel], groups > 0 else { return }
+                     groups: Int, height: Int = 1, threads: Int) {
+        guard let pipeline = pipelines[kernel], groups > 0, height > 0 else { return }
+        bind(pipeline, encoder, bindings, arguments)
+        let limit = max(32, pipeline.maxTotalThreadsPerThreadgroup / 32 * 32)
+        encoder.dispatchThreadgroups(MTLSize(width: groups, height: height, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: min(threads, limit), height: 1, depth: 1))
+    }
+
+    private func bind(_ pipeline: MTLComputePipelineState, _ encoder: MTLComputeCommandEncoder, _ bindings: [Binding],
+                      _ arguments: GGUFMetalArgs) {
         encoder.setComputePipelineState(pipeline)
         for (index, binding) in bindings.enumerated() {
             encoder.setBuffer(binding.buffer, offset: binding.offset, index: index)
         }
         var values = arguments
         encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: bindings.count)
-        encoder.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
     }
 
-    /// SIMD グループが 32 スレッドの GPU（Apple の GPU）なら、1 トークンの線形層を 32 スレッドで 1 行ずつ計算する
+    /// SIMD グループが 32 スレッドの GPU（Apple の GPU）なら、線形層を SIMD グループで何行かずつ計算する
     private var usesSimdRows: Bool {
-        pipelines[.linearQ8Vector]?.threadExecutionWidth == 32 && pipelines[.linearF32Vector]?.threadExecutionWidth == 32
-            && pipelines[.linearQ4Vector]?.threadExecutionWidth == 32 && pipelines[.linearQ5Vector]?.threadExecutionWidth == 32
+        let kernels: [Kernel] = [.linearQ8Vector, .linearF32Vector, .linearQ4Rows, .linearQ5Rows, .linearQ4Batch, .linearQ5Batch,
+                                 .gateUpQ4, .gateUpQ5]
+        return kernels.allSatisfy { pipelines[$0]?.threadExecutionWidth == 32 }
+    }
+
+    /// 1 行をスレッド全部で計算する計算（正規化など）の、threadgroup のスレッド数
+    private static func rowThreads(_ columns: Int) -> Int {
+        min(256, max(32, (columns / 4 + 31) / 32 * 32))
     }
 
     private func vector(_ position: Int?) -> Binding {
         (vectors, (position ?? 0) * MemoryLayout<Float>.size)
     }
 
+    /// 線形層の出力の仕上げ
+    private enum Epilogue {
+        /// そのまま書く
+        case store
+        /// 出力に足す（出力 += 値 × scale）
+        case add(scale: Float)
+        /// gelu(値) × aux（aux の offset から。トークンごとに stride ずつ進む）
+        case geluTimes(aux: MTLBuffer, offset: Int, stride: Int)
+    }
+
     private func linear(_ encoder: MTLComputeCommandEncoder, _ weights: Weights, input: MTLBuffer, inOffset: Int = 0, inStride: Int,
-                        count: Int, output: MTLBuffer, outOffset: Int = 0, outStride: Int) {
+                        count: Int, output: MTLBuffer, outOffset: Int = 0, outStride: Int, epilogue: Epilogue = .store) {
         var arguments = GGUFMetalArgs()
         arguments.rows = UInt32(weights.rows)
         arguments.columns = UInt32(weights.columns)
@@ -603,12 +700,26 @@ final class GGUFMetalModel: GGUFEvaluator {
         arguments.weightSkip = UInt32(weights.skip)
         if weights.scales != nil { arguments.flags |= Flag.scales }
         if weights.bias != nil { arguments.flags |= Flag.bias }
+        var aux = vector(nil)
+        switch epilogue {
+        case .store:
+            break
+        case .add(let scale):
+            arguments.flags |= Flag.add
+            arguments.extra = scale
+        case .geluTimes(let buffer, let offset, let stride):
+            arguments.flags |= Flag.geluTimesAux
+            arguments.auxOffset = UInt32(offset)
+            arguments.auxStride = UInt32(stride)
+            aux = (buffer, 0)
+        }
         let batched = count > 1
         if weights.groupBits > 0, let params = weights.params {
-            linearGrouped(encoder, weights, params: params, input: input, output: output, arguments: arguments, batched: batched)
+            linearGrouped(encoder, weights, params: params, input: input, output: output, aux: aux, arguments: arguments)
             return
         }
-        let bindings: [Binding] = [(weights.buffer, weights.offset), vector(weights.scales), vector(weights.bias), (input, 0), (output, 0)]
+        let bindings: [Binding] = [(weights.buffer, weights.offset), vector(weights.scales), vector(weights.bias), (input, 0),
+                                   (output, 0), vector(nil), aux]
         if !batched && usesSimdRows {
             // 1 トークン: 32 スレッドで 1 行
             run(weights.isInt8 ? .linearQ8Vector : .linearF32Vector, encoder, bindings, arguments, groups: weights.rows, threads: 32)
@@ -623,24 +734,63 @@ final class GGUFMetalModel: GGUFEvaluator {
         run(kernel, encoder, bindings, arguments, width: weights.rows, height: batched ? (count + 3) / 4 : 1)
     }
 
-    /// 4・5 ビットの線形層（1 トークンは 32 スレッドで 1 行、それ以外はトークン 4 個ずつ）
+    /// 4・5 ビットの線形層。1 トークンは SIMD グループで 4 行ずつ、まとめてのときはトークン 8 個 × 2 行ずつ
     private func linearGrouped(_ encoder: MTLComputeCommandEncoder, _ weights: Weights, params: Binding, input: MTLBuffer,
-                               output: MTLBuffer, arguments: GGUFMetalArgs, batched: Bool) {
+                               output: MTLBuffer, aux: Binding, arguments: GGUFMetalArgs) {
         let five = weights.groupBits == 5
         // 5 ビット目の面が無い 4 ビットでも、場所は埋めておく（読まない）
         let high: Binding = weights.high.map { ($0.buffer, $0.offset) } ?? params
-        let bindings: [Binding] = [(weights.buffer, weights.offset), params, vector(weights.bias), (input, 0), (output, 0), high]
-        if !batched && usesSimdRows {
-            run(five ? .linearQ5Vector : .linearQ4Vector, encoder, bindings, arguments, groups: weights.rows, threads: 32)
+        let bindings: [Binding] = [(weights.buffer, weights.offset), params, vector(weights.bias), (input, 0), (output, 0), high, aux]
+        let count = Int(arguments.count)
+        guard usesSimdRows else {
+            run(five ? .linearQ5Vector : .linearQ4Vector, encoder, bindings, arguments, width: weights.rows, height: count)
             return
         }
-        run(five ? .linearQ5Batch : .linearQ4Batch, encoder, bindings, arguments, width: weights.rows,
-            height: (Int(arguments.count) + 3) / 4)
+        let threads = 32 * GGUFMetalSource.simdGroups
+        if count == 1 {
+            let rows = GGUFMetalSource.vectorRows * GGUFMetalSource.simdGroups
+            run(five ? .linearQ5Rows : .linearQ4Rows, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
+                threads: threads)
+            return
+        }
+        let rows = GGUFMetalSource.batchRows * GGUFMetalSource.simdGroups
+        let tokens = GGUFMetalSource.batchTokens
+        run(five ? .linearQ5Batch : .linearQ4Batch, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
+            height: (count + tokens - 1) / tokens, threads: threads)
     }
 
-    /// 正規化（weight が無ければ、重みを掛けない正規化）
+    /// FFN の gate と up を一度に計算できるか（1 トークン・どちらも同じ 4・5 ビット・バイアスなし）
+    private func canFuseGateUp(_ gate: Weights, _ up: Weights) -> Bool {
+        usesSimdRows && gate.groupBits > 0 && gate.groupBits == up.groupBits && gate.params != nil && up.params != nil
+            && gate.bias == nil && up.bias == nil && gate.rows == up.rows && gate.columns == up.columns
+    }
+
+    /// output = act(gate · input) × (up · input)（1 トークン）
+    private func gateUp(_ encoder: MTLComputeCommandEncoder, gate: Weights, up: Weights, input: MTLBuffer, output: MTLBuffer) {
+        guard let gateParams = gate.params, let upParams = up.params else { return }
+        var arguments = GGUFMetalArgs()
+        arguments.rows = UInt32(gate.rows)
+        arguments.columns = UInt32(gate.columns)
+        arguments.count = 1
+        switch config.activation {
+        case .gelu: arguments.flags |= Flag.gelu
+        case .reluSquared: arguments.flags |= Flag.reluSquared
+        case .silu: break
+        }
+        let five = gate.groupBits == 5
+        let gateHigh: Binding = gate.high.map { ($0.buffer, $0.offset) } ?? gateParams
+        let upHigh: Binding = up.high.map { ($0.buffer, $0.offset) } ?? upParams
+        let bindings: [Binding] = [(gate.buffer, gate.offset), gateParams, (up.buffer, up.offset), upParams, (input, 0), (output, 0),
+                                   gateHigh, upHigh]
+        let rows = GGUFMetalSource.gateUpRows * GGUFMetalSource.simdGroups
+        run(five ? .gateUpQ5 : .gateUpQ4, encoder, bindings, arguments, groups: (gate.rows + rows - 1) / rows,
+            threads: 32 * GGUFMetalSource.simdGroups)
+    }
+
+    /// 正規化（weight が無ければ、重みを掛けない正規化）。add があれば出力に足す: 出力 = (出力 + 値 × branch) × result
     private func normalize(_ encoder: MTLComputeCommandEncoder, _ input: MTLBuffer, inOffset: Int = 0, _ norm: Norm?,
-                           into output: MTLBuffer, outOffset: Int = 0, rows: Int, columns: Int, rms: Bool = false) {
+                           into output: MTLBuffer, outOffset: Int = 0, rows: Int, columns: Int, rms: Bool = false,
+                           add: (branch: Float, result: Float)? = nil) {
         var arguments = GGUFMetalArgs()
         arguments.rows = UInt32(rows)
         arguments.columns = UInt32(columns)
@@ -651,8 +801,13 @@ final class GGUFMetalModel: GGUFEvaluator {
         if norm?.weight != nil { arguments.flags |= Flag.normWeight }
         if norm?.bias != nil { arguments.flags |= Flag.normBias }
         if config.norm == .layer && !rms { arguments.flags |= Flag.layerNorm }
+        if let add {
+            arguments.flags |= Flag.add
+            arguments.extra = add.branch
+            arguments.scale = add.result
+        }
         let bindings: [Binding] = [(input, 0), vector(norm?.weight), vector(norm?.bias), (output, 0)]
-        run(.rmsNorm, encoder, bindings, arguments, width: rows)
+        run(.rmsNorm, encoder, bindings, arguments, groups: rows, threads: Self.rowThreads(columns))
     }
 
     /// out = scale × x + second × y（y が nil なら scale × x だけ）
@@ -705,21 +860,48 @@ final class GGUFMetalModel: GGUFEvaluator {
         run(.rope, encoder, bindings, arguments, width: table.pairs, height: count * heads)
     }
 
-    /// q / k の正規化（全体・ヘッドごと）
-    private func normalizeHeads(_ encoder: MTLComputeCommandEncoder, _ buffer: MTLBuffer, offset: Int = 0, _ norm: Norm,
-                                heads: Int, size: Int, count n: Int) {
-        if config.qkNormIsFull {
-            normalize(encoder, buffer, inOffset: offset, norm, into: buffer, outOffset: offset, rows: n, columns: heads * size)
-        } else {
-            normalize(encoder, buffer, inOffset: offset, norm, into: buffer, outOffset: offset, rows: n * heads, columns: size)
+    /// q / k の正規化と RoPE（1 つの計算にできるときはまとめる）
+    private func normalizeAndRotate(_ encoder: MTLComputeCommandEncoder, _ buffer: MTLBuffer, offset: Int = 0, _ norm: Norm?,
+                                    heads: Int, count n: Int, layer: Int) {
+        let shape = shapes[layer]
+        let table = shape.sliding ? slidingRope : fullRope
+        let afterRope = config.qkNormAfterRope
+        guard let norm else {
+            rotate(encoder, buffer, offset: offset, heads: heads, count: n, layer: layer)
+            return
         }
+        // ヘッドごとの RMSNorm なら、RoPE と 1 つの計算にする（RoPE が先のときは、回しても大きさが変わらない表に限る）
+        if !config.qkNormIsFull && config.norm == .rms && (!afterRope || table.magnitude == 1 || !shape.usesRope) {
+            var arguments = GGUFMetalArgs()
+            arguments.heads = UInt32(heads)
+            arguments.kvHeads = UInt32(norm.heads)
+            arguments.size = UInt32(shape.headSize)
+            arguments.pairs = UInt32(shape.usesRope ? table.pairs : 0)
+            arguments.outOffset = UInt32(offset)
+            arguments.epsilon = config.normEpsilon
+            if norm.weight != nil { arguments.flags |= Flag.normWeight }
+            if config.ropePairsAreSplit { arguments.flags |= Flag.splitPairs }
+            if afterRope { arguments.flags |= Flag.ropeFirst }
+            let bindings: [Binding] = [(buffer, 0), vector(norm.weight), (shape.sliding ? slidingRotation : rotation, 0)]
+            run(.headNormRope, encoder, bindings, arguments, groups: n * heads, threads: Self.rowThreads(shape.headSize))
+            return
+        }
+        if afterRope { rotate(encoder, buffer, offset: offset, heads: heads, count: n, layer: layer) }
+        if config.qkNormIsFull {
+            normalize(encoder, buffer, inOffset: offset, norm, into: buffer, outOffset: offset, rows: n, columns: heads * shape.headSize)
+        } else {
+            normalize(encoder, buffer, inOffset: offset, norm, into: buffer, outOffset: offset, rows: n * heads, columns: shape.headSize)
+        }
+        if !afterRope { rotate(encoder, buffer, offset: offset, heads: heads, count: n, layer: layer) }
     }
 
     // MARK: - 層
 
-    private func encodeLayer(_ encoder: MTLComputeCommandEncoder, layer index: Int, start: Int, count n: Int) {
+    private func encodeLayer(_ commands: Commands, layer index: Int, start: Int, count n: Int) throws {
         let layer = layers[index]
         let d = config.embeddingSize
+        try commands.begin("attention")
+        var encoder = commands.encoder
         // 注意の入力
         var attentionInput = hidden
         if let norm = layer.attentionNorm {
@@ -727,9 +909,12 @@ final class GGUFMetalModel: GGUFEvaluator {
             attentionInput = normed
         }
         encodeAttention(encoder, layer: index, input: attentionInput, start: start, count: n)
-        finishBranch(encoder, projected, postNorm: layer.postAttentionNorm, count: n)
-
+        // 層ごとの入力が無ければ、層の倍率は FFN の足し算のところで掛ける
+        let hasPerLayerInput = layer.inputGate != nil && layer.projection != nil
         if config.parallelResidual {
+            finishBranch(encoder, projected, postNorm: layer.postAttentionNorm, count: n)
+            try commands.begin("feed-forward")
+            encoder = commands.encoder
             var input = attentionInput
             if layer.feedForwardNorm?.weight != nil {
                 normalize(encoder, hidden, layer.feedForwardNorm, into: normed2, rows: n, columns: d)
@@ -739,19 +924,26 @@ final class GGUFMetalModel: GGUFEvaluator {
             finishBranch(encoder, feedForwardOut, postNorm: layer.postFeedForwardNorm, count: n)
             scaleAdd(encoder, hidden, plus: projected, into: hidden, count: n * d)
             scaleAdd(encoder, hidden, plus: feedForwardOut, into: hidden, count: n * d)
+            if !hasPerLayerInput && layer.outputScale != 1 {
+                scaleAdd(encoder, hidden, scale: layer.outputScale, into: hidden, count: n * d)
+            }
         } else {
-            scaleAdd(encoder, hidden, plus: projected, into: hidden, count: n * d)
+            addBranch(encoder, projected, postNorm: layer.postAttentionNorm, count: n)
+            try commands.begin("feed-forward")
+            encoder = commands.encoder
             var input = hidden
             if config.hasPreNorms {
                 normalize(encoder, hidden, layer.feedForwardNorm, into: normed, rows: n, columns: d)
                 input = normed
             }
             encodeFeedForward(encoder, layer: index, input: input, count: n)
-            finishBranch(encoder, feedForwardOut, postNorm: layer.postFeedForwardNorm, count: n)
-            scaleAdd(encoder, hidden, plus: feedForwardOut, into: hidden, count: n * d)
+            addBranch(encoder, feedForwardOut, postNorm: layer.postFeedForwardNorm, count: n,
+                      resultScale: hasPerLayerInput ? 1 : layer.outputScale)
         }
-        encodePerLayerInput(encoder, layer: index, count: n)
-        if layer.outputScale != 1 { scaleAdd(encoder, hidden, scale: layer.outputScale, into: hidden, count: n * d) }
+        if hasPerLayerInput {
+            try commands.begin("per-layer input")
+            encodePerLayerInput(commands.encoder, layer: index, count: n)
+        }
     }
 
     /// 注意・FFN の出力の仕上げ（後ろの正規化と倍率）
@@ -759,6 +951,18 @@ final class GGUFMetalModel: GGUFEvaluator {
         let d = config.embeddingSize
         if let postNorm { normalize(encoder, buffer, postNorm, into: buffer, rows: n, columns: d) }
         if config.residualScale != 1 { scaleAdd(encoder, buffer, scale: config.residualScale, into: buffer, count: n * d) }
+    }
+
+    /// hidden = (hidden + 仕上げた branch) × resultScale。後ろの正規化があれば、足し算も正規化の中でする
+    private func addBranch(_ encoder: MTLComputeCommandEncoder, _ branch: MTLBuffer, postNorm: Norm?, count n: Int,
+                           resultScale: Float = 1) {
+        let d = config.embeddingSize
+        if let postNorm {
+            normalize(encoder, branch, postNorm, into: hidden, rows: n, columns: d, add: (config.residualScale, resultScale))
+            return
+        }
+        scaleAdd(encoder, hidden, plus: branch, second: config.residualScale, into: hidden, count: n * d)
+        if resultScale != 1 { scaleAdd(encoder, hidden, scale: resultScale, into: hidden, count: n * d) }
     }
 
     private func attentionArguments(layer: Int, start: Int, count: Int) -> GGUFMetalArgs {
@@ -804,12 +1008,9 @@ final class GGUFMetalModel: GGUFEvaluator {
         let heads = shape.headCount, kvHeads = shape.kvHeadCount
         guard let keyBuffer = keys[shape.kvLayer], let valueBuffer = values[shape.kvLayer] else { return }
         let cacheOffset = start * kv
-        let afterRope = config.qkNormAfterRope
 
         linear(encoder, layer.query, input: input, inStride: d, count: n, output: queries, outStride: q)
-        if afterRope { rotate(encoder, queries, offset: 0, heads: heads, count: n, layer: index) }
-        if let norm = layer.queryNorm { normalizeHeads(encoder, queries, norm, heads: heads, size: size, count: n) }
-        if !afterRope { rotate(encoder, queries, offset: 0, heads: heads, count: n, layer: index) }
+        normalizeAndRotate(encoder, queries, layer.queryNorm, heads: heads, count: n, layer: index)
 
         if shape.kvLayer == index, let key = layer.key {
             // k と v は KV キャッシュの続きに直接書く
@@ -820,15 +1021,11 @@ final class GGUFMetalModel: GGUFEvaluator {
                 // Gemma 4: v が無ければ、正規化する前の k を使う
                 scaleAdd(encoder, keyBuffer, inOffset: cacheOffset, into: valueBuffer, outOffset: cacheOffset, count: n * kv)
             }
-            if afterRope { rotate(encoder, keyBuffer, offset: cacheOffset, heads: kvHeads, count: n, layer: index) }
-            if let norm = layer.keyNorm {
-                normalizeHeads(encoder, keyBuffer, offset: cacheOffset, norm, heads: kvHeads, size: size, count: n)
-            }
+            normalizeAndRotate(encoder, keyBuffer, offset: cacheOffset, layer.keyNorm, heads: kvHeads, count: n, layer: index)
             if config.hasValueNorm {
                 normalize(encoder, valueBuffer, inOffset: cacheOffset, nil, into: valueBuffer, outOffset: cacheOffset,
                           rows: n * kvHeads, columns: size, rms: true)
             }
-            if !afterRope { rotate(encoder, keyBuffer, offset: cacheOffset, heads: kvHeads, count: n, layer: index) }
         }
 
         let arguments = attentionArguments(layer: index, start: start, count: n)
@@ -836,9 +1033,10 @@ final class GGUFMetalModel: GGUFEvaluator {
         let scoreBindings: [Binding] = [(queries, 0), (keyBuffer, 0), (scores, 0)]
         run(.attentionScores, encoder, scoreBindings, arguments, width: start + n, height: rows)
         let softmaxBindings: [Binding] = [(scores, 0)]
-        run(.attentionSoftmax, encoder, softmaxBindings, arguments, width: rows)
+        run(.attentionSoftmax, encoder, softmaxBindings, arguments, groups: rows, threads: Self.rowThreads(4 * (start + n)))
         let combineBindings: [Binding] = [(scores, 0), (valueBuffer, 0), (attended, 0)]
-        run(.attentionCombine, encoder, combineBindings, arguments, width: size / 4, height: rows)
+        let quads = size / 4
+        run(.attentionCombine, encoder, combineBindings, arguments, groups: rows, threads: quads * max(1, 256 / quads))
 
         linear(encoder, layer.output, input: attended, inStride: q, count: n, output: projected, outStride: d)
     }
@@ -846,6 +1044,11 @@ final class GGUFMetalModel: GGUFEvaluator {
     private func encodeFeedForward(_ encoder: MTLComputeCommandEncoder, layer index: Int, input: MTLBuffer, count n: Int) {
         let layer = layers[index]
         let d = config.embeddingSize, ff = shapes[index].feedForwardSize
+        if let gate = layer.gate, n == 1, canFuseGateUp(gate, layer.up) {
+            gateUp(encoder, gate: gate, up: layer.up, input: input, output: gateBuffer)
+            linear(encoder, layer.down, input: gateBuffer, inStride: ff, count: n, output: feedForwardOut, outStride: d)
+            return
+        }
         linear(encoder, layer.up, input: input, inStride: d, count: n, output: upBuffer, outStride: ff)
         if let gate = layer.gate {
             linear(encoder, gate, input: input, inStride: d, count: n, output: gateBuffer, outStride: ff)
@@ -870,25 +1073,244 @@ final class GGUFMetalModel: GGUFEvaluator {
         scaleAdd(encoder, perLayerInputs, scale: half, plus: perLayerTokens, second: half, into: perLayerInputs, count: n * total)
     }
 
-    /// 層ごとの入力を足す（Gemma 4）
+    /// 層ごとの入力を足して、層の倍率を掛ける（Gemma 4）:
+    /// hidden = (hidden + norm(射影(gelu(入力のゲート · hidden) × その層の入力))) × 層の倍率
     private func encodePerLayerInput(_ encoder: MTLComputeCommandEncoder, layer index: Int, count n: Int) {
         let layer = layers[index]
         guard let inputGate = layer.inputGate, let projection = layer.projection else { return }
         let size = config.perLayerInputSize, total = size * config.layerCount, d = config.embeddingSize
-        linear(encoder, inputGate, input: hidden, inStride: d, count: n, output: perLayerWork, outStride: size)
-        activate(encoder, perLayerWork, up: perLayerInputs, upOffset: index * size, upColumns: size, upStride: total,
-                 activation: .gelu, count: n * size)
+        linear(encoder, inputGate, input: hidden, inStride: d, count: n, output: perLayerWork, outStride: size,
+               epilogue: .geluTimes(aux: perLayerInputs, offset: index * size, stride: total))
         linear(encoder, projection, input: perLayerWork, inStride: size, count: n, output: feedForwardOut, outStride: d)
-        normalize(encoder, feedForwardOut, layer.perLayerPostNorm, into: feedForwardOut, rows: n, columns: d, rms: true)
-        scaleAdd(encoder, hidden, plus: feedForwardOut, into: hidden, count: n * d)
+        normalize(encoder, feedForwardOut, layer.perLayerPostNorm, into: hidden, rows: n, columns: d, rms: true,
+                  add: (1, layer.outputScale))
     }
 
-    /// 最後のトークンだけ、出力層を計算する
-    private func encodeOutput(_ encoder: MTLComputeCommandEncoder, count n: Int) {
+    /// 最後のトークンだけ、出力層を計算する（all ならどのトークンも。verifiedLogitsBuffer に書く）
+    private func encodeOutput(_ encoder: MTLComputeCommandEncoder, count n: Int, all: Bool = false) {
         guard let outputWeights else { return }
         let d = config.embeddingSize
+        if all, let buffer = verifiedLogitsBuffer {
+            normalize(encoder, hidden, outputNorm, into: normed, rows: n, columns: d)
+            linear(encoder, outputWeights, input: normed, inStride: d, count: n, output: buffer, outStride: outputWeights.rows)
+            return
+        }
         normalize(encoder, hidden, inOffset: (n - 1) * d, outputNorm, into: normed, rows: 1, columns: d)
         linear(encoder, outputWeights, input: normed, inStride: d, count: 1, output: logits, outStride: outputWeights.rows)
+    }
+}
+
+// MARK: - 先読み（MTP）
+
+extension GGUFMetalModel: GGUFSpeculativeEvaluator {
+    /// 先読み用のモデル（gemma4-assistant）の重みと作業用のメモリ
+    private final class Drafter {
+        struct Layer {
+            var attentionNorm: Norm
+            var query: Weights
+            var queryNorm: Norm
+            var output: Weights
+            var postAttentionNorm: Norm
+            var feedForwardNorm: Norm
+            var gate: Weights
+            var up: Weights
+            var down: Weights
+            var postFeedForwardNorm: Norm
+            var outputScale: Float
+        }
+
+        let config: GGUFModelConfig
+        let store: GGUFWeightStore
+        let layers: [Layer]
+        let preProjection: Weights, postProjection: Weights, output: Weights
+        let outputNorm: Norm
+        /// 使う本体の層（KV キャッシュ）: 直近だけを見る層と、全体を見る層
+        let sources: (sliding: Int, full: Int)
+        let fullRope: GGUFRope.Table, slidingRope: GGUFRope.Table
+        let input: MTLBuffer, current: MTLBuffer, normed: MTLBuffer, projected: MTLBuffer, queries: MTLBuffer, attended: MTLBuffer
+        let gate: MTLBuffer, up: MTLBuffer, logits: MTLBuffer, next: MTLBuffer, rotation: MTLBuffer, slidingRotation: MTLBuffer
+
+        init(config: GGUFModelConfig, store: GGUFWeightStore, layers: [Layer], preProjection: Weights, postProjection: Weights,
+             output: Weights, outputNorm: Norm, sources: (sliding: Int, full: Int), ropeFactors: UnsafePointer<Float>?,
+             device: MTLDevice) throws {
+            self.config = config
+            self.store = store
+            self.layers = layers
+            self.preProjection = preProjection
+            self.postProjection = postProjection
+            self.output = output
+            self.outputNorm = outputNorm
+            self.sources = sources
+            fullRope = GGUFRope.table(config: config, sliding: false, factors: ropeFactors)
+            slidingRope = GGUFRope.table(config: config, sliding: true, factors: ropeFactors)
+            let d = config.embeddingSize, outer = config.drafterOutputSize
+            input = try GGUFMetalModel.floats(device, 2 * outer)
+            current = try GGUFMetalModel.floats(device, d)
+            normed = try GGUFMetalModel.floats(device, d)
+            projected = try GGUFMetalModel.floats(device, d)
+            queries = try GGUFMetalModel.floats(device, config.maxQuerySize)
+            attended = try GGUFMetalModel.floats(device, config.maxQuerySize)
+            gate = try GGUFMetalModel.floats(device, config.maxFeedForwardSize)
+            up = try GGUFMetalModel.floats(device, config.maxFeedForwardSize)
+            logits = try GGUFMetalModel.floats(device, output.rows)
+            next = try GGUFMetalModel.floats(device, outer)
+            rotation = try GGUFMetalModel.floats(device, max(fullRope.pairs, 1) * 2)
+            slidingRotation = try GGUFMetalModel.floats(device, max(slidingRope.pairs, 1) * 2)
+        }
+    }
+
+    /// 先読み用のモデルをつなぐ（組にならなければエラー）
+    func attachDrafter(store drafterStore: GGUFWeightStore) throws {
+        let drafterConfig = drafterStore.config
+        let sources = try GGUFDrafterWeights.cacheLayers(drafter: drafterConfig, target: config)
+        guard drafterConfig.normEpsilon == config.normEpsilon, drafterConfig.norm == config.norm else {
+            throw GGUFMetalError.unavailable("draft model normalization")
+        }
+        let source = try GGUFDrafterWeights(store: drafterStore)
+        // 小さなベクトルのまとめに、先読みの分を足す（今までの位置はそのまま使える）
+        let existing = vectors.contents().assumingMemoryBound(to: Float.self)
+        pool = Array(UnsafeBufferPointer(start: existing, count: vectors.length / MemoryLayout<Float>.size))
+        let d = drafterConfig.embeddingSize
+        var layers: [Drafter.Layer] = []
+        for (index, layer) in source.layers.enumerated() {
+            let shape = drafterConfig.layers[index]
+            layers.append(Drafter.Layer(
+                attentionNorm: norm(layer.attentionNorm, bias: nil, count: d), query: try weights(layer.query, bias: nil),
+                queryNorm: norm(layer.queryNorm, bias: nil, count: shape.headSize), output: try weights(layer.output, bias: nil),
+                postAttentionNorm: norm(layer.postAttentionNorm, bias: nil, count: d),
+                feedForwardNorm: norm(layer.feedForwardNorm, bias: nil, count: d),
+                gate: try weights(layer.gate, bias: nil), up: try weights(layer.up, bias: nil), down: try weights(layer.down, bias: nil),
+                postFeedForwardNorm: norm(layer.postFeedForwardNorm, bias: nil, count: d), outputScale: layer.outputScale))
+        }
+        let preProjection = try weights(source.preProjection, bias: nil)
+        let postProjection = try weights(source.postProjection, bias: nil)
+        let output = try weights(source.output, bias: nil)
+        let outputNorm = norm(source.outputNorm, bias: nil, count: d)
+        let bytes = pool.count * MemoryLayout<Float>.size
+        guard let buffer = device.makeBuffer(bytes: pool, length: bytes, options: .storageModeShared) else {
+            throw GGUFMetalError.unavailable("vector buffer")
+        }
+        vectors = buffer
+        pool = []
+        drafter = try Drafter(config: drafterConfig, store: drafterStore, layers: layers, preProjection: preProjection,
+                              postProjection: postProjection, output: output, outputNorm: outputNorm, sources: sources,
+                              ropeFactors: source.ropeFactors, device: device)
+    }
+
+    var canDraft: Bool { drafter != nil }
+
+    func draft(after token: Int, hidden state: [Float], count: Int) throws -> [Int] {
+        guard let drafter, count > 0, length > 0 else { return [] }
+        let position = length, outer = drafter.config.drafterOutputSize
+        try reserveScores(drafter.config.maxHeadCount * position)
+        fill(drafter.rotation, drafter.fullRope, start: position, count: 1)
+        fill(drafter.slidingRotation, drafter.slidingRope, start: position, count: 1)
+        let input = drafter.input.contents().assumingMemoryBound(to: Float.self)
+        let next = drafter.next.contents().assumingMemoryBound(to: Float.self)
+        state.withUnsafeBufferPointer { (input + outer).update(from: $0.baseAddress!, count: min(outer, $0.count)) }
+        var drafts: [Int] = []
+        var current = token
+        for step in 0..<count {
+            // 入力: [本体の埋め込み × √(本体の大きさ), 隠れ状態（最初は本体の、あとは前の予想の）]
+            GGUFKernels.embeddingRow(globals.embedding, row: current, scale: Float(outer).squareRoot(), into: input)
+            if step > 0 { (input + outer).update(from: next, count: outer) }
+            let commands = try Commands(queue: queue, profile: nil)
+            encodeDraftStep(commands.encoder, drafter, position: position)
+            try commands.finish()
+            let logits = drafter.logits.contents().assumingMemoryBound(to: Float.self)
+            var best = 0
+            for index in 1..<drafter.output.rows where logits[index] > logits[best] { best = index }
+            drafts.append(best)
+            current = best
+        }
+        return drafts
+    }
+
+    func verify(_ tokens: [Int]) throws {
+        try validate(tokens)
+        let rows = globals.output.rows
+        if (verifiedLogitsBuffer?.length ?? 0) < tokens.count * rows * MemoryLayout<Float>.size {
+            verifiedLogitsBuffer = try Self.floats(device, max(tokens.count, 4) * rows)
+        }
+        verifyStart = length
+        _ = try forward(tokens, wantsLogits: true, all: true)
+    }
+
+    func verifiedLogits(_ index: Int) -> [Float] {
+        guard let buffer = verifiedLogitsBuffer, index < verifiedHidden.count else { return [] }
+        return readLogits(from: buffer, row: index)
+    }
+
+    func accept(_ count: Int) {
+        guard count < verifiedHidden.count else { return }
+        truncate(to: verifyStart + count + 1)
+        lastHidden = verifiedHidden[count]
+    }
+
+    /// 先読み 1 回（入力は drafter.input、logits は drafter.logits、次の隠れ状態は drafter.next）
+    private func encodeDraftStep(_ encoder: MTLComputeCommandEncoder, _ drafter: Drafter, position: Int) {
+        let config = drafter.config, d = config.embeddingSize, outer = config.drafterOutputSize
+        linear(encoder, drafter.preProjection, input: drafter.input, inStride: 2 * outer, count: 1, output: drafter.current, outStride: d)
+        for (index, layer) in drafter.layers.enumerated() {
+            let shape = config.layers[index], ff = shape.feedForwardSize
+            normalize(encoder, drafter.current, layer.attentionNorm, into: drafter.normed, rows: 1, columns: d)
+            linear(encoder, layer.query, input: drafter.normed, inStride: d, count: 1, output: drafter.queries, outStride: shape.querySize)
+            encodeDraftQueryNorm(encoder, drafter, layer: index)
+            encodeDraftAttention(encoder, drafter, layer: index, position: position)
+            linear(encoder, layer.output, input: drafter.attended, inStride: shape.querySize, count: 1, output: drafter.projected,
+                   outStride: d)
+            normalize(encoder, drafter.projected, layer.postAttentionNorm, into: drafter.current, rows: 1, columns: d, add: (1, 1))
+            normalize(encoder, drafter.current, layer.feedForwardNorm, into: drafter.normed, rows: 1, columns: d)
+            linear(encoder, layer.up, input: drafter.normed, inStride: d, count: 1, output: drafter.up, outStride: ff)
+            linear(encoder, layer.gate, input: drafter.normed, inStride: d, count: 1, output: drafter.gate, outStride: ff)
+            activate(encoder, drafter.gate, up: drafter.up, activation: .gelu, count: ff)
+            linear(encoder, layer.down, input: drafter.gate, inStride: ff, count: 1, output: drafter.projected, outStride: d)
+            normalize(encoder, drafter.projected, layer.postFeedForwardNorm, into: drafter.current, rows: 1, columns: d,
+                      add: (1, layer.outputScale))
+        }
+        normalize(encoder, drafter.current, drafter.outputNorm, into: drafter.normed, rows: 1, columns: d)
+        linear(encoder, drafter.output, input: drafter.normed, inStride: d, count: 1, output: drafter.logits, outStride: drafter.output.rows)
+        linear(encoder, drafter.postProjection, input: drafter.normed, inStride: d, count: 1, output: drafter.next, outStride: outer)
+    }
+
+    /// 先読みの q のヘッドごとの正規化と RoPE（位置は本体がまだ読んでいない位置。表の 0 行目）
+    private func encodeDraftQueryNorm(_ encoder: MTLComputeCommandEncoder, _ drafter: Drafter, layer index: Int) {
+        let config = drafter.config, shape = config.layers[index], norm = drafter.layers[index].queryNorm
+        let table = shape.sliding ? drafter.slidingRope : drafter.fullRope
+        var arguments = GGUFMetalArgs()
+        arguments.heads = UInt32(shape.headCount)
+        arguments.kvHeads = UInt32(norm.heads)
+        arguments.size = UInt32(shape.headSize)
+        arguments.pairs = UInt32(shape.usesRope ? table.pairs : 0)
+        arguments.epsilon = config.normEpsilon
+        if norm.weight != nil { arguments.flags |= Flag.normWeight }
+        if config.ropePairsAreSplit { arguments.flags |= Flag.splitPairs }
+        let bindings: [Binding] = [(drafter.queries, 0), vector(norm.weight), (shape.sliding ? drafter.slidingRotation : drafter.rotation, 0)]
+        run(.headNormRope, encoder, bindings, arguments, groups: shape.headCount, threads: Self.rowThreads(shape.headSize))
+    }
+
+    /// 先読みの注意: 本体の KV キャッシュの位置 0 … position − 1 を見る（直近だけを見る層は、position から窓の大きさ未満）
+    private func encodeDraftAttention(_ encoder: MTLComputeCommandEncoder, _ drafter: Drafter, layer index: Int, position: Int) {
+        let config = drafter.config, shape = config.layers[index]
+        let source = shape.sliding ? drafter.sources.sliding : drafter.sources.full
+        guard let keyBuffer = keys[source], let valueBuffer = values[source] else { return }
+        var arguments = GGUFMetalArgs()
+        arguments.count = 1
+        arguments.heads = UInt32(shape.headCount)
+        arguments.kvHeads = 1
+        arguments.size = UInt32(shape.headSize)
+        arguments.total = UInt32(position)
+        // q は位置 position にあるが、キャッシュは position − 1 まで: 位置 position − 1 から見ることにして、窓を 1 つ小さくする
+        arguments.start = UInt32(position - 1)
+        arguments.window = UInt32(shape.sliding && config.slidingWindow > 1 ? config.slidingWindow - 1 : 0)
+        arguments.scale = config.attentionScale
+        arguments.softcap = config.attentionSoftcap
+        let heads = shape.headCount
+        run(.attentionScores, encoder, [(drafter.queries, 0), (keyBuffer, 0), (scores, 0)], arguments, width: position, height: heads)
+        run(.attentionSoftmax, encoder, [(scores, 0)], arguments, groups: heads, threads: Self.rowThreads(4 * position))
+        let quads = shape.headSize / 4
+        run(.attentionCombine, encoder, [(scores, 0), (valueBuffer, 0), (drafter.attended, 0)], arguments, groups: heads,
+            threads: quads * max(1, 256 / quads))
     }
 }
 #endif

@@ -18,14 +18,14 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         let threads: Int
         let counts: [Int]
         /// 列を分ける SIMD グループの数（Args.split）を使う計算か。使うなら rowsPerGroup は行の組の大きさで、
-        /// 数はアプリと同じ GGUFMetalSource.split(columns:)（split があればその数に決め打ち）
+        /// 数はアプリと同じ GGUFMetalSource.split(rows:columns:)（split があればその数に決め打ち）
         var splits = false
         var split: Int? = nil
 
         /// この行列での、threadgroup の数・スレッドの数・Args.split
         func shape(rows: Int, columns: Int) -> (groups: Int, threads: Int, split: Int) {
             guard splits else { return ((rows + rowsPerGroup - 1) / rowsPerGroup, threads, 0) }
-            let count = split ?? GGUFMetalSource.split(columns: columns)
+            let count = split ?? GGUFMetalSource.split(rows: rows, columns: columns)
             let simds = max(2, count)
             let perGroup = simds / count * rowsPerGroup
             return ((rows + perGroup - 1) / perGroup, 32 * simds, count)
@@ -117,7 +117,7 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
             return pipeline
         }
         // アプリの 1 トークンの計算を、分ける数を決め打ちして（1・2・4）と、アプリの選び方で
-        let candidates: [Candidate] = [1, 2, 4].map { split in
+        let candidates: [Candidate] = [1, 2, 4].map { (split: Int) in
             Candidate(label: "app-rows-split\(split)", function: "linear_q4_rows", rowsPerGroup: GGUFMetalSource.vectorRows,
                       tokensPerGroup: 0, threads: 64, counts: [1], splits: true, split: split)
         } + [Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: GGUFMetalSource.vectorRows, tokensPerGroup: 0,

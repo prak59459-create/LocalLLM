@@ -106,12 +106,15 @@ enum GGUFMetalSource {
     static let fewTokens = 4
 
     /// 4・5 ビットの線形層（1 トークン・少しまとめて・gate と up）で、1 つの行の組の列を分けて受け持つ SIMD グループの数（Args.split）。
-    /// 列が多いほど多く分ける。CI の Mac では、分けないときより FFN の down（12288 列）で 4 にして 14%、注意の o（2048 列）で 2 にして 11% 速かった。
+    /// CI の Mac で、どの回に測っても速かったところだけで分ける: 列のとても多い行列（FFN の down、6144 列以上）は 4 つに（分けないときより 5〜14% 速い）、
+    /// 行のとても少ない行列（k・v・層ごとの入力のゲート、512 行まで）は 2 つに（6〜14% 速い）。注意の q・o、FFN の up などは、
+    /// 速くなる回と遅くなる回があった（差は ±10% の測り方のぶれより小さい）ので分けない。
     /// 1 トークンのときと少しまとめてのときで同じ数にするので、足す順番が同じになり、先読みで確かめた値が 1 トークンずつのときとちょうど同じになる
-    static func split(columns: Int) -> Int {
+    static func split(rows: Int, columns: Int) -> Int {
         let halves = columns / 16
-        if halves < 64 { return 1 }
-        return Swift.min(splitMax, Swift.max(2, halves / 48))
+        if halves >= 384 { return splitMax }
+        if halves >= 64 && rows <= 512 { return 2 }
+        return 1
     }
 
     static let splitMax = 4

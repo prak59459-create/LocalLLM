@@ -27,7 +27,7 @@ struct GGUFMetalArgs {
     var extra: Float = 0
     var auxOffset: UInt32 = 0
     var auxStride: UInt32 = 0
-    /// 4・5 ビットの線形層: 1 つの行の組の列を分けて受け持つ SIMD グループの数（GGUFMetalSource.split(columns:)）
+    /// 4・5 ビットの線形層: 1 つの行の組の列を分けて受け持つ SIMD グループの数（GGUFMetalSource.split(rows:columns:)）
     var split: UInt32 = 0
 }
 
@@ -839,11 +839,11 @@ final class GGUFMetalModel: GGUFEvaluator {
     }
 
     /// 4・5 ビットの線形層。1 トークンは行の組（2 行）ごと、少しまとめて（4 トークンまで）は 4 行の組ごとで、
-    /// どちらも列を GGUFMetalSource.split(columns:) 個の SIMD グループで分ける。たくさんまとめては行列の掛け算
+    /// どちらも列を GGUFMetalSource.split(rows:columns:) 個の SIMD グループで分ける。たくさんまとめては行列の掛け算
     private func linearGrouped(_ encoder: MTLComputeCommandEncoder, _ weights: Weights, params: Binding, input: MTLBuffer,
                                output: MTLBuffer, aux: Binding, arguments base: GGUFMetalArgs) {
         var arguments = base
-        let split = GGUFMetalSource.split(columns: weights.columns)
+        let split = GGUFMetalSource.split(rows: weights.rows, columns: weights.columns)
         arguments.split = UInt32(split)
         let five = weights.groupBits == 5
         // 5 ビット目の面が無い 4 ビットでも、場所は埋めておく（読まない）
@@ -905,7 +905,7 @@ final class GGUFMetalModel: GGUFEvaluator {
         let upHigh: Binding = up.high.map { ($0.buffer, $0.offset) } ?? upParams
         let bindings: [Binding] = [(gate.buffer, gate.offset), gateParams, (up.buffer, up.offset), upParams, (input, 0), (output, 0),
                                    gateHigh, upHigh]
-        let split = GGUFMetalSource.split(columns: gate.columns)
+        let split = GGUFMetalSource.split(rows: gate.rows, columns: gate.columns)
         arguments.split = UInt32(split)
         let layout = Self.splitShape(split: split, rowsPerGroup: GGUFMetalSource.gateUpRows)
         run(five ? .gateUpQ5 : .gateUpQ4, encoder, bindings, arguments, groups: (gate.rows + layout.rows - 1) / layout.rows,

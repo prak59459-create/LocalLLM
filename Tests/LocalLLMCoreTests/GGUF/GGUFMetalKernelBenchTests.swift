@@ -50,13 +50,14 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         }
 
         let q4: [Candidate] = [
-            Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: 8, tokensPerGroup: 0, threads: 64, counts: [1]),
+            Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: 2 * GGUFMetalSource.vectorRows, tokensPerGroup: 0,
+                      threads: 64, counts: [1]),
             Candidate(label: "app-few2", function: "linear_q4_few2", rowsPerGroup: 8, tokensPerGroup: 2, threads: 64, counts: [2]),
             Candidate(label: "app-few3", function: "linear_q4_few3", rowsPerGroup: 8, tokensPerGroup: 3, threads: 64, counts: [3]),
             Candidate(label: "app-few4", function: "linear_q4_few4", rowsPerGroup: 8, tokensPerGroup: 4, threads: 64, counts: [4, 8]),
             Candidate(label: "app-legacy", function: "linear_q4_batch", rowsPerGroup: 4, tokensPerGroup: 8, threads: 64, counts: [2, 8]),
             Candidate(label: "x-shift2", function: "xq4_one2", rowsPerGroup: 4, tokensPerGroup: 0, threads: 64, counts: [1]),
-            Candidate(label: "x-mask2", function: "xq4_mask2", rowsPerGroup: 4, tokensPerGroup: 0, threads: 64, counts: [1]),
+            Candidate(label: "x-mask4", function: "xq4_mask4", rowsPerGroup: 8, tokensPerGroup: 0, threads: 64, counts: [1]),
         ] + (matrices ? [Candidate(label: "app-matrix", function: "linear_q4_mma", rowsPerGroup: 32, tokensPerGroup: 8, threads: 128,
                                    counts: [2, 4, 8])] : [])
         let q8: [Candidate] = [
@@ -68,8 +69,6 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
             Candidate(label: "app-legacy", function: "linear_q8_tokens", rowsPerGroup: 4, tokensPerGroup: 8, threads: 64, counts: [2]),
             Candidate(label: "x-one1", function: "xq8_one1", rowsPerGroup: 2, tokensPerGroup: 0, threads: 64, counts: [1]),
             Candidate(label: "x-one4", function: "xq8_one4", rowsPerGroup: 8, tokensPerGroup: 0, threads: 64, counts: [1]),
-            Candidate(label: "x-fewh4", function: "xq8_fewh4", rowsPerGroup: 8, tokensPerGroup: 4, threads: 64, counts: [4]),
-            Candidate(label: "x-fewh8", function: "xq8_fewh8", rowsPerGroup: 8, tokensPerGroup: 8, threads: 64, counts: [8]),
         ] + (matrices ? [Candidate(label: "app-matrix", function: "linear_q8_mma", rowsPerGroup: 32, tokensPerGroup: 8, threads: 128,
                                    counts: [2, 4, 8])] : [])
 
@@ -351,7 +350,7 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
     }
 
     typedef decltype(xq4_mask<2>) xq4_mask_t;
-    template [[host_name("xq4_mask2")]] kernel xq4_mask_t xq4_mask<2>;
+    template [[host_name("xq4_mask4")]] kernel xq4_mask_t xq4_mask<4>;
 
     // 8 ビット・1 トークン: SIMD グループ 1 つで R 行（アプリは Q8_ROWS 行）
     template <uint R>
@@ -392,66 +391,6 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
     typedef decltype(xq8_one<2>) xq8_one_t;
     template [[host_name("xq8_one1")]] kernel xq8_one_t xq8_one<1>;
     template [[host_name("xq8_one4")]] kernel xq8_one_t xq8_one<4>;
-
-    // 8 ビット・N トークン: linear_q8_few と同じで、取り出した重み（-128 … 127 の整数なので half でちょうど表せる）を half で持つ
-    template <uint N>
-    kernel void xq8_fewh(device const char *weights [[buffer(0)]],
-                         device const float *scales [[buffer(1)]],
-                         device const float *bias [[buffer(2)]],
-                         device const float *input [[buffer(3)]],
-                         device float *output [[buffer(4)]],
-                         device const float *aux [[buffer(6)]],
-                         constant Args &a [[buffer(7)]],
-                         uint2 group [[threadgroup_position_in_grid]],
-                         uint simd [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-        uint first = (group.x * SIMD_GROUPS + simd) * FEW_ROWS;
-        uint t0 = group.y * N;
-        if (first >= a.rows || t0 >= a.count) { return; }
-        uint rows = min(FEW_ROWS, a.rows - first);
-        uint tokens = min(N, a.count - t0);
-        uint chunks = a.columns >> 4u;
-        device const uint4 *w = (device const uint4 *)(weights + a.weightSkip);
-        device const float *base = input + a.inOffset + t0 * a.inStride;
-        float acc[FEW_ROWS][N];
-        for (uint r = 0u; r < FEW_ROWS; r++) {
-            for (uint t = 0u; t < N; t++) { acc[r][t] = 0.0f; }
-        }
-        for (uint c = lane; c < chunks; c += 32u) {
-            half4 w0[FEW_ROWS];
-            half4 w1[FEW_ROWS];
-            half4 w2[FEW_ROWS];
-            half4 w3[FEW_ROWS];
-            for (uint r = 0u; r < FEW_ROWS; r++) {
-                uint4 q = w[(first + min(r, rows - 1u)) * chunks + c];
-                w0[r] = half4(as_type<char4>(q.x));
-                w1[r] = half4(as_type<char4>(q.y));
-                w2[r] = half4(as_type<char4>(q.z));
-                w3[r] = half4(as_type<char4>(q.w));
-            }
-            for (uint t = 0u; t < N; t++) {
-                device const packed_float4 *x = (device const packed_float4 *)(base + min(t, tokens - 1u) * a.inStride) + c * 4u;
-                float4 x0 = float4(x[0]);
-                float4 x1 = float4(x[1]);
-                float4 x2 = float4(x[2]);
-                float4 x3 = float4(x[3]);
-                for (uint r = 0u; r < FEW_ROWS; r++) {
-                    acc[r][t] += dot(float4(w0[r]), x0) + dot(float4(w1[r]), x1) + dot(float4(w2[r]), x2) + dot(float4(w3[r]), x3);
-                }
-            }
-        }
-        for (uint r = 0u; r < FEW_ROWS; r++) {
-            float scale = ((a.flags & 1u) != 0u) ? scales[first + min(r, rows - 1u)] : 1.0f;
-            for (uint t = 0u; t < N; t++) {
-                float sum = simd_sum(acc[r][t]);
-                if (lane == 0u && r < rows && t < tokens) { linear_store(output, bias, aux, a, first + r, t0 + t, sum * scale); }
-            }
-        }
-    }
-
-    typedef decltype(xq8_fewh<4>) xq8_fewh_t;
-    template [[host_name("xq8_fewh4")]] kernel xq8_fewh_t xq8_fewh<4>;
-    template [[host_name("xq8_fewh8")]] kernel xq8_fewh_t xq8_fewh<8>;
     """
 }
 #endif

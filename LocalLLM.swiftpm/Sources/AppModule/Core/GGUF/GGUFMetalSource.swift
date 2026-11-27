@@ -91,9 +91,9 @@ enum GGUFMetalSource {
         static let ropeFirst: UInt32 = 4096
     }
 
-    /// 線形層の SIMD グループ 1 つが受け持つ行（1 トークン・まとめて）と、threadgroup の SIMD グループの数
-    static let vectorRows = 4
-    /// 8 ビットの線形層（1 トークン）の、SIMD グループ 1 つが受け持つ行（2 行のほうが 4 行より速かった）
+    /// 4・5 ビットの線形層（1 トークン）の、SIMD グループ 1 つが受け持つ行（2 行のほうが 4 行より速かった。小さな行列ほど差が大きい）
+    static let vectorRows = 2
+    /// 8 ビットの線形層（1 トークン）の、SIMD グループ 1 つが受け持つ行（1・2・4 行で速さはほぼ同じだった）
     static let q8Rows = 2
     static let batchRows = 2
     static let gateUpRows = 2
@@ -139,7 +139,7 @@ enum GGUFMetalSource {
         uint auxStride;
     };
 
-    #define VECTOR_ROWS 4u
+    #define VECTOR_ROWS 2u
     #define FEW_ROWS 4u
     #define Q8_ROWS 2u
     #define BATCH_ROWS 2u

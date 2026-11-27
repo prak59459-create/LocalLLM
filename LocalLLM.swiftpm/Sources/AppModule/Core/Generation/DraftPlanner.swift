@@ -16,9 +16,12 @@ struct DraftPlanner {
     /// 次の判断まで、決めた数のまま進む回数など
     private var roundsSinceExplore = 0
     private var roundsSincePlain = 0
+    /// 最初の予想の時間は使わない（読み込んでから初めて予想するときは、先読み用の重みを初めて読むので何倍も遅い。
+    /// CI の Mac では 46 ms と、ふだんの 15 倍ほど。その 1 回で「予想は高い」と見て、しばらく予想しなくなっていた）
+    private var skippedFirstDraft = false
 
-    /// 予想しない回が続いても、この回数ごとに 1 つ予想して、当たり方を確かめ直す
-    static let exploreEvery = 16
+    /// 予想しない回が続いても、この回数ごとに 1 つ予想して、当たり方と時間を確かめ直す
+    static let exploreEvery = 8
     /// 予想し続けても、この回数ごとに予想しない回を入れて、ふつうの 1 回の時間を測り直す
     static let plainEvery = 48
     /// 新しく測った値の重み（時間が今の見積もりより長いとき）
@@ -99,7 +102,11 @@ struct DraftPlanner {
     /// 測った時間を覚える: drafted 個の予想に draftTime 秒、verified 個の確かめに verifyTime 秒
     mutating func recordTimes(drafted: Int, draftTime: Double, verified: Int, verifyTime: Double) {
         if drafted > 0, draftTime > 0 {
-            draftSeconds = Self.blend(draftSeconds, draftTime / Double(drafted))
+            if skippedFirstDraft {
+                draftSeconds = Self.blend(draftSeconds, draftTime / Double(drafted))
+            } else {
+                skippedFirstDraft = true
+            }
         }
         guard verified >= 1, verified < verifySeconds.count, verifyTime > 0 else { return }
         verifySeconds[verified] = Self.blend(verifySeconds[verified], verifyTime)

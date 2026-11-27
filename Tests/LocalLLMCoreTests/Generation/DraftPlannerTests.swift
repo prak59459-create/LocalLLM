@@ -59,25 +59,29 @@ final class DraftPlannerTests: XCTestCase {
         XCTAssertEqual(plain, 1)
     }
 
-    /// 最初の 1 回だけ遅くても（重みを初めて読む など）、速く測れればすぐに見積もりを直す。遅くなるほうはゆっくり追う
-    func testRecoversQuicklyFromASlowFirstMeasurement() {
+    /// 読み込んでから最初の予想の時間（先読み用の重みを初めて読むので遅い）は使わない。そのあとも、速く測れればすぐに見積もりを直し、
+    /// 遅くなるほうはゆっくり追う
+    func testIgnoresTheFirstDraftTimeAndRecoversQuickly() {
         var planner = DraftPlanner(maximum: 2)
-        planner.recordTimes(drafted: 1, draftTime: 0.030, verified: 2, verifyTime: 0.300)
+        planner.recordTimes(drafted: 1, draftTime: 0.046, verified: 2, verifyTime: 0.300)
+        XCTAssertEqual(planner.draftCost, 0.1 * planner.verifyCost(1), accuracy: 1e-9, "the first draft time is not used")
         planner.recordTimes(drafted: 1, draftTime: 0.003, verified: 2, verifyTime: 0.035)
-        // 速い値には 8 割の重み
-        XCTAssertEqual(planner.draftCost, 0.030 * 0.2 + 0.003 * 0.8, accuracy: 1e-9)
+        XCTAssertEqual(planner.draftCost, 0.003, accuracy: 1e-9)
+        // 確かめの時間: 速い値には 8 割の重み
         XCTAssertEqual(planner.verifyCost(2), 0.300 * 0.2 + 0.035 * 0.8, accuracy: 1e-9)
         for _ in 0..<2 { planner.recordTimes(drafted: 1, draftTime: 0.003, verified: 2, verifyTime: 0.035) }
         XCTAssertLessThan(planner.verifyCost(2), 0.040)
-        XCTAssertLessThan(planner.draftCost, 0.004)
         // 1 回だけ遅くても、見積もりは 2 割しか動かない
         let before = planner.verifyCost(2)
-        planner.recordTimes(drafted: 1, draftTime: 0.003, verified: 2, verifyTime: 0.100)
+        planner.recordTimes(drafted: 1, draftTime: 0.030, verified: 2, verifyTime: 0.100)
         XCTAssertEqual(planner.verifyCost(2), before * 0.8 + 0.100 * 0.2, accuracy: 1e-9)
+        XCTAssertEqual(planner.draftCost, 0.003 * 0.8 + 0.030 * 0.2, accuracy: 1e-9)
     }
 
     func testEstimatesUnmeasuredBatchesFromMeasuredOnes() {
         var planner = DraftPlanner(maximum: 3)
+        // 最初の予想の時間は使われない（読み込んだ直後の 1 回）
+        planner.recordTimes(drafted: 1, draftTime: 0.050, verified: 1, verifyTime: 0)
         planner.recordTimes(drafted: 2, draftTime: 0.004, verified: 3, verifyTime: 0.039)
         // 3 個で 39 ms → 1 個は 30 ms、2 個は 34.5 ms と見る
         XCTAssertEqual(planner.verifyCost(1), 0.030, accuracy: 1e-9)

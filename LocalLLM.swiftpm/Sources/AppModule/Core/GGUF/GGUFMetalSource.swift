@@ -104,6 +104,20 @@ enum GGUFMetalSource {
     /// （トークンの数をコンパイル時に決めた計算がある数。それより多いときは何回かに分ける）
     static let fewRows = 4
     static let fewTokens = 4
+
+    /// 4・5 ビットの線形層（1 トークン・少しまとめて・gate と up）で、1 つの行の組の列を分けて受け持つ SIMD グループの数（Args.split）。
+    /// CI の Mac で、どの回に測っても速かったところだけで分ける: 列のとても多い行列（FFN の down、6144 列以上）は 4 つに（分けないときより 5〜14% 速い）、
+    /// 行のとても少ない行列（k・v・層ごとの入力のゲート、512 行まで）は 2 つに（6〜14% 速い）。注意の q・o、FFN の up などは、
+    /// 速くなる回と遅くなる回があった（差は ±10% の測り方のぶれより小さい）ので分けない。
+    /// 1 トークンのときと少しまとめてのときで同じ数にするので、足す順番が同じになり、先読みで確かめた値が 1 トークンずつのときとちょうど同じになる
+    static func split(rows: Int, columns: Int) -> Int {
+        let halves = columns / 16
+        if halves >= 384 { return splitMax }
+        if halves >= 64 && rows <= 512 { return 2 }
+        return 1
+    }
+
+    static let splitMax = 4
     /// 行列の掛け算（simdgroup の 8×8）でまとめて計算するときの、threadgroup 1 つが受け持つ行・トークンと、スレッドの数
     static let matrixRows = 32
     static let matrixTokens = 8
@@ -137,6 +151,8 @@ enum GGUFMetalSource {
         float extra;
         uint auxOffset;
         uint auxStride;
+        // 4・5 ビットの線形層（1 トークン・少しまとめて・gate と up）: 1 つの行の組の列を分けて受け持つ SIMD グループの数（0・1 は分けない）
+        uint split;
     };
 
     #define VECTOR_ROWS 2u
@@ -640,21 +656,53 @@ enum GGUFMetalSource {
         return dot(a0, y0) + dot(a1, y1) + dot(a2, y2) + dot(a3, y3);
     }
 
-    // 1 トークン: SIMD グループ 1 つで VECTOR_ROWS 行。スレッドは組の半分ずつを受け持ち、入力は 1 回読んで何行にも使う。
-    // threadgroup = SIMD_GROUPS 個の SIMD グループ。4 ビットは masked_dot、5 ビットは half_dot
+    // 線形層の threadgroup の分け方（Args.split = 1 つの行の組の列を分けて受け持つ SIMD グループの数。1・2・4）。
+    // threadgroup の SIMD グループは max(2, split) 個で、split 個ずつで 1 つの行の組を受け持つ（組の半分を split × 32 個おきに取る）。
+    // 行の少ない行列（FFN の down・注意の o など）でも SIMD グループが足りるように、列を分けて、最後に threadgroup で足す
+    #define SPLIT_MAX 4u
+
+    struct Split {
+        uint count;
+        // threadgroup の中の行の組の数と、この SIMD グループの行の組・受け持つ列の番号
+        uint groups;
+        uint slot;
+        uint slice;
+    };
+
+    inline Split split_layout(constant Args &a, uint simd) {
+        Split s;
+        s.count = clamp(a.split, 1u, SPLIT_MAX);
+        s.groups = max(2u, s.count) / s.count;
+        s.slot = simd / s.count;
+        s.slice = simd % s.count;
+        return s;
+    }
+
+    // 行の組の split 個の SIMD グループの和を、SIMD グループの順に足す（partial[SIMD グループ × width + i]）。
+    // どの計算でも同じ順に足すので、1 トークンのときと少しまとめてのときで、ちょうど同じ値になる
+    inline float split_sum(threadgroup const float *partial, Split s, uint width, uint i) {
+        float sum = 0.0f;
+        for (uint k = 0u; k < s.count; k++) { sum += partial[(s.slot * s.count + k) * width + i]; }
+        return sum;
+    }
+
+    // 1 トークン: 行の組 1 つ（VECTOR_ROWS 行）を split 個の SIMD グループで（split_layout）。スレッドは組の半分ずつを受け持ち、
+    // 入力は 1 回読んで何行にも使う。4 ビットは masked_dot、5 ビットは half_dot。partial は threadgroup の SPLIT_MAX × VECTOR_ROWS 個
     inline void linear_group_rows(device const uchar *nibbles, device const half2 *params, device const float *bias,
                                   device const float *input, device float *output, device const uint *high,
-                                  device const float *aux, constant Args &a, uint group, uint simd, uint lane, bool five) {
-        uint first = (group * SIMD_GROUPS + simd) * VECTOR_ROWS;
-        if (first >= a.rows) { return; }
-        uint rows = min(VECTOR_ROWS, a.rows - first);
+                                  device const float *aux, constant Args &a, threadgroup float *partial, uint group, uint simd,
+                                  uint lane, bool five) {
+        Split s = split_layout(a, simd);
+        uint first = (group * s.groups + s.slot) * VECTOR_ROWS;
+        // 行の外の SIMD グループも、threadgroup で足すところまでは一緒に進む
+        uint rows = first < a.rows ? min(VECTOR_ROWS, a.rows - first) : 0u;
         uint groups = a.columns >> 5u;
-        uint halves = groups * 2u;
+        uint halves = rows > 0u ? groups * 2u : 0u;
         device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
         device const uint2 *words = (device const uint2 *)nibbles;
         float acc[VECTOR_ROWS];
         for (uint r = 0u; r < VECTOR_ROWS; r++) { acc[r] = 0.0f; }
-        for (uint h = lane; h < halves; h += 32u) {
+        for (uint h = s.slice * 32u + lane; h < halves; h += 32u * s.count) {
             float4 x0 = float4(x[h * 4u]);
             float4 x1 = float4(x[h * 4u + 1u]);
             float4 x2 = float4(x[h * 4u + 2u]);
@@ -677,10 +725,12 @@ enum GGUFMetalSource {
             }
         }
         for (uint r = 0u; r < VECTOR_ROWS; r++) {
-            if (r < rows) {
-                float sum = simd_sum(acc[r]);
-                if (lane == 0u) { linear_store(output, bias, aux, a, first + r, 0u, sum); }
-            }
+            float sum = simd_sum(acc[r]);
+            if (lane == 0u) { partial[simd * VECTOR_ROWS + r] = sum; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s.slice == 0u && lane < rows) {
+            linear_store(output, bias, aux, a, first + lane, 0u, split_sum(partial, s, VECTOR_ROWS, lane));
         }
     }
 
@@ -760,7 +810,8 @@ enum GGUFMetalSource {
                                uint group [[threadgroup_position_in_grid]],
                                uint simd [[simdgroup_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
-        linear_group_rows(nibbles, params, bias, input, output, high, aux, a, group, simd, lane, false);
+        threadgroup float partial[SPLIT_MAX * VECTOR_ROWS];
+        linear_group_rows(nibbles, params, bias, input, output, high, aux, a, partial, group, simd, lane, false);
     }
 
     kernel void linear_q5_rows(device const uchar *nibbles [[buffer(0)]],
@@ -774,7 +825,8 @@ enum GGUFMetalSource {
                                uint group [[threadgroup_position_in_grid]],
                                uint simd [[simdgroup_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
-        linear_group_rows(nibbles, params, bias, input, output, high, aux, a, group, simd, lane, true);
+        threadgroup float partial[SPLIT_MAX * VECTOR_ROWS];
+        linear_group_rows(nibbles, params, bias, input, output, high, aux, a, partial, group, simd, lane, true);
     }
 
     // 4 個の q（0 … 31 の整数）を half に。half でちょうど表せるので、float のときの半分のレジスタで持てる
@@ -788,7 +840,8 @@ enum GGUFMetalSource {
                      half((bits >> (e + 2u)) & 1u), half((bits >> (e + 3u)) & 1u)) * half(16.0f);
     }
 
-    // 少しまとめて（N トークン。先読みの確かめなど）: 1 トークンのときと同じく SIMD グループ 1 つで FEW_ROWS 行、スレッドは組の半分ずつ。
+    // 少しまとめて（N トークン。先読みの確かめなど）: 1 トークンのときと同じく、行の組 1 つ（FEW_ROWS 行）を split 個の SIMD グループで、
+    // スレッドは組の半分ずつ（1 トークンのときと同じ split なら、足す順番も同じ）。
     // 組の半分の重みは 1 回だけ q に直して（half で持つ）N トークンに使い、入力はトークンごとに 1 回読んで全部の行に使う。
     // N はコンパイル時に決める（足し込む値をレジスタに置くため。実行時の数で回すと、配列がメモリに置かれて遅くなる）。
     // threadgroup の y = トークン ÷ N。残りが N より少ないときは、最後のトークンを読み直して計算し、書かない
@@ -804,20 +857,23 @@ enum GGUFMetalSource {
                                  uint2 group [[threadgroup_position_in_grid]],
                                  uint simd [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
-        uint first = (group.x * SIMD_GROUPS + simd) * FEW_ROWS;
+        threadgroup float partial[SPLIT_MAX * FEW_ROWS * N];
+        Split s = split_layout(a, simd);
+        uint first = (group.x * s.groups + s.slot) * FEW_ROWS;
         uint t0 = group.y * N;
-        if (first >= a.rows || t0 >= a.count) { return; }
-        uint rows = min(FEW_ROWS, a.rows - first);
+        // threadgroup の全部の SIMD グループで同じ（threadgroup ごと抜ける）
+        if (t0 >= a.count) { return; }
+        uint rows = first < a.rows ? min(FEW_ROWS, a.rows - first) : 0u;
         uint tokens = min(N, a.count - t0);
         uint groups = a.columns >> 5u;
-        uint halves = groups * 2u;
+        uint halves = rows > 0u ? groups * 2u : 0u;
         device const uint2 *words = (device const uint2 *)nibbles;
         device const float *base = input + a.inOffset + t0 * a.inStride;
         float acc[FEW_ROWS][N];
         for (uint r = 0u; r < FEW_ROWS; r++) {
             for (uint t = 0u; t < N; t++) { acc[r][t] = 0.0f; }
         }
-        for (uint h = lane; h < halves; h += 32u) {
+        for (uint h = s.slice * 32u + lane; h < halves; h += 32u * s.count) {
             uint part = h & 1u;
             uint block = first * groups + (h >> 1u);
             half4 w0[FEW_ROWS];
@@ -857,8 +913,14 @@ enum GGUFMetalSource {
         for (uint r = 0u; r < FEW_ROWS; r++) {
             for (uint t = 0u; t < N; t++) {
                 float sum = simd_sum(acc[r][t]);
-                if (lane == 0u && r < rows && t < tokens) { linear_store(output, bias, aux, a, first + r, t0 + t, sum); }
+                if (lane == 0u) { partial[(simd * FEW_ROWS + r) * N + t] = sum; }
             }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // 行 × トークン（16 個まで）を 1 スレッドずつ書く
+        if (s.slice == 0u && lane < rows * N && lane % N < tokens) {
+            uint r = lane / N, t = lane % N;
+            linear_store(output, bias, aux, a, first + r, t0 + t, split_sum(partial, s, FEW_ROWS * N, lane));
         }
     }
 
@@ -949,17 +1011,18 @@ enum GGUFMetalSource {
     }
 
     // FFN の gate と up を一度に（1 トークン。入力を 1 回読んで 2 つの行列に使う）: 出力 = act(gate · x) × (up · x)。
-    // SIMD グループ 1 つで GATE_UP_ROWS 行。4 ビットは masked_dot、5 ビットは half_dot
+    // 行の組 1 つ（GATE_UP_ROWS 行）を split 個の SIMD グループで（gate・up を別々に少しまとめて計算するときと、足す順番が同じ）。
+    // 4 ビットは masked_dot、5 ビットは half_dot。partial は threadgroup の SPLIT_MAX × GATE_UP_ROWS × 2 個
     inline void gate_up_rows(device const uchar *gateNibbles, device const half2 *gateParams,
                              device const uchar *upNibbles, device const half2 *upParams,
                              device const float *input, device float *output,
                              device const uint *gateHigh, device const uint *upHigh,
-                             constant Args &a, uint group, uint simd, uint lane, bool five) {
-        uint first = (group * SIMD_GROUPS + simd) * GATE_UP_ROWS;
-        if (first >= a.rows) { return; }
-        uint rows = min(GATE_UP_ROWS, a.rows - first);
+                             constant Args &a, threadgroup float *partial, uint group, uint simd, uint lane, bool five) {
+        Split s = split_layout(a, simd);
+        uint first = (group * s.groups + s.slot) * GATE_UP_ROWS;
+        uint rows = first < a.rows ? min(GATE_UP_ROWS, a.rows - first) : 0u;
         uint groups = a.columns >> 5u;
-        uint halves = groups * 2u;
+        uint halves = rows > 0u ? groups * 2u : 0u;
         device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
         device const uint2 *gateWords = (device const uint2 *)gateNibbles;
         device const uint2 *upWords = (device const uint2 *)upNibbles;
@@ -969,7 +1032,7 @@ enum GGUFMetalSource {
             g[r] = 0.0f;
             u[r] = 0.0f;
         }
-        for (uint h = lane; h < halves; h += 32u) {
+        for (uint h = s.slice * 32u + lane; h < halves; h += 32u * s.count) {
             float4 x0 = float4(x[h * 4u]);
             float4 x1 = float4(x[h * 4u + 1u]);
             float4 x2 = float4(x[h * 4u + 2u]);
@@ -996,11 +1059,18 @@ enum GGUFMetalSource {
             }
         }
         for (uint r = 0u; r < GATE_UP_ROWS; r++) {
-            if (r < rows) {
-                float gs = simd_sum(g[r]);
-                float us = simd_sum(u[r]);
-                if (lane == 0u) { output[a.outOffset + first + r] = activation(gs, a.flags) * us; }
+            float gs = simd_sum(g[r]);
+            float us = simd_sum(u[r]);
+            if (lane == 0u) {
+                partial[(simd * GATE_UP_ROWS + r) * 2u] = gs;
+                partial[(simd * GATE_UP_ROWS + r) * 2u + 1u] = us;
             }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s.slice == 0u && lane < rows) {
+            float gs = split_sum(partial, s, GATE_UP_ROWS * 2u, lane * 2u);
+            float us = split_sum(partial, s, GATE_UP_ROWS * 2u, lane * 2u + 1u);
+            output[a.outOffset + first + lane] = activation(gs, a.flags) * us;
         }
     }
 
@@ -1018,7 +1088,8 @@ enum GGUFMetalSource {
                            uint group [[threadgroup_position_in_grid]],
                            uint simd [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
-        gate_up_rows(gateNibbles, gateParams, upNibbles, upParams, input, output, gateHigh, upHigh, a, group, simd, lane, false);
+        threadgroup float partial[SPLIT_MAX * GATE_UP_ROWS * 2u];
+        gate_up_rows(gateNibbles, gateParams, upNibbles, upParams, input, output, gateHigh, upHigh, a, partial, group, simd, lane, false);
     }
 
     kernel void gate_up_q5(device const uchar *gateNibbles [[buffer(0)]],
@@ -1033,7 +1104,8 @@ enum GGUFMetalSource {
                            uint group [[threadgroup_position_in_grid]],
                            uint simd [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
-        gate_up_rows(gateNibbles, gateParams, upNibbles, upParams, input, output, gateHigh, upHigh, a, group, simd, lane, true);
+        threadgroup float partial[SPLIT_MAX * GATE_UP_ROWS * 2u];
+        gate_up_rows(gateNibbles, gateParams, upNibbles, upParams, input, output, gateHigh, upHigh, a, partial, group, simd, lane, true);
     }
 
     // 正規化（RMSNorm か LayerNorm）。threadgroup = 行（rows 行 × columns）で、1 行をスレッド全部で計算する。

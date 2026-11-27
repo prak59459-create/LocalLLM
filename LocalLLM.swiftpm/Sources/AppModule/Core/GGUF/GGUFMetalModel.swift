@@ -247,13 +247,22 @@ final class GGUFMetalModel: GGUFEvaluator {
     // MARK: - 用意
 
     private func makePipelines() throws {
-        let library: MTLLibrary
-        do {
-            library = try device.makeLibrary(source: GGUFMetalSource.code, options: nil)
-        } catch {
-            throw GGUFMetalError.unavailable("shader: \(error.localizedDescription)")
+        // simdgroup の行列の計算（まとめての線形層）は Apple7 以降の GPU だけ。コンパイルできなければ使わない
+        var library: MTLLibrary?
+        if device.supportsFamily(.apple7) {
+            library = try? device.makeLibrary(source: GGUFMetalSource.code + GGUFMetalSource.matrixCode, options: nil)
         }
+        let withMatrices = library != nil
+        if library == nil {
+            do {
+                library = try device.makeLibrary(source: GGUFMetalSource.code, options: nil)
+            } catch {
+                throw GGUFMetalError.unavailable("shader: \(error.localizedDescription)")
+            }
+        }
+        guard let library else { throw GGUFMetalError.unavailable("shader") }
         for kernel in Kernel.allCases {
+            if !withMatrices && Kernel.matrixKernels.contains(kernel) { continue }
             guard let function = library.makeFunction(name: kernel.rawValue) else {
                 throw GGUFMetalError.unavailable("kernel \(kernel.rawValue)")
             }
@@ -668,6 +677,23 @@ final class GGUFMetalModel: GGUFEvaluator {
         return kernels.allSatisfy { pipelines[$0]?.threadExecutionWidth == 32 }
     }
 
+    /// まとめての線形層を、simdgroup の行列の掛け算で計算できるか（Apple7 以降の GPU）
+    var usesMatrixKernels: Bool {
+        // 計算の中は 32 スレッドの SIMD グループ 4 つ（128 スレッド）を前提にしている
+        Kernel.matrixKernels.allSatisfy { kernel in
+            guard let pipeline = pipelines[kernel] else { return false }
+            return pipeline.threadExecutionWidth == 32 && pipeline.maxTotalThreadsPerThreadgroup >= GGUFMetalSource.matrixThreads
+        }
+    }
+
+    /// まとめて（2 トークン以上）を行列の掛け算で: threadgroup 1 つで 32 行 × 8 トークン
+    private func runMatrix(_ kernel: Kernel, _ encoder: MTLComputeCommandEncoder, _ bindings: [Binding], _ arguments: GGUFMetalArgs,
+                           rows: Int, count: Int) {
+        let rowsPerGroup = GGUFMetalSource.matrixRows, tokensPerGroup = GGUFMetalSource.matrixTokens
+        run(kernel, encoder, bindings, arguments, groups: (rows + rowsPerGroup - 1) / rowsPerGroup,
+            height: (count + tokensPerGroup - 1) / tokensPerGroup, threads: GGUFMetalSource.matrixThreads)
+    }
+
     /// 1 行をスレッド全部で計算する計算（正規化など）の、threadgroup のスレッド数
     private static func rowThreads(_ columns: Int) -> Int {
         min(256, max(32, (columns / 4 + 31) / 32 * 32))
@@ -722,7 +748,9 @@ final class GGUFMetalModel: GGUFEvaluator {
                                    (output, 0), vector(nil), aux]
         if weights.isInt8 && usesSimdRows && weights.columns % 16 == 0 && weights.skip % 16 == 0 {
             let threads = 32 * GGUFMetalSource.simdGroups
-            if batched {
+            if batched && usesMatrixKernels {
+                runMatrix(.linearQ8Matrix, encoder, bindings, arguments, rows: weights.rows, count: count)
+            } else if batched {
                 let rows = GGUFMetalSource.batchRows * GGUFMetalSource.simdGroups
                 let tokens = GGUFMetalSource.batchTokens
                 run(.linearQ8Tokens, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
@@ -760,6 +788,10 @@ final class GGUFMetalModel: GGUFEvaluator {
             return
         }
         let threads = 32 * GGUFMetalSource.simdGroups
+        if count > 1 && usesMatrixKernels {
+            runMatrix(five ? .linearQ5Matrix : .linearQ4Matrix, encoder, bindings, arguments, rows: weights.rows, count: count)
+            return
+        }
         if count == 1 {
             let rows = GGUFMetalSource.vectorRows * GGUFMetalSource.simdGroups
             run(five ? .linearQ5Rows : .linearQ4Rows, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,

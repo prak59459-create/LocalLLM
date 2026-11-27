@@ -20,6 +20,12 @@ enum GGUFMetalSource {
         case linearQ8Tokens = "linear_q8_tokens"
         case argmax = "argmax"
         case embeddingRow = "embedding_row"
+        case linearQ4Matrix = "linear_q4_mma"
+        case linearQ5Matrix = "linear_q5_mma"
+        case linearQ8Matrix = "linear_q8_mma"
+
+        /// simdgroup の行列の計算を使うもの（Apple7 以降の GPU だけ。matrixCode にある）
+        static let matrixKernels: Set<Kernel> = [.linearQ4Matrix, .linearQ5Matrix, .linearQ8Matrix]
         case linearF32Vector = "linear_f32_vector"
         case linearQ4Vector = "linear_q4_vector"
         case linearQ5Vector = "linear_q5_vector"
@@ -73,6 +79,10 @@ enum GGUFMetalSource {
     static let simdGroups = 2
     /// まとめて計算するときの、1 回のトークン数
     static let batchTokens = 8
+    /// 行列の掛け算（simdgroup の 8×8）でまとめて計算するときの、threadgroup 1 つが受け持つ行・トークンと、スレッドの数
+    static let matrixRows = 32
+    static let matrixTokens = 8
+    static let matrixThreads = 128
 
     static let code = """
     #include <metal_stdlib>
@@ -1078,6 +1088,213 @@ enum GGUFMetalSource {
             value *= up[a.inOffset + index];
         }
         gate[gid] = value;
+    }
+    """
+
+    /// まとめて（トークン 2 個以上）の線形層を、simdgroup の 8×8 の行列の掛け算で計算する（Apple7 以降の GPU。code のあとにつなげる）。
+    /// 1 つずつのやり方は、まとめたトークンの数だけ入力を何度も読み直すので、先読みの確かめ・プロンプトの読み込みが遅かった。
+    /// threadgroup（SIMD グループ 4 つ）が MMA_ROWS 行 × MMA_TOKENS トークンを受け持ち、列を MMA_K 個ずつ進める:
+    /// 重みを Float32 に直して threadgroup メモリに置き、入力も置いてから、各 SIMD グループが 8 行 × 8 トークンを足し込む。
+    static let matrixCode = """
+    #define MMA_ROWS 32u
+    #define MMA_TOKENS 8u
+    #define MMA_K 64u
+    #define MMA_THREADS 128u
+
+    // 4・5 ビットの組の重みの MMA_ROWS 行 × MMA_K 列を、Float32 にして wTile に（[行][列]）。1 スレッドで組の半分（16 個）
+    inline void mma_load_groups(threadgroup float *wTile, device const uchar *nibbles, device const half2 *params,
+                                device const uint *high, constant Args &a, uint row0, uint k0, uint tid, bool five) {
+        uint groups = a.columns >> 5u;
+        for (uint i = tid; i < MMA_ROWS * (MMA_K / 16u); i += MMA_THREADS) {
+            uint r = i / (MMA_K / 16u);
+            uint q = i % (MMA_K / 16u);
+            uint col = k0 + q * 16u;
+            float4 w0 = float4(0.0f);
+            float4 w1 = float4(0.0f);
+            float4 w2 = float4(0.0f);
+            float4 w3 = float4(0.0f);
+            if (row0 + r < a.rows && col < a.columns) {
+                uint part = (col >> 4u) & 1u;
+                uint b = (row0 + r) * groups + (col >> 5u);
+                uint2 w = ((device const uint2 *)nibbles)[b * 2u + part];
+                float4 n0 = nibbles4(w.x, 0u);
+                float4 n1 = nibbles4(w.x, 16u);
+                float4 n2 = nibbles4(w.y, 0u);
+                float4 n3 = nibbles4(w.y, 16u);
+                if (five) {
+                    uint bits = high[b] >> (part * 16u);
+                    n0 += high4(bits, 0u);
+                    n1 += high4(bits, 4u);
+                    n2 += high4(bits, 8u);
+                    n3 += high4(bits, 12u);
+                }
+                float2 p = float2(params[b]);
+                w0 = n0 * p.x + p.y;
+                w1 = n1 * p.x + p.y;
+                w2 = n2 * p.x + p.y;
+                w3 = n3 * p.x + p.y;
+            }
+            threadgroup float4 *dst = (threadgroup float4 *)(wTile + r * MMA_K + q * 16u);
+            dst[0] = w0;
+            dst[1] = w1;
+            dst[2] = w2;
+            dst[3] = w3;
+        }
+    }
+
+    // 8 ビットの重み（行の先頭は 16 バイトの境目）の MMA_ROWS 行 × MMA_K 列を wTile に。行ごとの倍率は最後に掛ける
+    inline void mma_load_q8(threadgroup float *wTile, device const char *weights, constant Args &a, uint row0, uint k0, uint tid) {
+        for (uint i = tid; i < MMA_ROWS * (MMA_K / 16u); i += MMA_THREADS) {
+            uint r = i / (MMA_K / 16u);
+            uint q = i % (MMA_K / 16u);
+            uint col = k0 + q * 16u;
+            float4 w0 = float4(0.0f);
+            float4 w1 = float4(0.0f);
+            float4 w2 = float4(0.0f);
+            float4 w3 = float4(0.0f);
+            if (row0 + r < a.rows && col < a.columns) {
+                uint4 v = *((device const uint4 *)(weights + a.weightSkip + (row0 + r) * a.columns + col));
+                w0 = float4(as_type<char4>(v.x));
+                w1 = float4(as_type<char4>(v.y));
+                w2 = float4(as_type<char4>(v.z));
+                w3 = float4(as_type<char4>(v.w));
+            }
+            threadgroup float4 *dst = (threadgroup float4 *)(wTile + r * MMA_K + q * 16u);
+            dst[0] = w0;
+            dst[1] = w1;
+            dst[2] = w2;
+            dst[3] = w3;
+        }
+    }
+
+    // 入力の MMA_TOKENS トークン × MMA_K 列を xTile に（[トークン][列]。無いところは 0）
+    inline void mma_load_input(threadgroup float *xTile, device const float *input, constant Args &a, uint t0, uint k0, uint tid) {
+        for (uint i = tid; i < MMA_TOKENS * (MMA_K / 4u); i += MMA_THREADS) {
+            uint t = i / (MMA_K / 4u);
+            uint c = (i % (MMA_K / 4u)) * 4u;
+            float4 v = float4(0.0f);
+            if (t0 + t < a.count && k0 + c < a.columns) {
+                v = float4(*((device const packed_float4 *)(input + a.inOffset + (t0 + t) * a.inStride + k0 + c)));
+            }
+            *((threadgroup float4 *)(xTile + t * MMA_K + c)) = v;
+        }
+    }
+
+    // この SIMD グループの 8 行 × 8 トークンに、wTile · xTile^T（MMA_K 列ぶん）を足す
+    inline void mma_accumulate(threadgroup const float *wTile, threadgroup const float *xTile, uint simd, thread simdgroup_float8x8 &acc) {
+        for (uint kk = 0u; kk < MMA_K; kk += 8u) {
+            simdgroup_float8x8 w;
+            simdgroup_float8x8 x;
+            simdgroup_load(w, wTile + simd * 8u * MMA_K + kk, MMA_K);
+            simdgroup_load(x, xTile + kk, MMA_K, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc, w, x, acc);
+        }
+    }
+
+    // 8 行 × 8 トークンの結果を書く（行ごとの倍率・バイアス・gelu × aux・出力に足す）
+    inline void mma_store(threadgroup float *results, thread simdgroup_float8x8 &acc, device float *output, device const float *bias,
+                          device const float *aux, device const float *scales, bool scaled, constant Args &a,
+                          uint row0, uint t0, uint simd, uint lane) {
+        threadgroup float *mine = results + simd * 64u;
+        simdgroup_store(acc, mine, 8u);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = lane; e < 64u; e += 32u) {
+            uint row = row0 + simd * 8u + (e >> 3u);
+            uint t = e & 7u;
+            if (row < a.rows && t0 + t < a.count) {
+                float sum = mine[e];
+                if (scaled) { sum *= scales[row]; }
+                linear_store(output, bias, aux, a, row, t0 + t, sum);
+            }
+        }
+    }
+
+    // 入り口は linear_q4_batch と同じ並び（threadgroup の x = 行 ÷ MMA_ROWS、y = トークン ÷ MMA_TOKENS）
+    kernel void linear_q4_mma(device const uchar *nibbles [[buffer(0)]],
+                              device const half2 *params [[buffer(1)]],
+                              device const float *bias [[buffer(2)]],
+                              device const float *input [[buffer(3)]],
+                              device float *output [[buffer(4)]],
+                              device const uint *high [[buffer(5)]],
+                              device const float *aux [[buffer(6)]],
+                              constant Args &a [[buffer(7)]],
+                              uint2 group [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint simd [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup float wTile[MMA_ROWS * MMA_K];
+        threadgroup float xTile[MMA_TOKENS * MMA_K];
+        threadgroup float results[(MMA_THREADS / 32u) * 64u];
+        uint row0 = group.x * MMA_ROWS;
+        uint t0 = group.y * MMA_TOKENS;
+        if (row0 >= a.rows || t0 >= a.count) { return; }
+        simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint k0 = 0u; k0 < a.columns; k0 += MMA_K) {
+            mma_load_groups(wTile, nibbles, params, high, a, row0, k0, tid, false);
+            mma_load_input(xTile, input, a, t0, k0, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mma_accumulate(wTile, xTile, simd, acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        mma_store(results, acc, output, bias, aux, input, false, a, row0, t0, simd, lane);
+    }
+
+    kernel void linear_q5_mma(device const uchar *nibbles [[buffer(0)]],
+                              device const half2 *params [[buffer(1)]],
+                              device const float *bias [[buffer(2)]],
+                              device const float *input [[buffer(3)]],
+                              device float *output [[buffer(4)]],
+                              device const uint *high [[buffer(5)]],
+                              device const float *aux [[buffer(6)]],
+                              constant Args &a [[buffer(7)]],
+                              uint2 group [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint simd [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup float wTile[MMA_ROWS * MMA_K];
+        threadgroup float xTile[MMA_TOKENS * MMA_K];
+        threadgroup float results[(MMA_THREADS / 32u) * 64u];
+        uint row0 = group.x * MMA_ROWS;
+        uint t0 = group.y * MMA_TOKENS;
+        if (row0 >= a.rows || t0 >= a.count) { return; }
+        simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint k0 = 0u; k0 < a.columns; k0 += MMA_K) {
+            mma_load_groups(wTile, nibbles, params, high, a, row0, k0, tid, true);
+            mma_load_input(xTile, input, a, t0, k0, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mma_accumulate(wTile, xTile, simd, acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        mma_store(results, acc, output, bias, aux, input, false, a, row0, t0, simd, lane);
+    }
+
+    // 8 ビット（0 重み、1 行ごとの倍率、2 バイアス、3 入力、4 出力、6 aux、7 Args）
+    kernel void linear_q8_mma(device const char *weights [[buffer(0)]],
+                              device const float *scales [[buffer(1)]],
+                              device const float *bias [[buffer(2)]],
+                              device const float *input [[buffer(3)]],
+                              device float *output [[buffer(4)]],
+                              device const float *aux [[buffer(6)]],
+                              constant Args &a [[buffer(7)]],
+                              uint2 group [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint simd [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup float wTile[MMA_ROWS * MMA_K];
+        threadgroup float xTile[MMA_TOKENS * MMA_K];
+        threadgroup float results[(MMA_THREADS / 32u) * 64u];
+        uint row0 = group.x * MMA_ROWS;
+        uint t0 = group.y * MMA_TOKENS;
+        if (row0 >= a.rows || t0 >= a.count) { return; }
+        simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint k0 = 0u; k0 < a.columns; k0 += MMA_K) {
+            mma_load_q8(wTile, weights, a, row0, k0, tid);
+            mma_load_input(xTile, input, a, t0, k0, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mma_accumulate(wTile, xTile, simd, acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        mma_store(results, acc, output, bias, aux, scales, (a.flags & 1u) != 0u, a, row0, t0, simd, lane);
     }
     """
 }

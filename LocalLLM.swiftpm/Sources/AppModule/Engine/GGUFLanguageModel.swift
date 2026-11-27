@@ -14,7 +14,8 @@ struct GGUFModelFiles: Sendable {
     var drafts = 0
 
     static let draftsKey = "gguf.mtpDrafts"
-    static let defaultDrafts = 3
+    /// 既定は使わない（今の GPU の作りでは、先読みを使うとかえって遅くなる。速くできたら既定で使う）
+    static let defaultDrafts = 0
 
     /// 保存してある「先読みの数」（無ければ既定）
     static var storedDrafts: Int {

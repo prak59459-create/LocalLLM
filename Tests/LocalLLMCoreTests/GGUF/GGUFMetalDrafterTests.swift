@@ -176,13 +176,25 @@ final class GGUFMetalDrafterTests: XCTestCase {
             token = argmax(try model.evaluate([token]))
         }
         print(String(format: "COST-MTP plain step: %.1f ms (GPU %.1f)", plain.wall, plain.gpu))
-        for n in 1...5 {
-            let verify = try time {
-                try model.verify(Array(repeating: token, count: n))
-                model.accept(0)
+        // まとめての計算のしかたごとに: n 個の確かめと、64 トークンのプロンプトの読み込み
+        let choices: [(String, GGUFMetalModel.BatchKernel?)] = [("auto", nil), ("few", .few), ("matrix", .matrix), ("legacy", .legacy)]
+        defer { GGUFMetalModel.batchKernelOverride = nil }
+        for (name, choice) in choices {
+            GGUFMetalModel.batchKernelOverride = choice
+            for n in 1...5 {
+                let verify = try time {
+                    try model.verify(Array(repeating: token, count: n))
+                    model.accept(0)
+                }
+                print(String(format: "COST-MTP %@ verify %d: %.1f ms (GPU %.1f) = x%.2f of a plain step", name, n, verify.wall,
+                             verify.gpu, verify.wall / plain.wall))
             }
-            print(String(format: "COST-MTP verify %d: %.1f ms (GPU %.1f) = x%.2f of a plain step", n, verify.wall, verify.gpu,
-                         verify.wall / plain.wall))
+            let prefillModel = try GGUFMetalModel(store: targetStore, maxContext: 1024)
+            let long = Array((prompt + prompt + prompt + prompt + prompt).prefix(64))
+            let start = Date()
+            _ = try prefillModel.evaluate(long)
+            print(String(format: "COST-MTP %@ prefill 64 tokens: %.0f ms (%.1f tok/s)", name, Date().timeIntervalSince(start) * 1000,
+                         64 / Date().timeIntervalSince(start)))
         }
         for k in 1...4 {
             let draft = try time {

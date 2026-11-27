@@ -681,8 +681,31 @@ final class GGUFMetalModel: GGUFEvaluator {
     /// SIMD グループが 32 スレッドの GPU（Apple の GPU）なら、線形層を SIMD グループで何行かずつ計算する
     private var usesSimdRows: Bool {
         let kernels: [Kernel] = [.linearQ8Vector, .linearF32Vector, .linearQ4Rows, .linearQ5Rows, .linearQ4Batch, .linearQ5Batch,
-                                 .gateUpQ4, .gateUpQ5, .linearQ8Rows, .linearQ8Tokens]
+                                 .gateUpQ4, .gateUpQ5, .linearQ8Rows, .linearQ8Tokens, .linearQ4Tokens, .linearQ5Tokens, .linearQ8Few]
         return kernels.allSatisfy { pipelines[$0]?.threadExecutionWidth == 32 }
+    }
+
+    /// まとめて（2 トークン以上）の線形層の計算のしかた
+    enum BatchKernel {
+        /// 1 トークンのときと同じ形で、トークンごとに入力を 1 回だけ読む（少しまとめるとき）
+        case few
+        /// simdgroup の行列の掛け算（たくさんまとめるとき。Apple7 以降・Mac2 の GPU）
+        case matrix
+        /// 前からある形（行の組ごとに入力を読み直す）
+        case legacy
+    }
+
+    /// 速さを比べるときだけ、まとめての計算のしかたを決め打ちする（nil なら自動）
+    static var batchKernelOverride: BatchKernel?
+
+    /// count トークンをまとめて計算するときの選び方: 8 個までは few、それより多ければ行列（使えなければ前からの形）
+    private func batchKernel(count: Int) -> BatchKernel {
+        if let choice = Self.batchKernelOverride {
+            return choice == .matrix && !usesMatrixKernels ? .legacy : choice
+        }
+        guard usesSimdRows else { return .legacy }
+        if count <= GGUFMetalSource.batchTokens { return .few }
+        return usesMatrixKernels ? .matrix : .legacy
     }
 
     /// simdgroup の行列の計算が使える GPU か（iPad・iPhone は A14 以降、Mac は Apple silicon の Mac2）
@@ -764,8 +787,14 @@ final class GGUFMetalModel: GGUFEvaluator {
                                    (output, 0), vector(nil), aux]
         if weights.isInt8 && usesSimdRows && weights.columns % 16 == 0 && weights.skip % 16 == 0 {
             let threads = 32 * GGUFMetalSource.simdGroups
-            if batched && usesMatrixKernels {
+            let choice = batched ? batchKernel(count: count) : .legacy
+            if batched && choice == .matrix {
                 runMatrix(.linearQ8Matrix, encoder, bindings, arguments, rows: weights.rows, count: count)
+            } else if batched && choice == .few {
+                let rows = GGUFMetalSource.fewRows * GGUFMetalSource.simdGroups
+                let tokens = GGUFMetalSource.batchTokens
+                run(.linearQ8Few, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
+                    height: (count + tokens - 1) / tokens, threads: threads)
             } else if batched {
                 let rows = GGUFMetalSource.batchRows * GGUFMetalSource.simdGroups
                 let tokens = GGUFMetalSource.batchTokens
@@ -804,9 +833,20 @@ final class GGUFMetalModel: GGUFEvaluator {
             return
         }
         let threads = 32 * GGUFMetalSource.simdGroups
-        if count > 1 && usesMatrixKernels {
-            runMatrix(five ? .linearQ5Matrix : .linearQ4Matrix, encoder, bindings, arguments, rows: weights.rows, count: count)
-            return
+        if count > 1 {
+            switch batchKernel(count: count) {
+            case .matrix:
+                runMatrix(five ? .linearQ5Matrix : .linearQ4Matrix, encoder, bindings, arguments, rows: weights.rows, count: count)
+                return
+            case .few:
+                let rows = GGUFMetalSource.fewRows * GGUFMetalSource.simdGroups
+                let tokens = GGUFMetalSource.batchTokens
+                run(five ? .linearQ5Tokens : .linearQ4Tokens, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
+                    height: (count + tokens - 1) / tokens, threads: threads)
+                return
+            case .legacy:
+                break
+            }
         }
         if count == 1 {
             let rows = GGUFMetalSource.vectorRows * GGUFMetalSource.simdGroups

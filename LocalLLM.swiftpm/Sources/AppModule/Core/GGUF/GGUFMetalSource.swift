@@ -20,6 +20,9 @@ enum GGUFMetalSource {
         case linearQ8Tokens = "linear_q8_tokens"
         case argmax = "argmax"
         case embeddingRow = "embedding_row"
+        case linearQ4Tokens = "linear_q4_tokens"
+        case linearQ5Tokens = "linear_q5_tokens"
+        case linearQ8Few = "linear_q8_few"
         case linearQ4Matrix = "linear_q4_mma"
         case linearQ5Matrix = "linear_q5_mma"
         case linearQ8Matrix = "linear_q8_mma"
@@ -79,6 +82,8 @@ enum GGUFMetalSource {
     static let simdGroups = 2
     /// まとめて計算するときの、1 回のトークン数
     static let batchTokens = 8
+    /// 少しまとめて（先読みの確かめなど）の、SIMD グループ 1 つが受け持つ行
+    static let fewRows = 4
     /// 行列の掛け算（simdgroup の 8×8）でまとめて計算するときの、threadgroup 1 つが受け持つ行・トークンと、スレッドの数
     static let matrixRows = 32
     static let matrixTokens = 8
@@ -115,6 +120,7 @@ enum GGUFMetalSource {
     };
 
     #define VECTOR_ROWS 4u
+    #define FEW_ROWS 4u
     #define Q8_ROWS 4u
     #define BATCH_ROWS 2u
     #define GATE_UP_ROWS 2u
@@ -441,6 +447,57 @@ enum GGUFMetalSource {
         }
     }
 
+    // 8 ビット・少しまとめて（トークン BATCH_TOKENS 個まで）: SIMD グループ 1 つで FEW_ROWS 行。16 個ずつの重みはそのまま持っておき、
+    // トークンごとに入力を 1 回読んで全部の行に使う。threadgroup の y = トークン ÷ BATCH_TOKENS
+    kernel void linear_q8_few(device const char *weights [[buffer(0)]],
+                              device const float *scales [[buffer(1)]],
+                              device const float *bias [[buffer(2)]],
+                              device const float *input [[buffer(3)]],
+                              device float *output [[buffer(4)]],
+                              device const float *aux [[buffer(6)]],
+                              constant Args &a [[buffer(7)]],
+                              uint2 group [[threadgroup_position_in_grid]],
+                              uint simd [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+        uint first = (group.x * SIMD_GROUPS + simd) * FEW_ROWS;
+        uint t0 = group.y * BATCH_TOKENS;
+        if (first >= a.rows || t0 >= a.count) { return; }
+        uint rows = min(FEW_ROWS, a.rows - first);
+        uint tokens = min(BATCH_TOKENS, a.count - t0);
+        uint chunks = a.columns >> 4u;
+        device const uint4 *w = (device const uint4 *)(weights + a.weightSkip);
+        device const float *base = input + a.inOffset + t0 * a.inStride;
+        float acc[FEW_ROWS][BATCH_TOKENS];
+        for (uint r = 0u; r < FEW_ROWS; r++) {
+            for (uint t = 0u; t < BATCH_TOKENS; t++) { acc[r][t] = 0.0f; }
+        }
+        for (uint c = lane; c < chunks; c += 32u) {
+            uint4 q[FEW_ROWS];
+            for (uint r = 0u; r < FEW_ROWS; r++) { q[r] = w[(first + min(r, rows - 1u)) * chunks + c]; }
+            for (uint t = 0u; t < BATCH_TOKENS; t++) {
+                if (t < tokens) {
+                    device const packed_float4 *x = (device const packed_float4 *)(base + t * a.inStride) + c * 4u;
+                    float4 x0 = float4(x[0]);
+                    float4 x1 = float4(x[1]);
+                    float4 x2 = float4(x[2]);
+                    float4 x3 = float4(x[3]);
+                    for (uint r = 0u; r < FEW_ROWS; r++) { acc[r][t] += dot16(q[r], x0, x1, x2, x3); }
+                }
+            }
+        }
+        for (uint r = 0u; r < FEW_ROWS; r++) {
+            if (r < rows) {
+                float scale = ((a.flags & 1u) != 0u) ? scales[first + r] : 1.0f;
+                for (uint t = 0u; t < BATCH_TOKENS; t++) {
+                    if (t < tokens) {
+                        float sum = simd_sum(acc[r][t]);
+                        if (lane == 0u) { linear_store(output, bias, aux, a, first + r, t0 + t, sum * scale); }
+                    }
+                }
+            }
+        }
+    }
+
     // いちばん大きい値の位置（同じ値なら前のもの）を result[outOffset] に書く。threadgroup 1 つで values[inOffset …] の count 個を見る
     kernel void argmax(device const float *values [[buffer(0)]],
                        device uint *result [[buffer(1)]],
@@ -665,6 +722,91 @@ enum GGUFMetalSource {
                                uint simd [[simdgroup_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
         linear_group_rows(nibbles, params, bias, input, output, high, aux, a, group, simd, lane, true);
+    }
+
+    // 少しまとめて（トークン BATCH_TOKENS 個まで。先読みの確かめなど）: 1 トークンのときと同じく SIMD グループ 1 つで FEW_ROWS 行。
+    // 組の半分ごとに、FEW_ROWS 行の重み（まだ q のまま）を読んでおき、トークンごとに入力を 1 回読んで全部の行に使う
+    // （行ごとに入力を読み直すと、入力を読む量が重みの何十倍にもなる）。threadgroup の y = トークン ÷ BATCH_TOKENS
+    inline void linear_group_tokens(device const uchar *nibbles, device const half2 *params, device const float *bias,
+                                    device const float *input, device float *output, device const uint *high,
+                                    device const float *aux, constant Args &a, uint group, uint chunk, uint simd, uint lane,
+                                    bool five) {
+        uint first = (group * SIMD_GROUPS + simd) * FEW_ROWS;
+        uint t0 = chunk * BATCH_TOKENS;
+        if (first >= a.rows || t0 >= a.count) { return; }
+        uint rows = min(FEW_ROWS, a.rows - first);
+        uint tokens = min(BATCH_TOKENS, a.count - t0);
+        uint groups = a.columns >> 5u;
+        uint halves = groups * 2u;
+        device const uint2 *words = (device const uint2 *)nibbles;
+        float acc[FEW_ROWS][BATCH_TOKENS];
+        for (uint r = 0u; r < FEW_ROWS; r++) {
+            for (uint t = 0u; t < BATCH_TOKENS; t++) { acc[r][t] = 0.0f; }
+        }
+        for (uint h = lane; h < halves; h += 32u) {
+            uint part = h & 1u;
+            uint block = first * groups + (h >> 1u);
+            uint2 w[FEW_ROWS];
+            uint bits[FEW_ROWS];
+            float2 p[FEW_ROWS];
+            for (uint r = 0u; r < FEW_ROWS; r++) {
+                uint b = block + min(r, rows - 1u) * groups;
+                w[r] = words[b * 2u + part];
+                bits[r] = five ? (high[b] >> (part * 16u)) : 0u;
+                p[r] = float2(params[b]);
+            }
+            for (uint t = 0u; t < BATCH_TOKENS; t++) {
+                if (t < tokens) {
+                    device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset + (t0 + t) * a.inStride) + h * 4u;
+                    float4 x0 = float4(x[0]);
+                    float4 x1 = float4(x[1]);
+                    float4 x2 = float4(x[2]);
+                    float4 x3 = float4(x[3]);
+                    float xs = sum4(x0 + x1 + x2 + x3);
+                    for (uint r = 0u; r < FEW_ROWS; r++) {
+                        acc[r][t] += p[r].x * half_dot(w[r], bits[r], five, x0, x1, x2, x3) + p[r].y * xs;
+                    }
+                }
+            }
+        }
+        for (uint r = 0u; r < FEW_ROWS; r++) {
+            if (r < rows) {
+                for (uint t = 0u; t < BATCH_TOKENS; t++) {
+                    if (t < tokens) {
+                        float sum = simd_sum(acc[r][t]);
+                        if (lane == 0u) { linear_store(output, bias, aux, a, first + r, t0 + t, sum); }
+                    }
+                }
+            }
+        }
+    }
+
+    kernel void linear_q4_tokens(device const uchar *nibbles [[buffer(0)]],
+                                 device const half2 *params [[buffer(1)]],
+                                 device const float *bias [[buffer(2)]],
+                                 device const float *input [[buffer(3)]],
+                                 device float *output [[buffer(4)]],
+                                 device const uint *high [[buffer(5)]],
+                                 device const float *aux [[buffer(6)]],
+                                 constant Args &a [[buffer(7)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint simd [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        linear_group_tokens(nibbles, params, bias, input, output, high, aux, a, group.x, group.y, simd, lane, false);
+    }
+
+    kernel void linear_q5_tokens(device const uchar *nibbles [[buffer(0)]],
+                                 device const half2 *params [[buffer(1)]],
+                                 device const float *bias [[buffer(2)]],
+                                 device const float *input [[buffer(3)]],
+                                 device float *output [[buffer(4)]],
+                                 device const uint *high [[buffer(5)]],
+                                 device const float *aux [[buffer(6)]],
+                                 constant Args &a [[buffer(7)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint simd [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        linear_group_tokens(nibbles, params, bias, input, output, high, aux, a, group.x, group.y, simd, lane, true);
     }
 
     kernel void linear_q4_batch(device const uchar *nibbles [[buffer(0)]],

@@ -251,7 +251,8 @@ final class GGUFMetalModel: GGUFEvaluator {
         var library: MTLLibrary?
         if Self.supportsMatrices(device) {
             do {
-                library = try device.makeLibrary(source: GGUFMetalSource.code + GGUFMetalSource.matrixCode, options: nil)
+                // code は改行で終わらないので、間に改行を入れる（matrixCode の先頭の #define が行の頭に来るように）
+                library = try device.makeLibrary(source: GGUFMetalSource.code + "\n" + GGUFMetalSource.matrixCode, options: nil)
                 matrixNote = "compiled"
             } catch {
                 matrixNote = "compile failed: \(error.localizedDescription)"

@@ -17,8 +17,8 @@ let package = Package(
             targets: ["AppModule"],
             bundleIdentifier: "com.example.LocalLLM",
             teamIdentifier: "",
-            displayVersion: "0.11",
-            bundleVersion: "11",
+            displayVersion: "0.12",
+            bundleVersion: "12",
             appIcon: .placeholder(icon: .chatMessage),
             accentColor: .presetColor(.indigo),
             supportedDeviceFamilies: [

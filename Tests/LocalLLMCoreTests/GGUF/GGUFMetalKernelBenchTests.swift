@@ -83,6 +83,130 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         }
     }
 
+    /// Gemma 4 E2B の 1 トークンの計算のうち、線形層だけにかかる GPU の時間を、行列の形と数から見積もる。
+    /// ほかの計算（注意・正規化など）と、計算を 1 つ並べるごとの手間（小さな計算 1 回の時間）も測る。
+    /// 全体（TIME-GPU）との差で、線形層以外にどれだけかかっているかが分かる
+    func testGemma4DecodeLinearTime() throws {
+        guard GGUFMetalModel.isAvailable else { throw XCTSkip("no Metal device") }
+        guard GGUFFixtures.realModels != nil else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let library = try device.makeLibrary(source: GGUFMetalSource.code, options: nil)
+        func pipeline(_ name: String) throws -> MTLComputePipelineState {
+            try device.makeComputePipelineState(function: try XCTUnwrap(library.makeFunction(name: name), name))
+        }
+        let rows4 = try pipeline("linear_q4_rows"), rows8 = try pipeline("linear_q8_rows"), gateUp = try pipeline("gate_up_q4")
+        let columnsMax = 12288
+        let input = try XCTUnwrap(device.makeBuffer(length: columnsMax * 4, options: .storageModeShared))
+        let x = input.contents().bindMemory(to: Float.self, capacity: columnsMax)
+        var random = SplitMix64(seed: 11)
+        for i in 0..<columnsMax { x[i] = Float(Int(random.next() % 2001) - 1000) / 1000 }
+        let output = try XCTUnwrap(device.makeBuffer(length: 262144 * 4, options: .storageModeShared))
+        let dummy = try XCTUnwrap(device.makeBuffer(length: 64 * 1024, options: .storageModeShared))
+
+        /// 1 回の命令列で repeats 回並べて、1 回あたりの GPU の時間（3 回のうちいちばん短いもの、秒）。最初の 1 回は温めるだけ
+        func time(repeats: Int, _ encode: (MTLComputeCommandEncoder, Int) -> Void) throws -> Double {
+            var best = Double.infinity
+            for trial in 0..<4 {
+                let buffer = try XCTUnwrap(queue.makeCommandBuffer())
+                let encoder = try XCTUnwrap(buffer.makeComputeCommandEncoder())
+                for index in 0..<repeats { encode(encoder, index) }
+                encoder.endEncoding()
+                buffer.commit()
+                buffer.waitUntilCompleted()
+                XCTAssertNil(buffer.error)
+                if trial > 0 { best = min(best, (buffer.gpuEndTime - buffer.gpuStartTime) / Double(repeats)) }
+            }
+            return best
+        }
+        func arguments(rows: Int, columns: Int, int8: Bool) -> GGUFMetalArgs {
+            var arguments = GGUFMetalArgs()
+            arguments.rows = UInt32(rows)
+            arguments.columns = UInt32(columns)
+            arguments.count = 1
+            arguments.inStride = UInt32(columns)
+            arguments.outStride = UInt32(rows)
+            if int8 { arguments.flags = GGUFMetalSource.Flag.scales }
+            return arguments
+        }
+
+        // 1 トークンで使う線形層: 名前、行（出力）、列（入力）、8 ビットか、gate と up をまとめた計算か、1 トークンで使う回数
+        // （35 層。直近だけを見る層は q 2048・kv 256、全体を見る層（7 層）は q 4096・kv 512。k・v を持つのは前の 15 層だけ）
+        let layers: [(name: String, rows: Int, columns: Int, int8: Bool, fused: Bool, count: Int)] = [
+            ("ffn gate+up", 6144, 1536, false, true, 15), ("ffn gate+up", 12288, 1536, false, true, 20),
+            ("ffn down", 1536, 6144, false, false, 15), ("ffn down", 1536, 12288, false, false, 20),
+            ("attn q", 2048, 1536, false, false, 28), ("attn q", 4096, 1536, false, false, 7),
+            ("attn o", 1536, 2048, false, false, 28), ("attn o", 1536, 4096, false, false, 7),
+            ("attn k+v", 256, 1536, false, false, 24), ("attn k+v", 512, 1536, false, false, 6),
+            ("per-layer gate", 256, 1536, false, false, 35), ("per-layer proj", 1536, 256, false, false, 35),
+            ("output", 262144, 1536, true, false, 1), ("per-layer model proj", 8960, 1536, true, false, 1),
+        ]
+        var totalSeconds = 0.0, totalBytes = 0, dispatches = 0
+        for layer in layers {
+            let bytesPerCopy = layer.int8 ? layer.rows * (layer.columns + 4)
+                : GGUFGroupQuant.nibbleBytes(rows: layer.rows, columns: layer.columns) + GGUFGroupQuant.paramBytes(rows: layer.rows, columns: layer.columns)
+            // 写しを合わせて 32 MB 以上にして、毎回メモリから読む（gate と up は 2 つずつ使う。64 MB より大きい行列は 1 つで足りる）
+            let copies = bytesPerCopy > (64 << 20) ? 1 : max(layer.fused ? 3 : 2, (32 << 20) / bytesPerCopy + 1)
+            let matrix = try makeMatrix(device, name: layer.name, rows: layer.rows, columns: layer.columns, int8: layer.int8,
+                                        copies: copies, random: &random)
+            let repeats = max(16, copies * 2)
+            let seconds = try time(repeats: repeats) { encoder, index in
+                let a = index % copies, b = (index + 1) % copies
+                var values = arguments(rows: layer.rows, columns: layer.columns, int8: layer.int8)
+                if layer.fused {
+                    encoder.setComputePipelineState(gateUp)
+                    let bindings: [MTLBuffer] = [matrix.weights[a], matrix.params[a], matrix.weights[b], matrix.params[b], input, output,
+                                                 matrix.params[a], matrix.params[b]]
+                    for (slot, buffer) in bindings.enumerated() { encoder.setBuffer(buffer, offset: 0, index: slot) }
+                    encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: 8)
+                    let perGroup = GGUFMetalSource.gateUpRows * GGUFMetalSource.simdGroups
+                    encoder.dispatchThreadgroups(MTLSize(width: (layer.rows + perGroup - 1) / perGroup, height: 1, depth: 1),
+                                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                    return
+                }
+                encoder.setComputePipelineState(layer.int8 ? rows8 : rows4)
+                let bindings: [MTLBuffer] = [matrix.weights[a], matrix.params[a], dummy, input, output, layer.int8 ? dummy : matrix.params[a],
+                                             dummy]
+                for (slot, buffer) in bindings.enumerated() { encoder.setBuffer(buffer, offset: 0, index: slot) }
+                encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: 7)
+                let perGroup = (layer.int8 ? GGUFMetalSource.q8Rows : GGUFMetalSource.vectorRows) * GGUFMetalSource.simdGroups
+                encoder.dispatchThreadgroups(MTLSize(width: (layer.rows + perGroup - 1) / perGroup, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+            }
+            let bytes = bytesPerCopy * (layer.fused ? 2 : 1)
+            totalSeconds += seconds * Double(layer.count)
+            totalBytes += bytes * layer.count
+            dispatches += layer.count
+            print(String(format: "KERNEL-DECODE %@ %dx%d x%d: %.1f us each = %.2f ms per token (%.1f GB/s)", layer.name, layer.rows,
+                         layer.columns, layer.count, seconds * 1e6, seconds * Double(layer.count) * 1000, Double(bytes) / seconds / 1e9))
+        }
+        print(String(format: "KERNEL-DECODE linear layers: %.2f ms per token, %d dispatches, %.0f MB (%.1f GB/s)", totalSeconds * 1000,
+                     dispatches, Double(totalBytes) / 1e6, Double(totalBytes) / totalSeconds / 1e9))
+
+        // 小さな計算を 1 つ並べるごとの時間（足し算 64 個・1 行 1536 個の正規化）
+        let scaleAdd = try pipeline("scale_add"), norm = try pipeline("rms_norm")
+        var small = GGUFMetalArgs()
+        small.count = 64
+        small.scale = 1
+        let add = try time(repeats: 512) { encoder, _ in
+            encoder.setComputePipelineState(scaleAdd)
+            for slot in 0..<3 { encoder.setBuffer(dummy, offset: 0, index: slot) }
+            encoder.setBytes(&small, length: MemoryLayout<GGUFMetalArgs>.stride, index: 3)
+            encoder.dispatchThreadgroups(MTLSize(width: 2, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        }
+        var normArgs = GGUFMetalArgs()
+        normArgs.rows = 1
+        normArgs.columns = 1536
+        normArgs.epsilon = 1e-6
+        let normalize = try time(repeats: 512) { encoder, _ in
+            encoder.setComputePipelineState(norm)
+            for slot in 0..<4 { encoder.setBuffer(slot == 0 ? input : dummy, offset: 0, index: slot) }
+            encoder.setBytes(&normArgs, length: MemoryLayout<GGUFMetalArgs>.stride, index: 4)
+            encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        print(String(format: "KERNEL-DECODE small dispatches: scale_add (64) %.1f us, rms_norm (1x1536) %.1f us", add * 1e6, normalize * 1e6))
+    }
+
     private func makeMatrix(_ device: MTLDevice, name: String, rows: Int, columns: Int, int8: Bool, copies: Int,
                             random: inout SplitMix64) throws -> Matrix {
         let weightBytes = int8 ? rows * columns : GGUFGroupQuant.nibbleBytes(rows: rows, columns: columns)

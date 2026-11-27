@@ -164,9 +164,14 @@ jobs:
           grep -E "Sources/AppModule/.*took [0-9]+ms to type-check" typecheck.log | sed -E 's/^.*Sources\/AppModule\///' | sort -u > slow.txt || true
           echo "----- slow-ish (warning only) -----"
           cat slow.txt
-          fail=$(awk '
-            /expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 150) print }
-            /(function|getter|method|closure|initializer).*took/ && !/expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 200) print }
+          # CI の Mac は日によって速さが違う（同じコードで型チェック全体が 79 秒のときも 118 秒のときもある）ので、
+          # 全体が 80 秒より遅いときは、その分だけ上限を広げる
+          real=$(awk '/^real/ { print $2 }' typecheck.log | tail -1)
+          factor=$(awk -v r="${real:-80}" 'BEGIN { f = r / 80; if (f < 1) f = 1; printf "%.2f", f }')
+          echo "whole typecheck: ${real:-?} s, limits scaled by $factor"
+          fail=$(awk -v f="$factor" '
+            /expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 150 * f) print }
+            /(function|getter|method|closure|initializer).*took/ && !/expression took/ { match($0, /took [0-9]+ms/); ms = substr($0, RSTART + 5, RLENGTH - 7) + 0; if (ms > 200 * f) print }
           ' slow.txt)
           if [ -n "$fail" ]; then
             echo "$fail"
@@ -177,6 +182,7 @@ jobs:
 
       # 実験: MemberImportVisibility（各ファイルが import したモジュールのメンバーだけを探す）で型チェックが速くなるか
       - name: Typecheck with MemberImportVisibility (experiment)
+        if: always()
         continue-on-error: true
         run: |
           SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
@@ -191,6 +197,7 @@ jobs:
 
       # ビルド時間（Swift Playgrounds と同じく最適化なし・arm64）と、その内訳（段階ごと・ファイルごと・関数ごと）
       - name: Build time report
+        if: always()
         continue-on-error: true
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -209,6 +216,7 @@ jobs:
           python3 Tools/build_time_report.py "$RUNNER_TEMP/stats" functions.txt --top 80
 
       - name: Build the Swift Playgrounds app package with xcodebuild
+        if: always()
         working-directory: LocalLLM.swiftpm
         continue-on-error: true
         run: |
@@ -229,6 +237,7 @@ jobs:
 
       # 実験: 仮のアイコン（.placeholder）の代わりに、アイコン無しで作ると、アセットカタログの時間が減るか
       - name: Build without the placeholder icon (experiment)
+        if: always()
         continue-on-error: true
         run: |
           cp -R LocalLLM.swiftpm "$RUNNER_TEMP/NoIcon.swiftpm"

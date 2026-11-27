@@ -27,7 +27,12 @@ struct ConversationListView: View {
 
     /// 空の会話は、開いているもの以外は一覧に出さない
     private var visibleConversations: [Conversation] {
-        conversations.filter { !$0.messages.isEmpty || $0.id == selection }
+        let open: UUID? = selection
+        return conversations.filter { (conversation: Conversation) -> Bool in
+            if !conversation.messages.isEmpty { return true }
+            guard let open else { return false }
+            return conversation.id == open
+        }
     }
 
     // 型チェックを速くするため、行・ツールバー・確認ダイアログを分けている

@@ -147,7 +147,7 @@ struct DiffusionNoise {
     }
 
     private mutating func uniform() -> Double {
-        (Double(nextBits() >> 11) + 0.5) / Double(1 << 53)
+        (Double(nextBits() >> 11) + 0.5) * 0x1.0p-53
     }
 
     mutating func normal() -> Float {

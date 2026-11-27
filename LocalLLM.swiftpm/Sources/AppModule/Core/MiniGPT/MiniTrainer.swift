@@ -99,8 +99,9 @@ final class MiniGPTTrainer {
         self.optimizer = AdamWOptimizer(hyperparameters: hyperparameters)
         self.random = MiniRandom(seed: hyperparameters.seed &+ 0x9E37_79B9)
         // 後ろの一部を検証用にする（どちらも 1 窓ぶん以上あるときだけ）
-        let minimum = model.config.contextLength + 2
-        let validationCount = Int(Double(tokens.count) * min(max(validationFraction, 0), 0.5))
+        let minimum: Int = model.config.contextLength + 2
+        let fraction: Double = Swift.min(Swift.max(validationFraction, 0.0), 0.5)
+        let validationCount = Int(Double(tokens.count) * fraction)
         if validationCount >= minimum && tokens.count - validationCount >= minimum {
             trainTokens = Array(tokens[0..<(tokens.count - validationCount)])
             validationTokens = Array(tokens[(tokens.count - validationCount)...])

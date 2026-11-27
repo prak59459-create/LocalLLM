@@ -125,37 +125,71 @@ final class GGUFResidency {
         isMixture = config.moe != nil
         var experts: [[[GGUFPages.Region]]] = []
         var layers: [[GGUFPages.Region]] = []
+        let names: [String] = store.header.entries.map(\.name)
         for index in 0..<config.layerCount {
-            let prefix = "blk.\(index)."
-            let names = store.header.entries.map(\.name).filter { $0.hasPrefix(prefix) }
-            let expertNames = Set(["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].map { prefix + $0 })
-            layers.append(names.filter { !expertNames.contains($0) }.compactMap { try? store.matrix($0) }.flatMap(\.regions))
-            if let moe = config.moe, config.layers[index].moe,
-               let gate = try? store.matrix(prefix + "ffn_gate_exps.weight"),
-               let up = try? store.matrix(prefix + "ffn_up_exps.weight"),
-               let down = try? store.matrix(prefix + "ffn_down_exps.weight") {
-                let ff = config.layers[index].feedForwardSize, d = config.embeddingSize
-                experts.append((0..<moe.expertCount).map { e in
-                    gate.slice((e * ff)..<((e + 1) * ff)).regions + up.slice((e * ff)..<((e + 1) * ff)).regions
-                        + down.slice((e * d)..<((e + 1) * d)).regions
-                })
-            } else {
-                experts.append([])
-            }
+            layers.append(Self.layerRegions(index, names: names, store: store))
+            experts.append(Self.expertRegions(index, store: store, config: config))
         }
         expertRegions = experts
         layerRegions = layers
         recent = experts.map { _ in [] }
-        let used = config.moe.map { options.expertsUsed > 0 ? options.expertsUsed : $0.expertsUsed } ?? 0
-        keptExperts = max(1, options.keptExperts > 0 ? options.keptExperts : used * 2)
-        if options.keptLayers >= 0 {
-            keptLayers = min(options.keptLayers, config.layerCount)
-        } else {
-            // 空いているメモリの半分に収まるだけの層を残す
-            let perLayer = max(1, layers.map { $0.reduce(0) { $0 + $1.count } }.max() ?? 1)
-            let budget = Int((availableBytes ?? 0) / 2)
-            keptLayers = min(config.layerCount, max(0, budget / perLayer))
+        keptExperts = Self.keptExperts(options: options, config: config)
+        keptLayers = Self.keptLayers(options: options, config: config, layers: layers, availableBytes: availableBytes)
+    }
+
+    // 型チェックを速くするため、初期化の中身を小さな関数に分けている
+
+    private static let expertSuffixes: [String] = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"]
+
+    /// 層の重みの範囲（専門家を除く）
+    private static func layerRegions(_ index: Int, names: [String], store: GGUFWeightStore) -> [GGUFPages.Region] {
+        let prefix: String = "blk.\(index)."
+        let expertNames: Set<String> = Set(expertSuffixes.map { (suffix: String) -> String in prefix + suffix })
+        var regions: [GGUFPages.Region] = []
+        for name in names where name.hasPrefix(prefix) && !expertNames.contains(name) {
+            if let matrix: GGUFMatrix = try? store.matrix(name) { regions += matrix.regions }
         }
+        return regions
+    }
+
+    /// 層の、専門家ごとの重みの範囲（MoE の層でなければ空）
+    private static func expertRegions(_ index: Int, store: GGUFWeightStore, config: GGUFModelConfig) -> [[GGUFPages.Region]] {
+        let prefix: String = "blk.\(index)."
+        guard let moe = config.moe, config.layers[index].moe,
+              let gate: GGUFMatrix = try? store.matrix(prefix + "ffn_gate_exps.weight"),
+              let up: GGUFMatrix = try? store.matrix(prefix + "ffn_up_exps.weight"),
+              let down: GGUFMatrix = try? store.matrix(prefix + "ffn_down_exps.weight") else { return [] }
+        let ff: Int = config.layers[index].feedForwardSize
+        let d: Int = config.embeddingSize
+        var result: [[GGUFPages.Region]] = []
+        for expert in 0..<moe.expertCount {
+            var regions: [GGUFPages.Region] = gate.slice((expert * ff)..<((expert + 1) * ff)).regions
+            regions += up.slice((expert * ff)..<((expert + 1) * ff)).regions
+            regions += down.slice((expert * d)..<((expert + 1) * d)).regions
+            result.append(regions)
+        }
+        return result
+    }
+
+    private static func keptExperts(options: GGUFMemoryOptions, config: GGUFModelConfig) -> Int {
+        var used: Int = 0
+        if let moe = config.moe { used = options.expertsUsed > 0 ? options.expertsUsed : moe.expertsUsed }
+        let kept: Int = options.keptExperts > 0 ? options.keptExperts : used * 2
+        return Swift.max(1, kept)
+    }
+
+    private static func keptLayers(options: GGUFMemoryOptions, config: GGUFModelConfig, layers: [[GGUFPages.Region]],
+                                   availableBytes: Int64?) -> Int {
+        if options.keptLayers >= 0 { return Swift.min(options.keptLayers, config.layerCount) }
+        // 空いているメモリの半分に収まるだけの層を残す
+        var perLayer: Int = 1
+        for regions in layers {
+            var bytes: Int = 0
+            for region in regions { bytes += region.count }
+            perLayer = Swift.max(perLayer, bytes)
+        }
+        let budget: Int = Int((availableBytes ?? 0) / 2)
+        return Swift.min(config.layerCount, Swift.max(0, budget / perLayer))
     }
 
     /// 層ごとの専門家の重みのバイト数（画面に出す目安）

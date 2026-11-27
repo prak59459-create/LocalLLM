@@ -131,18 +131,25 @@ enum RopeTable {
         return distance(halves) <= distance(interleaved) ? .halves : .interleaved
     }
 
+    /// よく使われる θ
+    private static let commonThetas: [Double] = [10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000, 75_000_000]
+
     /// 周波数の並びから θ を求め、よく使われる値に近ければそれにそろえる
     static func snapTheta(_ frequencies: [Double]) -> Double? {
         let columns = frequencies.count
         guard columns >= 4 else { return nil }
         // 前半と後半で同じなら halves、隣どうしが同じなら interleaved
-        let isHalves = zip(frequencies.prefix(columns / 2), frequencies.suffix(columns / 2)).allSatisfy { abs($0 - $1) < 1e-3 }
-        let index = isHalves ? 1 : 2
-        let step = frequencies[index]
+        let half: Int = columns / 2
+        var isHalves = true
+        for index in 0..<half where !(abs(frequencies[index] - frequencies[columns - half + index]) < 1e-3) {
+            isHalves = false
+            break
+        }
+        let step: Double = frequencies[isHalves ? 1 : 2]
         guard step > 0, step < 1 else { return nil }
-        let estimate = pow(step, -Double(columns) / 2)
-        let common: [Double] = [10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 10_000_000, 75_000_000]
-        if let near = common.first(where: { abs($0 - estimate) / $0 < 0.05 }) { return near }
+        let power: Double = -Double(columns) / 2
+        let estimate: Double = pow(step, power)
+        for value in Self.commonThetas where abs(value - estimate) / value < 0.05 { return value }
         return estimate
     }
 

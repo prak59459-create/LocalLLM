@@ -267,7 +267,7 @@ struct MiniRandom {
     }
 
     mutating func nextUniform() -> Double {
-        Double(generator.next() >> 11) / Double(1 << 53)
+        Double(generator.next() >> 11) * 0x1.0p-53
     }
 
     mutating func nextInt(_ upperBound: Int) -> Int {

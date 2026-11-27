@@ -60,21 +60,30 @@ struct GGUFDrafterWeights {
 extension GGUFDrafterWeights {
     /// 本体と組にできるか確かめ、使う本体の層（KV キャッシュ）を返す: (直近だけを見る層, 全体を見る層)
     static func cacheLayers(drafter: GGUFModelConfig, target: GGUFModelConfig) throws -> (sliding: Int, full: Int) {
-        guard drafter.family == .gemma4Assistant, target.family == .gemma4,
-              drafter.drafterOutputSize == target.embeddingSize, drafter.vocabSize <= target.vocabSize else {
+        guard isPair(drafter: drafter, target: target) else {
             throw GGUFError.invalid(L("先読み用のモデルが、このモデルと組になりません", "The draft model does not match this model"))
         }
-        let shapes = target.layers
+        let shapes: [GGUFModelConfig.Layer] = target.layers
         guard shapes.count >= 2 else { throw GGUFError.invalid("draft target layers") }
-        let sliding = shapes[shapes.count - 2], full = shapes[shapes.count - 1]
-        for shape in drafter.layers {
-            let source = shape.sliding ? sliding : full
-            guard source.sliding == shape.sliding, source.headSize == shape.headSize, source.kvHeadCount == 1,
-                  shape.kvHeadCount == 1, !shape.convolution else {
-                throw GGUFError.invalid(L("先読み用のモデルの形が、このモデルと合いません", "The draft model's shape does not match this model"))
-            }
+        let sliding: GGUFModelConfig.Layer = shapes[shapes.count - 2]
+        let full: GGUFModelConfig.Layer = shapes[shapes.count - 1]
+        for shape in drafter.layers where !fits(shape, source: shape.sliding ? sliding : full) {
+            throw GGUFError.invalid(L("先読み用のモデルの形が、このモデルと合いません", "The draft model's shape does not match this model"))
         }
         return (sliding.kvLayer, full.kvLayer)
+    }
+
+    // 条件を小さな関数に分ける（1 つの guard に並べると型チェックが遅い）
+    private static func isPair(drafter: GGUFModelConfig, target: GGUFModelConfig) -> Bool {
+        if drafter.family != .gemma4Assistant || target.family != .gemma4 { return false }
+        if drafter.drafterOutputSize != target.embeddingSize { return false }
+        return drafter.vocabSize <= target.vocabSize
+    }
+
+    private static func fits(_ shape: GGUFModelConfig.Layer, source: GGUFModelConfig.Layer) -> Bool {
+        if source.sliding != shape.sliding || source.headSize != shape.headSize { return false }
+        if source.kvHeadCount != 1 || shape.kvHeadCount != 1 { return false }
+        return !shape.convolution
     }
 }
 

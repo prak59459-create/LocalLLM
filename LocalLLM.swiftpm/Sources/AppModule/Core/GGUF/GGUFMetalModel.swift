@@ -681,13 +681,14 @@ final class GGUFMetalModel: GGUFEvaluator {
     /// SIMD グループが 32 スレッドの GPU（Apple の GPU）なら、線形層を SIMD グループで何行かずつ計算する
     private var usesSimdRows: Bool {
         let kernels: [Kernel] = [.linearQ8Vector, .linearF32Vector, .linearQ4Rows, .linearQ5Rows, .linearQ4Batch, .linearQ5Batch,
-                                 .gateUpQ4, .gateUpQ5, .linearQ8Rows, .linearQ8Tokens, .linearQ4Tokens, .linearQ5Tokens, .linearQ8Few]
+                                 .gateUpQ4, .gateUpQ5, .linearQ8Rows, .linearQ8Tokens, .linearQ4Few2, .linearQ4Few3, .linearQ4Few4,
+                                 .linearQ5Few2, .linearQ5Few3, .linearQ5Few4, .linearQ8Few2, .linearQ8Few3, .linearQ8Few4]
         return kernels.allSatisfy { pipelines[$0]?.threadExecutionWidth == 32 }
     }
 
     /// まとめて（2 トークン以上）の線形層の計算のしかた
     enum BatchKernel {
-        /// 1 トークンのときと同じ形で、トークンごとに入力を 1 回だけ読む（少しまとめるとき）
+        /// 1 トークンのときと同じ形で、重みを 1 回だけ取り出してトークンごとに使う（少しまとめるとき。fewTokens 個ずつ）
         case few
         /// simdgroup の行列の掛け算（たくさんまとめるとき。Apple7 以降・Mac2 の GPU）
         case matrix
@@ -698,14 +699,22 @@ final class GGUFMetalModel: GGUFEvaluator {
     /// 速さを比べるときだけ、まとめての計算のしかたを決め打ちする（nil なら自動）
     static var batchKernelOverride: BatchKernel?
 
-    /// count トークンをまとめて計算するときの選び方: 8 個までは few、それより多ければ行列（使えなければ前からの形）
+    /// count トークンをまとめて計算するときの選び方: fewTokens 個（4 個）までは few、それより多ければ行列
+    /// （使えない GPU では few を何回か）。CI の Mac で測ると、few は 2 トークンで 1 トークンの 1.0 倍ほど・4 トークンで 1.2〜1.6 倍、
+    /// 行列はトークンの数によらず 1.3〜2.4 倍だった（GGUFMetalKernelBenchTests）
     private func batchKernel(count: Int) -> BatchKernel {
         if let choice = Self.batchKernelOverride {
-            return choice == .matrix && !usesMatrixKernels ? .legacy : choice
+            return choice == .matrix && !usesMatrixKernels ? .few : choice
         }
         guard usesSimdRows else { return .legacy }
-        if count <= GGUFMetalSource.batchTokens { return .few }
-        return usesMatrixKernels ? .matrix : .legacy
+        if count <= GGUFMetalSource.fewTokens { return .few }
+        return usesMatrixKernels ? .matrix : .few
+    }
+
+    /// 少しまとめての計算で count トークンを計算する: 1 回で受け持つトークンの数と、回数（threadgroup の y の数）
+    private static func fewShape(count: Int) -> (tokens: Int, height: Int) {
+        let tokens = min(count, GGUFMetalSource.fewTokens)
+        return (tokens, (count + tokens - 1) / tokens)
     }
 
     /// simdgroup の行列の計算が使える GPU か（iPad・iPhone は A14 以降、Mac は Apple silicon の Mac2）
@@ -792,9 +801,9 @@ final class GGUFMetalModel: GGUFEvaluator {
                 runMatrix(.linearQ8Matrix, encoder, bindings, arguments, rows: weights.rows, count: count)
             } else if batched && choice == .few {
                 let rows = GGUFMetalSource.fewRows * GGUFMetalSource.simdGroups
-                let tokens = GGUFMetalSource.batchTokens
-                run(.linearQ8Few, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
-                    height: (count + tokens - 1) / tokens, threads: threads)
+                let shape = Self.fewShape(count: count)
+                run(Kernel.few(bits: 8, tokens: shape.tokens), encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
+                    height: shape.height, threads: threads)
             } else if batched {
                 let rows = GGUFMetalSource.batchRows * GGUFMetalSource.simdGroups
                 let tokens = GGUFMetalSource.batchTokens
@@ -840,9 +849,9 @@ final class GGUFMetalModel: GGUFEvaluator {
                 return
             case .few:
                 let rows = GGUFMetalSource.fewRows * GGUFMetalSource.simdGroups
-                let tokens = GGUFMetalSource.batchTokens
-                run(five ? .linearQ5Tokens : .linearQ4Tokens, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
-                    height: (count + tokens - 1) / tokens, threads: threads)
+                let shape = Self.fewShape(count: count)
+                run(Kernel.few(bits: five ? 5 : 4, tokens: shape.tokens), encoder, bindings, arguments,
+                    groups: (weights.rows + rows - 1) / rows, height: shape.height, threads: threads)
                 return
             case .legacy:
                 break

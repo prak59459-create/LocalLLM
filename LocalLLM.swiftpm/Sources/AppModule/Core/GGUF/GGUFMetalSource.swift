@@ -20,15 +20,33 @@ enum GGUFMetalSource {
         case linearQ8Tokens = "linear_q8_tokens"
         case argmax = "argmax"
         case embeddingRow = "embedding_row"
-        case linearQ4Tokens = "linear_q4_tokens"
-        case linearQ5Tokens = "linear_q5_tokens"
-        case linearQ8Few = "linear_q8_few"
+        /// 少しまとめて（数字はコンパイル時に決めたトークンの数）
+        case linearQ4Few2 = "linear_q4_few2"
+        case linearQ4Few3 = "linear_q4_few3"
+        case linearQ4Few4 = "linear_q4_few4"
+        case linearQ5Few2 = "linear_q5_few2"
+        case linearQ5Few3 = "linear_q5_few3"
+        case linearQ5Few4 = "linear_q5_few4"
+        case linearQ8Few2 = "linear_q8_few2"
+        case linearQ8Few3 = "linear_q8_few3"
+        case linearQ8Few4 = "linear_q8_few4"
         case linearQ4Matrix = "linear_q4_mma"
         case linearQ5Matrix = "linear_q5_mma"
         case linearQ8Matrix = "linear_q8_mma"
 
         /// simdgroup の行列の計算を使うもの（Apple7 以降の GPU だけ。matrixCode にある）
         static let matrixKernels: Set<Kernel> = [.linearQ4Matrix, .linearQ5Matrix, .linearQ8Matrix]
+
+        /// 少しまとめての計算（bits は 4・5・8、tokens は 2 … fewTokens。コンパイル時にその数に決めたもの）
+        static func few(bits: Int, tokens: Int) -> Kernel {
+            let kernels: [Kernel]
+            switch bits {
+            case 4: kernels = [.linearQ4Few2, .linearQ4Few3, .linearQ4Few4]
+            case 5: kernels = [.linearQ5Few2, .linearQ5Few3, .linearQ5Few4]
+            default: kernels = [.linearQ8Few2, .linearQ8Few3, .linearQ8Few4]
+            }
+            return kernels[Swift.max(2, Swift.min(tokens, GGUFMetalSource.fewTokens)) - 2]
+        }
         case linearF32Vector = "linear_f32_vector"
         case linearQ4Vector = "linear_q4_vector"
         case linearQ5Vector = "linear_q5_vector"
@@ -75,15 +93,17 @@ enum GGUFMetalSource {
 
     /// 線形層の SIMD グループ 1 つが受け持つ行（1 トークン・まとめて）と、threadgroup の SIMD グループの数
     static let vectorRows = 4
-    /// 8 ビットの線形層（1 トークン）の、SIMD グループ 1 つが受け持つ行
-    static let q8Rows = 4
+    /// 8 ビットの線形層（1 トークン）の、SIMD グループ 1 つが受け持つ行（2 行のほうが 4 行より速かった）
+    static let q8Rows = 2
     static let batchRows = 2
     static let gateUpRows = 2
     static let simdGroups = 2
     /// まとめて計算するときの、1 回のトークン数
     static let batchTokens = 8
-    /// 少しまとめて（先読みの確かめなど）の、SIMD グループ 1 つが受け持つ行
+    /// 少しまとめて（先読みの確かめなど）の、SIMD グループ 1 つが受け持つ行と、1 回で受け持つトークンの数の上限
+    /// （トークンの数をコンパイル時に決めた計算がある数。それより多いときは何回かに分ける）
     static let fewRows = 4
+    static let fewTokens = 4
     /// 行列の掛け算（simdgroup の 8×8）でまとめて計算するときの、threadgroup 1 つが受け持つ行・トークンと、スレッドの数
     static let matrixRows = 32
     static let matrixTokens = 8
@@ -121,7 +141,7 @@ enum GGUFMetalSource {
 
     #define VECTOR_ROWS 4u
     #define FEW_ROWS 4u
-    #define Q8_ROWS 4u
+    #define Q8_ROWS 2u
     #define BATCH_ROWS 2u
     #define GATE_UP_ROWS 2u
     #define SIMD_GROUPS 2u
@@ -364,7 +384,8 @@ enum GGUFMetalSource {
         uint chunks = a.columns >> 4u;
         device const uint4 *w = (device const uint4 *)(weights + a.weightSkip) + first * chunks;
         device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
-        float acc[Q8_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float acc[Q8_ROWS];
+        for (uint r = 0u; r < Q8_ROWS; r++) { acc[r] = 0.0f; }
         for (uint c = lane; c < chunks; c += 32u) {
             float4 x0 = float4(x[c * 4u]);
             float4 x1 = float4(x[c * 4u + 1u]);
@@ -447,8 +468,10 @@ enum GGUFMetalSource {
         }
     }
 
-    // 8 ビット・少しまとめて（トークン BATCH_TOKENS 個まで）: SIMD グループ 1 つで FEW_ROWS 行。16 個ずつの重みはそのまま持っておき、
-    // トークンごとに入力を 1 回読んで全部の行に使う。threadgroup の y = トークン ÷ BATCH_TOKENS
+    // 8 ビット・少しまとめて（N トークン。先読みの確かめなど）: SIMD グループ 1 つで FEW_ROWS 行。16 個ずつの重みを 1 回だけ float にして
+    // N トークンに使い、入力はトークンごとに 1 回読んで全部の行に使う。N はコンパイル時に決める（linear_group_few と同じ理由）。
+    // threadgroup の y = トークン ÷ N
+    template <uint N>
     kernel void linear_q8_few(device const char *weights [[buffer(0)]],
                               device const float *scales [[buffer(1)]],
                               device const float *bias [[buffer(2)]],
@@ -460,43 +483,53 @@ enum GGUFMetalSource {
                               uint simd [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
         uint first = (group.x * SIMD_GROUPS + simd) * FEW_ROWS;
-        uint t0 = group.y * BATCH_TOKENS;
+        uint t0 = group.y * N;
         if (first >= a.rows || t0 >= a.count) { return; }
         uint rows = min(FEW_ROWS, a.rows - first);
-        uint tokens = min(BATCH_TOKENS, a.count - t0);
+        uint tokens = min(N, a.count - t0);
         uint chunks = a.columns >> 4u;
         device const uint4 *w = (device const uint4 *)(weights + a.weightSkip);
         device const float *base = input + a.inOffset + t0 * a.inStride;
-        float acc[FEW_ROWS][BATCH_TOKENS];
+        float acc[FEW_ROWS][N];
         for (uint r = 0u; r < FEW_ROWS; r++) {
-            for (uint t = 0u; t < BATCH_TOKENS; t++) { acc[r][t] = 0.0f; }
+            for (uint t = 0u; t < N; t++) { acc[r][t] = 0.0f; }
         }
         for (uint c = lane; c < chunks; c += 32u) {
-            uint4 q[FEW_ROWS];
-            for (uint r = 0u; r < FEW_ROWS; r++) { q[r] = w[(first + min(r, rows - 1u)) * chunks + c]; }
-            for (uint t = 0u; t < BATCH_TOKENS; t++) {
-                if (t < tokens) {
-                    device const packed_float4 *x = (device const packed_float4 *)(base + t * a.inStride) + c * 4u;
-                    float4 x0 = float4(x[0]);
-                    float4 x1 = float4(x[1]);
-                    float4 x2 = float4(x[2]);
-                    float4 x3 = float4(x[3]);
-                    for (uint r = 0u; r < FEW_ROWS; r++) { acc[r][t] += dot16(q[r], x0, x1, x2, x3); }
+            float4 w0[FEW_ROWS];
+            float4 w1[FEW_ROWS];
+            float4 w2[FEW_ROWS];
+            float4 w3[FEW_ROWS];
+            for (uint r = 0u; r < FEW_ROWS; r++) {
+                uint4 q = w[(first + min(r, rows - 1u)) * chunks + c];
+                w0[r] = float4(as_type<char4>(q.x));
+                w1[r] = float4(as_type<char4>(q.y));
+                w2[r] = float4(as_type<char4>(q.z));
+                w3[r] = float4(as_type<char4>(q.w));
+            }
+            for (uint t = 0u; t < N; t++) {
+                device const packed_float4 *x = (device const packed_float4 *)(base + min(t, tokens - 1u) * a.inStride) + c * 4u;
+                float4 x0 = float4(x[0]);
+                float4 x1 = float4(x[1]);
+                float4 x2 = float4(x[2]);
+                float4 x3 = float4(x[3]);
+                for (uint r = 0u; r < FEW_ROWS; r++) {
+                    acc[r][t] += dot(w0[r], x0) + dot(w1[r], x1) + dot(w2[r], x2) + dot(w3[r], x3);
                 }
             }
         }
         for (uint r = 0u; r < FEW_ROWS; r++) {
-            if (r < rows) {
-                float scale = ((a.flags & 1u) != 0u) ? scales[first + r] : 1.0f;
-                for (uint t = 0u; t < BATCH_TOKENS; t++) {
-                    if (t < tokens) {
-                        float sum = simd_sum(acc[r][t]);
-                        if (lane == 0u) { linear_store(output, bias, aux, a, first + r, t0 + t, sum * scale); }
-                    }
-                }
+            float scale = ((a.flags & 1u) != 0u) ? scales[first + min(r, rows - 1u)] : 1.0f;
+            for (uint t = 0u; t < N; t++) {
+                float sum = simd_sum(acc[r][t]);
+                if (lane == 0u && r < rows && t < tokens) { linear_store(output, bias, aux, a, first + r, t0 + t, sum * scale); }
             }
         }
     }
+
+    typedef decltype(linear_q8_few<2>) linear_q8_few_t;
+    template [[host_name("linear_q8_few2")]] kernel linear_q8_few_t linear_q8_few<2>;
+    template [[host_name("linear_q8_few3")]] kernel linear_q8_few_t linear_q8_few<3>;
+    template [[host_name("linear_q8_few4")]] kernel linear_q8_few_t linear_q8_few<4>;
 
     // いちばん大きい値の位置（同じ値なら前のもの）を result[outOffset] に書く。threadgroup 1 つで values[inOffset …] の count 個を見る
     kernel void argmax(device const float *values [[buffer(0)]],
@@ -593,8 +626,22 @@ enum GGUFMetalSource {
         return dot(a0, x0) + dot(a1, x1) + dot(a2, x2) + dot(a3, x3);
     }
 
+    // 4 ビットの組の半分の Σ q·x を、シフトせずにマスクだけで q を取り出して計算する（1 トークンのときに速い）。
+    // マスクした値は q × (1, 16, 256, 4096) なので、入力は先にその分だけ割っておく: y = x × (1, 1/16, 1/256, 1/4096)。
+    // 積は 2 の累乗倍しか違わないので、half_dot と同じ値になる
+    #define NIBBLE_SCALES float4(1.0f, 0.0625f, 0.00390625f, 0.000244140625f)
+
+    inline float masked_dot(uint2 w, float4 y0, float4 y1, float4 y2, float4 y3) {
+        const uint4 m = uint4(0xFu, 0xF0u, 0xF00u, 0xF000u);
+        float4 a0 = float4(uint4(w.x) & m);
+        float4 a1 = float4(uint4(w.x >> 16u) & m);
+        float4 a2 = float4(uint4(w.y) & m);
+        float4 a3 = float4(uint4(w.y >> 16u) & m);
+        return dot(a0, y0) + dot(a1, y1) + dot(a2, y2) + dot(a3, y3);
+    }
+
     // 1 トークン: SIMD グループ 1 つで VECTOR_ROWS 行。スレッドは組の半分ずつを受け持ち、入力は 1 回読んで何行にも使う。
-    // threadgroup = SIMD_GROUPS 個の SIMD グループ
+    // threadgroup = SIMD_GROUPS 個の SIMD グループ。4 ビットは masked_dot、5 ビットは half_dot
     inline void linear_group_rows(device const uchar *nibbles, device const half2 *params, device const float *bias,
                                   device const float *input, device float *output, device const uint *high,
                                   device const float *aux, constant Args &a, uint group, uint simd, uint lane, bool five) {
@@ -605,21 +652,27 @@ enum GGUFMetalSource {
         uint halves = groups * 2u;
         device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
         device const uint2 *words = (device const uint2 *)nibbles;
-        float acc[VECTOR_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float acc[VECTOR_ROWS];
+        for (uint r = 0u; r < VECTOR_ROWS; r++) { acc[r] = 0.0f; }
         for (uint h = lane; h < halves; h += 32u) {
             float4 x0 = float4(x[h * 4u]);
             float4 x1 = float4(x[h * 4u + 1u]);
             float4 x2 = float4(x[h * 4u + 2u]);
             float4 x3 = float4(x[h * 4u + 3u]);
             float xs = sum4(x0 + x1 + x2 + x3);
+            float4 y0 = x0 * NIBBLE_SCALES;
+            float4 y1 = x1 * NIBBLE_SCALES;
+            float4 y2 = x2 * NIBBLE_SCALES;
+            float4 y3 = x3 * NIBBLE_SCALES;
             uint part = h & 1u;
             uint block = first * groups + (h >> 1u);
             for (uint r = 0u; r < VECTOR_ROWS; r++) {
                 if (r < rows) {
                     uint b = block + r * groups;
-                    uint bits = five ? (high[b] >> (part * 16u)) : 0u;
                     float2 p = float2(params[b]);
-                    acc[r] += p.x * half_dot(words[b * 2u + part], bits, five, x0, x1, x2, x3) + p.y * xs;
+                    uint2 w = words[b * 2u + part];
+                    float qx = five ? half_dot(w, high[b] >> (part * 16u), true, x0, x1, x2, x3) : masked_dot(w, y0, y1, y2, y3);
+                    acc[r] += p.x * qx + p.y * xs;
                 }
             }
         }
@@ -724,90 +777,99 @@ enum GGUFMetalSource {
         linear_group_rows(nibbles, params, bias, input, output, high, aux, a, group, simd, lane, true);
     }
 
-    // 少しまとめて（トークン BATCH_TOKENS 個まで。先読みの確かめなど）: 1 トークンのときと同じく SIMD グループ 1 つで FEW_ROWS 行。
-    // 組の半分ごとに、FEW_ROWS 行の重み（まだ q のまま）を読んでおき、トークンごとに入力を 1 回読んで全部の行に使う
-    // （行ごとに入力を読み直すと、入力を読む量が重みの何十倍にもなる）。threadgroup の y = トークン ÷ BATCH_TOKENS
-    inline void linear_group_tokens(device const uchar *nibbles, device const half2 *params, device const float *bias,
-                                    device const float *input, device float *output, device const uint *high,
-                                    device const float *aux, constant Args &a, uint group, uint chunk, uint simd, uint lane,
-                                    bool five) {
-        uint first = (group * SIMD_GROUPS + simd) * FEW_ROWS;
-        uint t0 = chunk * BATCH_TOKENS;
+    // 4 個の q（0 … 31 の整数）を half に。half でちょうど表せるので、float のときの半分のレジスタで持てる
+    inline half4 nibbles4h(uint word, uint shift) {
+        return half4(half((word >> shift) & 15u), half((word >> (shift + 4u)) & 15u),
+                     half((word >> (shift + 8u)) & 15u), half((word >> (shift + 12u)) & 15u));
+    }
+
+    inline half4 high4h(uint bits, uint e) {
+        return half4(half((bits >> e) & 1u), half((bits >> (e + 1u)) & 1u),
+                     half((bits >> (e + 2u)) & 1u), half((bits >> (e + 3u)) & 1u)) * half(16.0f);
+    }
+
+    // 少しまとめて（N トークン。先読みの確かめなど）: 1 トークンのときと同じく SIMD グループ 1 つで FEW_ROWS 行、スレッドは組の半分ずつ。
+    // 組の半分の重みは 1 回だけ q に直して（half で持つ）N トークンに使い、入力はトークンごとに 1 回読んで全部の行に使う。
+    // N はコンパイル時に決める（足し込む値をレジスタに置くため。実行時の数で回すと、配列がメモリに置かれて遅くなる）。
+    // threadgroup の y = トークン ÷ N。残りが N より少ないときは、最後のトークンを読み直して計算し、書かない
+    template <uint N, bool FIVE>
+    kernel void linear_group_few(device const uchar *nibbles [[buffer(0)]],
+                                 device const half2 *params [[buffer(1)]],
+                                 device const float *bias [[buffer(2)]],
+                                 device const float *input [[buffer(3)]],
+                                 device float *output [[buffer(4)]],
+                                 device const uint *high [[buffer(5)]],
+                                 device const float *aux [[buffer(6)]],
+                                 constant Args &a [[buffer(7)]],
+                                 uint2 group [[threadgroup_position_in_grid]],
+                                 uint simd [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        uint first = (group.x * SIMD_GROUPS + simd) * FEW_ROWS;
+        uint t0 = group.y * N;
         if (first >= a.rows || t0 >= a.count) { return; }
         uint rows = min(FEW_ROWS, a.rows - first);
-        uint tokens = min(BATCH_TOKENS, a.count - t0);
+        uint tokens = min(N, a.count - t0);
         uint groups = a.columns >> 5u;
         uint halves = groups * 2u;
         device const uint2 *words = (device const uint2 *)nibbles;
-        float acc[FEW_ROWS][BATCH_TOKENS];
+        device const float *base = input + a.inOffset + t0 * a.inStride;
+        float acc[FEW_ROWS][N];
         for (uint r = 0u; r < FEW_ROWS; r++) {
-            for (uint t = 0u; t < BATCH_TOKENS; t++) { acc[r][t] = 0.0f; }
+            for (uint t = 0u; t < N; t++) { acc[r][t] = 0.0f; }
         }
         for (uint h = lane; h < halves; h += 32u) {
             uint part = h & 1u;
             uint block = first * groups + (h >> 1u);
-            uint2 w[FEW_ROWS];
-            uint bits[FEW_ROWS];
+            half4 w0[FEW_ROWS];
+            half4 w1[FEW_ROWS];
+            half4 w2[FEW_ROWS];
+            half4 w3[FEW_ROWS];
             float2 p[FEW_ROWS];
             for (uint r = 0u; r < FEW_ROWS; r++) {
                 uint b = block + min(r, rows - 1u) * groups;
-                w[r] = words[b * 2u + part];
-                bits[r] = five ? (high[b] >> (part * 16u)) : 0u;
+                uint2 q = words[b * 2u + part];
+                w0[r] = nibbles4h(q.x, 0u);
+                w1[r] = nibbles4h(q.x, 16u);
+                w2[r] = nibbles4h(q.y, 0u);
+                w3[r] = nibbles4h(q.y, 16u);
+                if (FIVE) {
+                    uint bits = high[b] >> (part * 16u);
+                    w0[r] += high4h(bits, 0u);
+                    w1[r] += high4h(bits, 4u);
+                    w2[r] += high4h(bits, 8u);
+                    w3[r] += high4h(bits, 12u);
+                }
                 p[r] = float2(params[b]);
             }
-            for (uint t = 0u; t < BATCH_TOKENS; t++) {
-                if (t < tokens) {
-                    device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset + (t0 + t) * a.inStride) + h * 4u;
-                    float4 x0 = float4(x[0]);
-                    float4 x1 = float4(x[1]);
-                    float4 x2 = float4(x[2]);
-                    float4 x3 = float4(x[3]);
-                    float xs = sum4(x0 + x1 + x2 + x3);
-                    for (uint r = 0u; r < FEW_ROWS; r++) {
-                        acc[r][t] += p[r].x * half_dot(w[r], bits[r], five, x0, x1, x2, x3) + p[r].y * xs;
-                    }
+            for (uint t = 0u; t < N; t++) {
+                device const packed_float4 *x = (device const packed_float4 *)(base + min(t, tokens - 1u) * a.inStride) + h * 4u;
+                float4 x0 = float4(x[0]);
+                float4 x1 = float4(x[1]);
+                float4 x2 = float4(x[2]);
+                float4 x3 = float4(x[3]);
+                float xs = sum4(x0 + x1 + x2 + x3);
+                for (uint r = 0u; r < FEW_ROWS; r++) {
+                    float qx = dot(float4(w0[r]), x0) + dot(float4(w1[r]), x1) + dot(float4(w2[r]), x2) + dot(float4(w3[r]), x3);
+                    acc[r][t] += p[r].x * qx + p[r].y * xs;
                 }
             }
         }
         for (uint r = 0u; r < FEW_ROWS; r++) {
-            if (r < rows) {
-                for (uint t = 0u; t < BATCH_TOKENS; t++) {
-                    if (t < tokens) {
-                        float sum = simd_sum(acc[r][t]);
-                        if (lane == 0u) { linear_store(output, bias, aux, a, first + r, t0 + t, sum); }
-                    }
-                }
+            for (uint t = 0u; t < N; t++) {
+                float sum = simd_sum(acc[r][t]);
+                if (lane == 0u && r < rows && t < tokens) { linear_store(output, bias, aux, a, first + r, t0 + t, sum); }
             }
         }
     }
 
-    kernel void linear_q4_tokens(device const uchar *nibbles [[buffer(0)]],
-                                 device const half2 *params [[buffer(1)]],
-                                 device const float *bias [[buffer(2)]],
-                                 device const float *input [[buffer(3)]],
-                                 device float *output [[buffer(4)]],
-                                 device const uint *high [[buffer(5)]],
-                                 device const float *aux [[buffer(6)]],
-                                 constant Args &a [[buffer(7)]],
-                                 uint2 group [[threadgroup_position_in_grid]],
-                                 uint simd [[simdgroup_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
-        linear_group_tokens(nibbles, params, bias, input, output, high, aux, a, group.x, group.y, simd, lane, false);
-    }
-
-    kernel void linear_q5_tokens(device const uchar *nibbles [[buffer(0)]],
-                                 device const half2 *params [[buffer(1)]],
-                                 device const float *bias [[buffer(2)]],
-                                 device const float *input [[buffer(3)]],
-                                 device float *output [[buffer(4)]],
-                                 device const uint *high [[buffer(5)]],
-                                 device const float *aux [[buffer(6)]],
-                                 constant Args &a [[buffer(7)]],
-                                 uint2 group [[threadgroup_position_in_grid]],
-                                 uint simd [[simdgroup_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
-        linear_group_tokens(nibbles, params, bias, input, output, high, aux, a, group.x, group.y, simd, lane, true);
-    }
+    // 入り口（並びは linear_q4_rows と同じ）。名前の数字が N
+    typedef decltype(linear_group_few<2, false>) linear_group_few_t;
+    template [[host_name("linear_q4_few2")]] kernel linear_group_few_t linear_group_few<2, false>;
+    template [[host_name("linear_q4_few3")]] kernel linear_group_few_t linear_group_few<3, false>;
+    template [[host_name("linear_q4_few4")]] kernel linear_group_few_t linear_group_few<4, false>;
+    template [[host_name("linear_q5_few2")]] kernel linear_group_few_t linear_group_few<2, true>;
+    template [[host_name("linear_q5_few3")]] kernel linear_group_few_t linear_group_few<3, true>;
+    template [[host_name("linear_q5_few4")]] kernel linear_group_few_t linear_group_few<4, true>;
 
     kernel void linear_q4_batch(device const uchar *nibbles [[buffer(0)]],
                                 device const half2 *params [[buffer(1)]],
@@ -887,7 +949,7 @@ enum GGUFMetalSource {
     }
 
     // FFN の gate と up を一度に（1 トークン。入力を 1 回読んで 2 つの行列に使う）: 出力 = act(gate · x) × (up · x)。
-    // SIMD グループ 1 つで GATE_UP_ROWS 行
+    // SIMD グループ 1 つで GATE_UP_ROWS 行。4 ビットは masked_dot、5 ビットは half_dot
     inline void gate_up_rows(device const uchar *gateNibbles, device const half2 *gateParams,
                              device const uchar *upNibbles, device const half2 *upParams,
                              device const float *input, device float *output,
@@ -901,25 +963,35 @@ enum GGUFMetalSource {
         device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
         device const uint2 *gateWords = (device const uint2 *)gateNibbles;
         device const uint2 *upWords = (device const uint2 *)upNibbles;
-        float g[GATE_UP_ROWS] = {0.0f, 0.0f};
-        float u[GATE_UP_ROWS] = {0.0f, 0.0f};
+        float g[GATE_UP_ROWS];
+        float u[GATE_UP_ROWS];
+        for (uint r = 0u; r < GATE_UP_ROWS; r++) {
+            g[r] = 0.0f;
+            u[r] = 0.0f;
+        }
         for (uint h = lane; h < halves; h += 32u) {
             float4 x0 = float4(x[h * 4u]);
             float4 x1 = float4(x[h * 4u + 1u]);
             float4 x2 = float4(x[h * 4u + 2u]);
             float4 x3 = float4(x[h * 4u + 3u]);
             float xs = sum4(x0 + x1 + x2 + x3);
+            float4 y0 = x0 * NIBBLE_SCALES;
+            float4 y1 = x1 * NIBBLE_SCALES;
+            float4 y2 = x2 * NIBBLE_SCALES;
+            float4 y3 = x3 * NIBBLE_SCALES;
             uint part = h & 1u;
             uint block = first * groups + (h >> 1u);
             for (uint r = 0u; r < GATE_UP_ROWS; r++) {
                 if (r < rows) {
                     uint b = block + r * groups;
-                    uint gateBits = five ? (gateHigh[b] >> (part * 16u)) : 0u;
-                    uint upBits = five ? (upHigh[b] >> (part * 16u)) : 0u;
                     float2 pg = float2(gateParams[b]);
                     float2 pu = float2(upParams[b]);
-                    g[r] += pg.x * half_dot(gateWords[b * 2u + part], gateBits, five, x0, x1, x2, x3) + pg.y * xs;
-                    u[r] += pu.x * half_dot(upWords[b * 2u + part], upBits, five, x0, x1, x2, x3) + pu.y * xs;
+                    uint2 gw = gateWords[b * 2u + part];
+                    uint2 uw = upWords[b * 2u + part];
+                    float gx = five ? half_dot(gw, gateHigh[b] >> (part * 16u), true, x0, x1, x2, x3) : masked_dot(gw, y0, y1, y2, y3);
+                    float ux = five ? half_dot(uw, upHigh[b] >> (part * 16u), true, x0, x1, x2, x3) : masked_dot(uw, y0, y1, y2, y3);
+                    g[r] += pg.x * gx + pg.y * xs;
+                    u[r] += pu.x * ux + pu.y * xs;
                 }
             }
         }

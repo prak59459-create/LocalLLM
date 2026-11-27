@@ -17,6 +17,19 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         let tokensPerGroup: Int
         let threads: Int
         let counts: [Int]
+        /// 列を分ける SIMD グループの数（Args.split）を使う計算か。使うなら rowsPerGroup は行の組の大きさで、
+        /// 数はアプリと同じ GGUFMetalSource.split(columns:)（split があればその数に決め打ち）
+        var splits = false
+        var split: Int? = nil
+
+        /// この行列での、threadgroup の数・スレッドの数・Args.split
+        func shape(rows: Int, columns: Int) -> (groups: Int, threads: Int, split: Int) {
+            guard splits else { return ((rows + rowsPerGroup - 1) / rowsPerGroup, threads, 0) }
+            let count = split ?? GGUFMetalSource.split(columns: columns)
+            let simds = max(2, count)
+            let perGroup = simds / count * rowsPerGroup
+            return ((rows + perGroup - 1) / perGroup, 32 * simds, count)
+        }
     }
 
     /// 重み（copies 個。合わせてキャッシュより大きくして、毎回メモリから読む）
@@ -50,11 +63,16 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         }
 
         let q4: [Candidate] = [
-            Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: 2 * GGUFMetalSource.vectorRows, tokensPerGroup: 0,
-                      threads: 64, counts: [1]),
-            Candidate(label: "app-few2", function: "linear_q4_few2", rowsPerGroup: 8, tokensPerGroup: 2, threads: 64, counts: [2]),
-            Candidate(label: "app-few3", function: "linear_q4_few3", rowsPerGroup: 8, tokensPerGroup: 3, threads: 64, counts: [3]),
-            Candidate(label: "app-few4", function: "linear_q4_few4", rowsPerGroup: 8, tokensPerGroup: 4, threads: 64, counts: [4, 8]),
+            Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: GGUFMetalSource.vectorRows, tokensPerGroup: 0,
+                      threads: 64, counts: [1], splits: true),
+            Candidate(label: "app-few2", function: "linear_q4_few2", rowsPerGroup: GGUFMetalSource.fewRows, tokensPerGroup: 2, threads: 64,
+                      counts: [2], splits: true),
+            Candidate(label: "app-few3", function: "linear_q4_few3", rowsPerGroup: GGUFMetalSource.fewRows, tokensPerGroup: 3, threads: 64,
+                      counts: [3], splits: true),
+            Candidate(label: "app-few4", function: "linear_q4_few4", rowsPerGroup: GGUFMetalSource.fewRows, tokensPerGroup: 4, threads: 64,
+                      counts: [4, 8], splits: true),
+            Candidate(label: "app-rows-nosplit", function: "linear_q4_rows", rowsPerGroup: GGUFMetalSource.vectorRows, tokensPerGroup: 0,
+                      threads: 64, counts: [1], splits: true, split: 1),
             Candidate(label: "app-legacy", function: "linear_q4_batch", rowsPerGroup: 4, tokensPerGroup: 8, threads: 64, counts: [2, 8]),
             Candidate(label: "x-shift2", function: "xq4_one2", rowsPerGroup: 4, tokensPerGroup: 0, threads: 64, counts: [1]),
             Candidate(label: "x-mask4", function: "xq4_mask4", rowsPerGroup: 8, tokensPerGroup: 0, threads: 64, counts: [1]),
@@ -83,8 +101,8 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         }
     }
 
-    /// 行（出力）の少ない行列（FFN の down・注意の o など）は、SIMD グループの数が足りずにメモリを読みきれていない（23〜31 GB/s。
-    /// 行の多い gate+up は 50 GB/s）。1 つの行の組を threadgroup の S 個の SIMD グループで列を分けて計算し、最後に足すと速くなるか
+    /// 行（出力）の少ない行列（FFN の down・注意の o など）は、SIMD グループの数が足りずにメモリを読みきれていなかった（23〜31 GB/s。
+    /// 行の多い gate+up は 50 GB/s）。1 つの行の組を threadgroup の split 個の SIMD グループで列を分けて計算し、最後に足すと速いか
     func testSplitColumnsForMatricesWithFewRows() throws {
         guard GGUFMetalModel.isAvailable else { throw XCTSkip("no Metal device") }
         guard GGUFFixtures.realModels != nil else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
@@ -98,13 +116,12 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
             pipelines[name] = pipeline
             return pipeline
         }
-        let candidates: [Candidate] = [
-            Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: 2 * GGUFMetalSource.vectorRows, tokensPerGroup: 0,
-                      threads: 64, counts: [1]),
-        ] + [2, 4, 8].map { split in
-            Candidate(label: "x-split\(split)", function: "xq4_split\(split)", rowsPerGroup: 2, tokensPerGroup: 0, threads: 32 * split,
-                      counts: [1])
-        }
+        // アプリの 1 トークンの計算を、分ける数を決め打ちして（1・2・4）と、アプリの選び方で
+        let candidates: [Candidate] = [1, 2, 4].map { split in
+            Candidate(label: "app-rows-split\(split)", function: "linear_q4_rows", rowsPerGroup: GGUFMetalSource.vectorRows,
+                      tokensPerGroup: 0, threads: 64, counts: [1], splits: true, split: split)
+        } + [Candidate(label: "app-rows", function: "linear_q4_rows", rowsPerGroup: GGUFMetalSource.vectorRows, tokensPerGroup: 0,
+                       threads: 64, counts: [1], splits: true)]
         var random = SplitMix64(seed: 13)
         let shapes: [(String, Int, Int)] = [("ffn-down", 1536, 12288), ("ffn-down", 1536, 6144), ("attn-o", 1536, 4096), ("attn-o", 1536, 2048),
                                             ("attn-q", 2048, 1536), ("attn-k", 256, 1536), ("ffn-up", 12288, 1536)]
@@ -192,20 +209,27 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
                     let bindings: [MTLBuffer] = [matrix.weights[a], matrix.params[a], matrix.weights[b], matrix.params[b], input, output,
                                                  matrix.params[a], matrix.params[b]]
                     for (slot, buffer) in bindings.enumerated() { encoder.setBuffer(buffer, offset: 0, index: slot) }
+                    let shape = Candidate(label: "gate-up", function: "gate_up_q4", rowsPerGroup: GGUFMetalSource.gateUpRows,
+                                          tokensPerGroup: 0, threads: 64, counts: [1], splits: true)
+                        .shape(rows: layer.rows, columns: layer.columns)
+                    values.split = UInt32(shape.split)
                     encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: 8)
-                    let perGroup = GGUFMetalSource.gateUpRows * GGUFMetalSource.simdGroups
-                    encoder.dispatchThreadgroups(MTLSize(width: (layer.rows + perGroup - 1) / perGroup, height: 1, depth: 1),
-                                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                    encoder.dispatchThreadgroups(MTLSize(width: shape.groups, height: 1, depth: 1),
+                                                 threadsPerThreadgroup: MTLSize(width: shape.threads, height: 1, depth: 1))
                     return
                 }
                 encoder.setComputePipelineState(layer.int8 ? rows8 : rows4)
                 let bindings: [MTLBuffer] = [matrix.weights[a], matrix.params[a], dummy, input, output, layer.int8 ? dummy : matrix.params[a],
                                              dummy]
                 for (slot, buffer) in bindings.enumerated() { encoder.setBuffer(buffer, offset: 0, index: slot) }
+                // 4 ビットはアプリと同じく列を分ける（8 ビットは分けない）
+                let shape = Candidate(label: "rows", function: "rows", rowsPerGroup: layer.int8 ? 2 * GGUFMetalSource.q8Rows : GGUFMetalSource.vectorRows,
+                                      tokensPerGroup: 0, threads: 64, counts: [1], splits: !layer.int8)
+                    .shape(rows: layer.rows, columns: layer.columns)
+                values.split = UInt32(shape.split)
                 encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: 7)
-                let perGroup = (layer.int8 ? GGUFMetalSource.q8Rows : GGUFMetalSource.vectorRows) * GGUFMetalSource.simdGroups
-                encoder.dispatchThreadgroups(MTLSize(width: (layer.rows + perGroup - 1) / perGroup, height: 1, depth: 1),
-                                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                encoder.dispatchThreadgroups(MTLSize(width: shape.groups, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: shape.threads, height: 1, depth: 1))
             }
             let bytes = bytesPerCopy * (layer.fused ? 2 : 1)
             totalSeconds += seconds * Double(layer.count)
@@ -308,11 +332,12 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
                 encoder.setBuffer(binding.buffer, offset: binding.offset, index: index)
             }
             var values = arguments(count)
+            let shape = candidate.shape(rows: matrix.rows, columns: matrix.columns)
+            values.split = UInt32(shape.split)
             encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: 7)
-            let groups = (matrix.rows + candidate.rowsPerGroup - 1) / candidate.rowsPerGroup
             let height = candidate.tokensPerGroup == 0 ? 1 : (count + candidate.tokensPerGroup - 1) / candidate.tokensPerGroup
-            encoder.dispatchThreadgroups(MTLSize(width: groups, height: height, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: candidate.threads, height: 1, depth: 1))
+            encoder.dispatchThreadgroups(MTLSize(width: shape.groups, height: height, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: shape.threads, height: 1, depth: 1))
         }
         /// 1 回の命令列で何回か計算して、1 回あたりの GPU の時間（2 回のうち短いほう、秒）
         func time(_ candidate: Candidate, count: Int) throws -> Double {
@@ -330,9 +355,7 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
             }
             return best
         }
-        func run(_ function: String, rowsPerGroup: Int, tokensPerGroup: Int, threads: Int, count: Int, into target: MTLBuffer) throws {
-            let candidate = Candidate(label: function, function: function, rowsPerGroup: rowsPerGroup, tokensPerGroup: tokensPerGroup,
-                                      threads: threads, counts: [count])
+        func run(_ candidate: Candidate, count: Int, into target: MTLBuffer) throws {
             let buffer = try XCTUnwrap(queue.makeCommandBuffer())
             let encoder = try XCTUnwrap(buffer.makeComputeCommandEncoder())
             try encode(encoder, candidate, count: count, copy: 0, into: target)
@@ -356,10 +379,13 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
                                                (matrix.params[up], 0)]
                     for (slot, binding) in bindings.enumerated() { encoder.setBuffer(binding.buffer, offset: binding.offset, index: slot) }
                     var values = arguments(1)
+                    let shape = Candidate(label: "gate-up", function: "gate_up_q4", rowsPerGroup: GGUFMetalSource.gateUpRows,
+                                          tokensPerGroup: 0, threads: 64, counts: [1], splits: true)
+                        .shape(rows: matrix.rows, columns: matrix.columns)
+                    values.split = UInt32(shape.split)
                     encoder.setBytes(&values, length: MemoryLayout<GGUFMetalArgs>.stride, index: 8)
-                    let rowsPerGroup = GGUFMetalSource.gateUpRows * GGUFMetalSource.simdGroups
-                    encoder.dispatchThreadgroups(MTLSize(width: (matrix.rows + rowsPerGroup - 1) / rowsPerGroup, height: 1, depth: 1),
-                                                 threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                    encoder.dispatchThreadgroups(MTLSize(width: shape.groups, height: 1, depth: 1),
+                                                 threadsPerThreadgroup: MTLSize(width: shape.threads, height: 1, depth: 1))
                 }
                 encoder.endEncoding()
                 buffer.commit()
@@ -373,10 +399,10 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
         var configurations: [(candidate: Candidate, count: Int, difference: Float)] = []
         for candidate in candidates {
             for count in candidate.counts {
-                try run(reference, rowsPerGroup: 4, tokensPerGroup: 8, threads: 64, count: count, into: expected)
+                try run(Candidate(label: reference, function: reference, rowsPerGroup: 4, tokensPerGroup: 8, threads: 64, counts: [count]),
+                        count: count, into: expected)
                 memset(output.contents(), 0, count * matrix.rows * 4)
-                try run(candidate.function, rowsPerGroup: candidate.rowsPerGroup, tokensPerGroup: candidate.tokensPerGroup,
-                        threads: candidate.threads, count: count, into: output)
+                try run(candidate, count: count, into: output)
                 let a = output.contents().bindMemory(to: Float.self, capacity: count * matrix.rows)
                 let b = expected.contents().bindMemory(to: Float.self, capacity: count * matrix.rows)
                 var difference: Float = 0, largest: Float = 0
@@ -509,64 +535,6 @@ final class GGUFMetalKernelBenchTests: XCTestCase {
 
     typedef decltype(xq4_mask<2>) xq4_mask_t;
     template [[host_name("xq4_mask4")]] kernel xq4_mask_t xq4_mask<4>;
-
-    // 4 ビット・1 トークン: threadgroup 1 つで 2 行。S 個の SIMD グループで列（組の半分）を分けて計算し、最後に threadgroup で足す。
-    // 行の少ない行列でも、SIMD グループの数が S 倍になる
-    template <uint S>
-    kernel void xq4_split(device const uchar *nibbles [[buffer(0)]],
-                          device const half2 *params [[buffer(1)]],
-                          device const float *bias [[buffer(2)]],
-                          device const float *input [[buffer(3)]],
-                          device float *output [[buffer(4)]],
-                          device const uint *high [[buffer(5)]],
-                          device const float *aux [[buffer(6)]],
-                          constant Args &a [[buffer(7)]],
-                          uint group [[threadgroup_position_in_grid]],
-                          uint simd [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]]) {
-        threadgroup float partial[S][2];
-        uint first = group * 2u;
-        if (first >= a.rows) { return; }
-        uint rows = min(2u, a.rows - first);
-        uint groups = a.columns >> 5u;
-        uint halves = groups * 2u;
-        device const packed_float4 *x = (device const packed_float4 *)(input + a.inOffset);
-        device const uint2 *words = (device const uint2 *)nibbles;
-        float acc[2] = {0.0f, 0.0f};
-        for (uint h = simd * 32u + lane; h < halves; h += 32u * S) {
-            float4 x0 = float4(x[h * 4u]);
-            float4 x1 = float4(x[h * 4u + 1u]);
-            float4 x2 = float4(x[h * 4u + 2u]);
-            float4 x3 = float4(x[h * 4u + 3u]);
-            float xs = sum4(x0 + x1 + x2 + x3);
-            float4 y0 = x0 * NIBBLE_SCALES;
-            float4 y1 = x1 * NIBBLE_SCALES;
-            float4 y2 = x2 * NIBBLE_SCALES;
-            float4 y3 = x3 * NIBBLE_SCALES;
-            uint part = h & 1u;
-            uint block = first * groups + (h >> 1u);
-            for (uint r = 0u; r < 2u; r++) {
-                uint b = block + min(r, rows - 1u) * groups;
-                float2 p = float2(params[b]);
-                acc[r] += p.x * masked_dot(words[b * 2u + part], y0, y1, y2, y3) + p.y * xs;
-            }
-        }
-        for (uint r = 0u; r < 2u; r++) {
-            float sum = simd_sum(acc[r]);
-            if (lane == 0u) { partial[simd][r] = sum; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd == 0u && lane < rows) {
-            float sum = 0.0f;
-            for (uint s = 0u; s < S; s++) { sum += partial[s][lane]; }
-            linear_store(output, bias, aux, a, first + lane, 0u, sum);
-        }
-    }
-
-    typedef decltype(xq4_split<2>) xq4_split_t;
-    template [[host_name("xq4_split2")]] kernel xq4_split_t xq4_split<2>;
-    template [[host_name("xq4_split4")]] kernel xq4_split_t xq4_split<4>;
-    template [[host_name("xq4_split8")]] kernel xq4_split_t xq4_split<8>;
 
     // 8 ビット・1 トークン: SIMD グループ 1 つで R 行（アプリは Q8_ROWS 行）
     template <uint R>

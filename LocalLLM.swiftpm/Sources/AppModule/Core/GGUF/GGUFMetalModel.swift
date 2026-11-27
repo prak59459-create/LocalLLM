@@ -27,6 +27,8 @@ struct GGUFMetalArgs {
     var extra: Float = 0
     var auxOffset: UInt32 = 0
     var auxStride: UInt32 = 0
+    /// 4・5 ビットの線形層: 1 つの行の組の列を分けて受け持つ SIMD グループの数（GGUFMetalSource.split(columns:)）
+    var split: UInt32 = 0
 }
 
 enum GGUFMetalError: Error, LocalizedError, Equatable {
@@ -829,9 +831,20 @@ final class GGUFMetalModel: GGUFEvaluator {
         run(kernel, encoder, bindings, arguments, width: weights.rows, height: batched ? (count + 3) / 4 : 1)
     }
 
-    /// 4・5 ビットの線形層。1 トークンは SIMD グループで 4 行ずつ、まとめてのときはトークン 8 個 × 2 行ずつ
+    /// 列を split 個の SIMD グループで分けて計算するときの、threadgroup の SIMD グループの数と、受け持つ行
+    /// （threadgroup = max(2, split) 個の SIMD グループ。split 個ずつで rowsPerGroup 行の組を 1 つ受け持つ）
+    private static func splitShape(split: Int, rowsPerGroup: Int) -> (threads: Int, rows: Int) {
+        let simds = max(2, split)
+        return (32 * simds, simds / split * rowsPerGroup)
+    }
+
+    /// 4・5 ビットの線形層。1 トークンは行の組（2 行）ごと、少しまとめて（4 トークンまで）は 4 行の組ごとで、
+    /// どちらも列を GGUFMetalSource.split(columns:) 個の SIMD グループで分ける。たくさんまとめては行列の掛け算
     private func linearGrouped(_ encoder: MTLComputeCommandEncoder, _ weights: Weights, params: Binding, input: MTLBuffer,
-                               output: MTLBuffer, aux: Binding, arguments: GGUFMetalArgs) {
+                               output: MTLBuffer, aux: Binding, arguments base: GGUFMetalArgs) {
+        var arguments = base
+        let split = GGUFMetalSource.split(columns: weights.columns)
+        arguments.split = UInt32(split)
         let five = weights.groupBits == 5
         // 5 ビット目の面が無い 4 ビットでも、場所は埋めておく（読まない）
         let high: Binding = weights.high.map { ($0.buffer, $0.offset) } ?? params
@@ -848,19 +861,19 @@ final class GGUFMetalModel: GGUFEvaluator {
                 runMatrix(five ? .linearQ5Matrix : .linearQ4Matrix, encoder, bindings, arguments, rows: weights.rows, count: count)
                 return
             case .few:
-                let rows = GGUFMetalSource.fewRows * GGUFMetalSource.simdGroups
+                let layout = Self.splitShape(split: split, rowsPerGroup: GGUFMetalSource.fewRows)
                 let shape = Self.fewShape(count: count)
                 run(Kernel.few(bits: five ? 5 : 4, tokens: shape.tokens), encoder, bindings, arguments,
-                    groups: (weights.rows + rows - 1) / rows, height: shape.height, threads: threads)
+                    groups: (weights.rows + layout.rows - 1) / layout.rows, height: shape.height, threads: layout.threads)
                 return
             case .legacy:
                 break
             }
         }
         if count == 1 {
-            let rows = GGUFMetalSource.vectorRows * GGUFMetalSource.simdGroups
-            run(five ? .linearQ5Rows : .linearQ4Rows, encoder, bindings, arguments, groups: (weights.rows + rows - 1) / rows,
-                threads: threads)
+            let layout = Self.splitShape(split: split, rowsPerGroup: GGUFMetalSource.vectorRows)
+            run(five ? .linearQ5Rows : .linearQ4Rows, encoder, bindings, arguments, groups: (weights.rows + layout.rows - 1) / layout.rows,
+                threads: layout.threads)
             return
         }
         let rows = GGUFMetalSource.batchRows * GGUFMetalSource.simdGroups
@@ -892,9 +905,11 @@ final class GGUFMetalModel: GGUFEvaluator {
         let upHigh: Binding = up.high.map { ($0.buffer, $0.offset) } ?? upParams
         let bindings: [Binding] = [(gate.buffer, gate.offset), gateParams, (up.buffer, up.offset), upParams, (input, 0), (output, 0),
                                    gateHigh, upHigh]
-        let rows = GGUFMetalSource.gateUpRows * GGUFMetalSource.simdGroups
-        run(five ? .gateUpQ5 : .gateUpQ4, encoder, bindings, arguments, groups: (gate.rows + rows - 1) / rows,
-            threads: 32 * GGUFMetalSource.simdGroups)
+        let split = GGUFMetalSource.split(columns: gate.columns)
+        arguments.split = UInt32(split)
+        let layout = Self.splitShape(split: split, rowsPerGroup: GGUFMetalSource.gateUpRows)
+        run(five ? .gateUpQ5 : .gateUpQ4, encoder, bindings, arguments, groups: (gate.rows + layout.rows - 1) / layout.rows,
+            threads: layout.threads)
     }
 
     /// 正規化（weight が無ければ、重みを掛けない正規化）。add があれば出力に足す: 出力 = (出力 + 値 × branch) × result

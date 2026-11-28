@@ -62,6 +62,10 @@ enum GGUFMetalSource {
         case attentionScores = "attention_scores"
         case attentionSoftmax = "attention_softmax"
         case attentionCombine = "attention_combine"
+        /// KV キャッシュが半精度のとき（ふだん）
+        case attentionScoresHalf = "attention_scores_half"
+        case attentionCombineHalf = "attention_combine_half"
+        case storeKV = "store_kv"
         case scaleAdd = "scale_add"
         case gatedActivation = "gated_activation"
         case convolutionPrepare = "convolution_prepare"
@@ -1229,12 +1233,33 @@ enum GGUFMetalSource {
         return (window > 0u && position + 1u > window) ? position + 1u - window : 0u;
     }
 
+    // KV キャッシュ（半精度）に書く: Float で計算した k・v を、outOffset から書く。gid = 要素
+    // （半精度に入らない大きさは端の値にする。本物のモデルでは起きない）
+    kernel void store_kv(device const float *keys [[buffer(0)]],
+                         device const float *values [[buffer(1)]],
+                         device half *keyCache [[buffer(2)]],
+                         device half *valueCache [[buffer(3)]],
+                         constant Args &a [[buffer(4)]],
+                         uint gid [[thread_position_in_grid]]) {
+        if (gid >= a.count) { return; }
+        keyCache[a.outOffset + gid] = half(clamp(keys[gid], -65504.0f, 65504.0f));
+        valueCache[a.outOffset + gid] = half(clamp(values[gid], -65504.0f, 65504.0f));
+    }
+
+    // KV キャッシュの 4 個ずつ（Float か半精度。ふだんは半精度、Float で計算した正解と比べるテストだけ Float）
+    template <typename T> struct KVQuad {};
+    template <> struct KVQuad<float> { typedef packed_float4 packed; };
+    template <> struct KVQuad<half> { typedef packed_half4 packed; };
+    inline float4 widen(packed_float4 v) { return float4(v); }
+    inline float4 widen(packed_half4 v) { return float4(half4(v)); }
+
     // 注意のスコア = q · k。gid.x = 見る位置、gid.y = トークン × ヘッド
-    kernel void attention_scores(device const float *queries [[buffer(0)]],
-                                 device const float *keys [[buffer(1)]],
-                                 device float *scores [[buffer(2)]],
-                                 constant Args &a [[buffer(3)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
+    template <typename T>
+    kernel void attention_scores_t(device const float *queries [[buffer(0)]],
+                                   device const T *keys [[buffer(1)]],
+                                   device float *scores [[buffer(2)]],
+                                   constant Args &a [[buffer(3)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
         if (gid.x >= a.total || gid.y >= a.count * a.heads) { return; }
         uint index = gid.y / a.heads;
         uint head = gid.y % a.heads;
@@ -1243,15 +1268,19 @@ enum GGUFMetalSource {
         uint group = head / (a.heads / a.kvHeads);
         uint quads = a.size >> 2;
         device const packed_float4 *q = (device const packed_float4 *)(queries + gid.y * a.size);
-        device const packed_float4 *k = (device const packed_float4 *)(keys + (gid.x * a.kvHeads + group) * a.size);
+        device const typename KVQuad<T>::packed *k = (device const typename KVQuad<T>::packed *)(keys + (gid.x * a.kvHeads + group) * a.size);
         float4 sum = float4(0.0f);
         for (uint i = 0; i < quads; i++) {
-            sum += float4(q[i]) * float4(k[i]);
+            sum += float4(q[i]) * widen(k[i]);
         }
         float s = sum4(sum) * a.scale;
         if (a.softcap > 0.0f) { s = a.softcap * safe_tanh(s / a.softcap); }
         scores[gid.y * a.total + gid.x] = s;
     }
+    typedef decltype(attention_scores_t<float>) attention_scores_float_t;
+    typedef decltype(attention_scores_t<half>) attention_scores_half_t;
+    template [[host_name("attention_scores")]] kernel attention_scores_float_t attention_scores_t<float>;
+    template [[host_name("attention_scores_half")]] kernel attention_scores_half_t attention_scores_t<half>;
 
     // スコアを重み（合計 1）にする。threadgroup = トークン × ヘッドの 1 行で、見える位置をスレッド全部で分ける
     kernel void attention_softmax(device float *scores [[buffer(0)]],
@@ -1281,13 +1310,14 @@ enum GGUFMetalSource {
 
     // 重みを付けて v を足し合わせる。threadgroup = トークン × ヘッドの 1 行。
     // スレッド = (ヘッドの大きさ ÷ 4) × 分ける数。見る位置を分けて足し、最後にまとめる
-    kernel void attention_combine(device const float *scores [[buffer(0)]],
-                                  device const float *values [[buffer(1)]],
-                                  device float *output [[buffer(2)]],
-                                  constant Args &a [[buffer(3)]],
-                                  uint row [[threadgroup_position_in_grid]],
-                                  uint tid [[thread_position_in_threadgroup]],
-                                  uint threads [[threads_per_threadgroup]]) {
+    template <typename T>
+    kernel void attention_combine_t(device const float *scores [[buffer(0)]],
+                                    device const T *values [[buffer(1)]],
+                                    device float *output [[buffer(2)]],
+                                    constant Args &a [[buffer(3)]],
+                                    uint row [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    uint threads [[threads_per_threadgroup]]) {
         threadgroup float4 partial[256];
         uint quads = a.size >> 2u;
         uint parts = max(1u, threads / quads);
@@ -1299,11 +1329,11 @@ enum GGUFMetalSource {
         uint group = head / (a.heads / a.kvHeads);
         uint stride = a.kvHeads * quads;
         device const float *weights = scores + row * a.total;
-        device const packed_float4 *v = (device const packed_float4 *)values + group * quads + quad;
+        device const typename KVQuad<T>::packed *v = (device const typename KVQuad<T>::packed *)values + group * quads + quad;
         float4 sum = float4(0.0f);
         if (part < parts) {
             for (uint t = first + part; t <= position; t += parts) {
-                sum += weights[t] * float4(v[t * stride]);
+                sum += weights[t] * widen(v[t * stride]);
             }
         }
         partial[tid] = sum;
@@ -1314,6 +1344,10 @@ enum GGUFMetalSource {
             out[quad] = sum;
         }
     }
+    typedef decltype(attention_combine_t<float>) attention_combine_float_t;
+    typedef decltype(attention_combine_t<half>) attention_combine_half_t;
+    template [[host_name("attention_combine")]] kernel attention_combine_float_t attention_combine_t<float>;
+    template [[host_name("attention_combine_half")]] kernel attention_combine_half_t attention_combine_t<half>;
 
     // out = scale × x + softcap × y（y は flags に 512 があるときだけ）。gid = 要素。
     // x は inOffset、y は total、out は outOffset から。out は x と同じ場所でもよい

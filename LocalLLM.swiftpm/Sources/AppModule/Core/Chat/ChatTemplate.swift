@@ -318,26 +318,61 @@ struct PromptAssembler {
             }
         }
         let budget = max(1, contextLength - max(0, reserveTokens))
-        var dropped = 0
-        while true {
+        /// 先頭の dropped 個を捨てて描画する（last があれば、最後の発言をそれに替える）
+        func render(dropping dropped: Int, last: ChatMessage? = nil) throws -> (text: String, tokens: [Int]) {
             var messages: [ChatMessage] = []
             if let system, !system.isEmpty { messages.append(ChatMessage(role: .system, content: system)) }
-            messages.append(contentsOf: cleaned[dropped...])
+            var kept = Array(cleaned[min(dropped, cleaned.count)...])
+            if let last, !kept.isEmpty { kept[kept.count - 1] = last }
+            messages.append(contentsOf: kept)
             let text = try renderLeniently(messages, renderer: renderer, enableThinking: enableThinking,
                                            tools: nativeTools ? tools : [])
-            var tokens = tokenizer.encode(text, addSpecialTokens: false)
-            let remaining = cleaned.count - dropped
-            if tokens.count <= budget || remaining <= 1 {
-                if tokens.count > budget {
-                    // 最後の発言だけでも長すぎる: 先頭側を切り詰める
-                    tokens = Array(tokens.suffix(budget))
-                }
-                return Result(text: text, tokens: tokens, droppedMessageCount: dropped)
-            }
-            // 古いものから捨てる（user から始まるように、続く assistant / tool も一緒に）
-            dropped += 1
-            while dropped < cleaned.count - 1 && cleaned[dropped].role != .user { dropped += 1 }
+            return (text, tokenizer.encode(text, addSpecialTokens: false))
         }
+        let full = try render(dropping: 0)
+        if full.tokens.count <= budget || cleaned.isEmpty {
+            return Result(text: full.text, tokens: full.tokens, droppedMessageCount: 0)
+        }
+
+        // 古いものから捨てる（user から始まるように、続く assistant / tool も一緒に）。
+        // 捨てる量は「入りきらない分」ちょうどではなく、budget の 1/3 ごとの切りのよい量にする。
+        // ちょうどにすると、会話が続くたびに捨てる位置が 1 つずつずれてプロンプトの先頭が毎回変わり、
+        // KV キャッシュが使えずに毎回会話全体を読み直すことになる（長い会話で毎回「読み込み」がとても長くなっていた）。
+        // 切りのよい量にしておけば、次に捨てる位置が変わるまでの何回かは、前の読み込みをそのまま使える
+        let boundaries = (1..<cleaned.count).filter { cleaned[$0].role == .user || $0 == cleaned.count - 1 }
+        // 発言ごとのトークン数の見積もり（テンプレートの印の分を少し足す）。先頭からの合計は、前の発言が変わらない限り同じ
+        var before = [0]
+        for message in cleaned { before.append(before[before.count - 1] + tokenizer.encode(message.content, addSpecialTokens: false).count + 4) }
+        let quantum = max(64, budget / 3)
+        let excess = full.tokens.count - budget
+        let target = (excess + quantum - 1) / quantum * quantum
+        let first = boundaries.firstIndex { before[$0] >= target } ?? max(0, boundaries.count - 1)
+        for dropped in boundaries[first...] {
+            let attempt = try render(dropping: dropped)
+            if attempt.tokens.count <= budget {
+                return Result(text: attempt.text, tokens: attempt.tokens, droppedMessageCount: dropped)
+            }
+        }
+
+        // 最後の発言だけでも長すぎる: 発言の中ほどを省いて縮める（プロンプトの先頭（BOS やシステムプロンプト）を切ると、
+        // テンプレートの形が崩れて答えがおかしくなるので、切らない）
+        let dropped = boundaries.last ?? 0
+        var last = cleaned[cleaned.count - 1]
+        var attempt = try render(dropping: dropped)
+        for _ in 0..<4 where attempt.tokens.count > budget {
+            let characters = Array(last.content)
+            let contentTokens = max(1, tokenizer.encode(last.content, addSpecialTokens: false).count)
+            let keepTokens = contentTokens - (attempt.tokens.count - budget) - 16
+            let keep = Int(Double(characters.count) * Double(max(0, keepTokens)) / Double(contentTokens))
+            guard keep > 0 else { break }
+            let head = keep * 2 / 5
+            last.content = String(characters[..<head]) + "\n…（" + L("中略", "omitted") + "）…\n"
+                + String(characters[(characters.count - (keep - head))...])
+            attempt = try render(dropping: dropped, last: last)
+        }
+        // それでも入らない（テンプレートそのものが長すぎる）ときだけ、後ろを残して切る
+        let tokens = attempt.tokens.count > budget ? Array(attempt.tokens.suffix(budget)) : attempt.tokens
+        return Result(text: attempt.text, tokens: tokens, droppedMessageCount: dropped)
     }
 
     /// テンプレートが system を拒否したら最初の user にまとめて再挑戦し、それでもだめなら組み込みの書式にする。

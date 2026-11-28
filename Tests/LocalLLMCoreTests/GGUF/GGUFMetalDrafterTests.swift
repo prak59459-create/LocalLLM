@@ -5,6 +5,18 @@ import XCTest
 
 /// GPU（Metal）での Gemma 4 の MTP（先読み・推測デコード）が、CPU と numpy の正解と同じになるか（Mac の CI で動く）
 final class GGUFMetalDrafterTests: XCTestCase {
+    // CPU・numpy の正解は Float32 の KV キャッシュなので、小さなモデルとの比べは Float の KV キャッシュで行う
+    // （本物の Gemma 4 は、アプリと同じ半精度の KV キャッシュで、先読みあり・なしが同じ続きになるかを確かめる）
+    override func setUp() {
+        super.setUp()
+        GGUFMetalModel.halfPrecisionCache = false
+    }
+
+    override func tearDown() {
+        GGUFMetalModel.halfPrecisionCache = true
+        super.tearDown()
+    }
+
     private func requireDevice() throws {
         guard GGUFMetalModel.isAvailable else { throw XCTSkip("no Metal device") }
     }
@@ -106,6 +118,8 @@ final class GGUFMetalDrafterTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: targetFile.path), FileManager.default.fileExists(atPath: drafterFile.path) else {
             throw XCTSkip("Gemma 4 E2B and its MTP model are not in LOCALLLM_GGUF_MODELS")
         }
+        // アプリと同じ半精度の KV キャッシュで（先読みあり・なしのどちらも同じ KV キャッシュなので、同じ続きになる）
+        GGUFMetalModel.halfPrecisionCache = true
         func store(_ source: URL) throws -> GGUFWeightStore {
             let destination = GGUFFixtures.temporaryFile(source.lastPathComponent + ".llw")
             try GGUFConverter.convert(gguf: source, to: destination)

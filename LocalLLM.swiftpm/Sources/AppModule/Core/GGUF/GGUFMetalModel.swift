@@ -159,13 +159,22 @@ final class GGUFMetalModel: GGUFEvaluator {
     private let rotation: MTLBuffer, slidingRotation: MTLBuffer
     /// 層ごとの入力（Gemma 4）: [トークン][層][大きさ] と、トークンごとの表、1 層ぶんの作業用
     private let perLayerInputs: MTLBuffer, perLayerTokens: MTLBuffer, perLayerWork: MTLBuffer
+    /// k・v を Float で計算しておく場所（正規化と RoPE のあと、半精度にして KV キャッシュに写す）
+    private let stagedKeys: MTLBuffer, stagedValues: MTLBuffer
     private var scores: MTLBuffer
     private var scoresCapacity: Int
 
-    /// 層ごとの KV キャッシュ: [位置][kvHead][headSize]。借りる層は nil。足りなくなったら大きくする
+    /// 層ごとの KV キャッシュ: [位置][kvHead][headSize]（cacheInHalf なら半精度。畳み込みの層は Float）。借りる層は nil。
+    /// 足りなくなったら大きくする
     private var keys: [MTLBuffer?] = []
     private var values: [MTLBuffer?] = []
     private var cacheCapacity = 0
+    /// KV キャッシュを用意してあるトークン数（読む前にまとめて用意したかを見る）
+    var reservedTokens: Int { cacheCapacity }
+    /// KV キャッシュを半精度で置くか（Float の半分のメモリ。llama.cpp の既定と同じ）。作るときの halfPrecisionCache
+    let cacheInHalf: Bool
+    /// これから作るモデルの KV キャッシュを半精度にするか（ふだんは true。Float の KV キャッシュで計算した正解と比べるテストだけ false）
+    static var halfPrecisionCache = true
 
     /// スコア用のメモリの上限（Float の個数）
     private static let scoresBudget = 16 * 1024 * 1024
@@ -192,6 +201,7 @@ final class GGUFMetalModel: GGUFEvaluator {
         self.queue = queue
         self.config = config
         self.shapes = shapes
+        cacheInHalf = Self.halfPrecisionCache
         deviceName = device.name
         self.maxContext = max(8, min(config.contextLength, maxContext ?? config.contextLength))
         let globals = try GGUFGlobalWeights(store: store, config: config)
@@ -218,6 +228,9 @@ final class GGUFMetalModel: GGUFEvaluator {
         perLayerInputs = try Self.floats(device, capacity * perLayerTotal)
         perLayerTokens = try Self.floats(device, capacity * perLayerTotal)
         perLayerWork = try Self.floats(device, capacity * config.perLayerInputSize)
+        let widestKV = shapes.map(\.kvSize).max() ?? 0
+        stagedKeys = try Self.floats(device, capacity * widestKV)
+        stagedValues = try Self.floats(device, capacity * widestKV)
         scoresCapacity = 64 * 1024
         scores = try Self.floats(device, scoresCapacity)
         vectors = try Self.floats(device, 4)
@@ -228,7 +241,15 @@ final class GGUFMetalModel: GGUFEvaluator {
     }
 
     private static func floats(_ device: MTLDevice, _ count: Int) throws -> MTLBuffer {
-        let bytes = max(count, 4) * MemoryLayout<Float>.size
+        try buffer(device, max(count, 4) * MemoryLayout<Float>.size)
+    }
+
+    /// 半精度（2 バイト）を count 個
+    private static func halves(_ device: MTLDevice, _ count: Int) throws -> MTLBuffer {
+        try buffer(device, max(count, 8) * 2)
+    }
+
+    private static func buffer(_ device: MTLDevice, _ bytes: Int) throws -> MTLBuffer {
         guard let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else {
             throw GGUFMetalError.unavailable("buffer of \(bytes) bytes")
         }
@@ -412,35 +433,51 @@ final class GGUFMetalModel: GGUFEvaluator {
 
     // MARK: - KV キャッシュ
 
+    /// KV キャッシュを capacity トークンぶんにする（今入っている分は引き継ぐ）。
+    /// k・v は半精度で置く（Float の半分のメモリ。llama.cpp の既定と同じ）。畳み込みの層（LFM2）の記録だけは Float
     private func allocateCache(_ capacity: Int) throws {
-        var newKeys: [MTLBuffer?] = [], newValues: [MTLBuffer?] = []
-        for (index, shape) in shapes.enumerated() {
-            guard shape.kvLayer == index else {
-                newKeys.append(nil)
-                newValues.append(nil)
-                continue
-            }
+        let previous = cacheCapacity
+        if keys.count != shapes.count {
+            keys = Array(repeating: nil, count: shapes.count)
+            values = Array(repeating: nil, count: shapes.count)
+        }
+        for (index, shape) in shapes.enumerated() where shape.kvLayer == index {
             // 畳み込みの層（LFM2）は、位置ごとの b × x を keys に覚える
             let width = shape.convolution ? config.embeddingSize : shape.kvSize
-            let key = try Self.floats(device, capacity * width)
-            let value = try Self.floats(device, shape.convolution ? 4 : capacity * width)
+            let half = cacheInHalf && !shape.convolution
+            let key = half ? try Self.halves(device, capacity * width) : try Self.floats(device, capacity * width)
+            let value = shape.convolution ? try Self.floats(device, 4)
+                : (half ? try Self.halves(device, capacity * width) : try Self.floats(device, capacity * width))
             // 今入っている分は引き継ぐ
-            let used = min(length, cacheCapacity, capacity) * width * MemoryLayout<Float>.size
-            if used > 0, index < keys.count, let oldKey = keys[index], let oldValue = values[index] {
+            let elementBytes = half ? 2 : MemoryLayout<Float>.size
+            let used = min(length, previous, capacity) * width * elementBytes
+            if used > 0, let oldKey = keys[index], let oldValue = values[index] {
                 key.contents().copyMemory(from: oldKey.contents(), byteCount: used)
                 if !shape.convolution { value.contents().copyMemory(from: oldValue.contents(), byteCount: used) }
             }
-            newKeys.append(key)
-            newValues.append(value)
+            // この層の古い分は、ここで手放す（全部の層の古いものと新しいものを同時に持たない）
+            keys[index] = key
+            values[index] = value
         }
-        keys = newKeys
-        values = newValues
         cacheCapacity = capacity
     }
 
     private func reserveCache(_ needed: Int) throws {
         guard needed > cacheCapacity else { return }
         try allocateCache(min(maxContext, max(needed, cacheCapacity * 2)))
+    }
+
+    /// これから tokens トークンまで読む・書くぶんの KV キャッシュとスコアの置き場所を、先にまとめて用意する。
+    /// 読んでいる途中で大きくすると、そのたびに古いものと新しいものの両方を持つことになり、
+    /// メモリの見張りも「急に減った」と見なして止めてしまうので、プロンプトを読む前に 1 回で済ませる
+    func reserve(_ tokens: Int) throws {
+        let needed = min(maxContext, max(tokens, length))
+        if cacheCapacity == 0 { try allocateCache(min(maxContext, max(needed, Self.initialCache))) }
+        if needed > cacheCapacity {
+            // 256 トークンずつの切りのよい大きさに（少しだけ多めに書いても、もう一度大きくしなくてよいように）
+            try allocateCache(min(maxContext, (needed + 255) / 256 * 256))
+        }
+        try reserveScores(min(Self.scoresBudget, batchCapacity * config.maxHeadCount * needed))
     }
 
     func truncate(to newLength: Int) {
@@ -1166,30 +1203,41 @@ final class GGUFMetalModel: GGUFEvaluator {
         normalizeAndRotate(encoder, queries, layer.queryNorm, heads: heads, count: n, layer: index)
 
         if shape.kvLayer == index, let key = layer.key {
-            // k と v は KV キャッシュの続きに直接書く
-            linear(encoder, key, input: input, inStride: d, count: n, output: keyBuffer, outOffset: cacheOffset, outStride: kv)
+            // 半精度の KV キャッシュには、k と v を Float で計算して正規化・RoPE をしてから、半精度にして続きに書く。
+            // Float の KV キャッシュには直接書く
+            let half = cacheInHalf
+            let keyTarget = half ? stagedKeys : keyBuffer, valueTarget = half ? stagedValues : valueBuffer
+            let offset = half ? 0 : cacheOffset
+            linear(encoder, key, input: input, inStride: d, count: n, output: keyTarget, outOffset: offset, outStride: kv)
             if let value = layer.value {
-                linear(encoder, value, input: input, inStride: d, count: n, output: valueBuffer, outOffset: cacheOffset, outStride: kv)
+                linear(encoder, value, input: input, inStride: d, count: n, output: valueTarget, outOffset: offset, outStride: kv)
             } else {
                 // Gemma 4: v が無ければ、正規化する前の k を使う
-                scaleAdd(encoder, keyBuffer, inOffset: cacheOffset, into: valueBuffer, outOffset: cacheOffset, count: n * kv)
+                scaleAdd(encoder, keyTarget, inOffset: offset, into: valueTarget, outOffset: offset, count: n * kv)
             }
-            normalizeAndRotate(encoder, keyBuffer, offset: cacheOffset, layer.keyNorm, heads: kvHeads, count: n, layer: index)
+            normalizeAndRotate(encoder, keyTarget, offset: offset, layer.keyNorm, heads: kvHeads, count: n, layer: index)
             if config.hasValueNorm {
-                normalize(encoder, valueBuffer, inOffset: cacheOffset, nil, into: valueBuffer, outOffset: cacheOffset,
+                normalize(encoder, valueTarget, inOffset: offset, nil, into: valueTarget, outOffset: offset,
                           rows: n * kvHeads, columns: size, rms: true)
+            }
+            if half {
+                var store = GGUFMetalArgs()
+                store.count = UInt32(n * kv)
+                store.outOffset = UInt32(cacheOffset)
+                run(.storeKV, encoder, [(stagedKeys, 0), (stagedValues, 0), (keyBuffer, 0), (valueBuffer, 0)], store, width: n * kv)
             }
         }
 
         let arguments = attentionArguments(layer: index, start: start, count: n)
         let rows = n * heads
         let scoreBindings: [Binding] = [(queries, 0), (keyBuffer, 0), (scores, 0)]
-        run(.attentionScores, encoder, scoreBindings, arguments, width: start + n, height: rows)
+        run(cacheInHalf ? .attentionScoresHalf : .attentionScores, encoder, scoreBindings, arguments, width: start + n, height: rows)
         let softmaxBindings: [Binding] = [(scores, 0)]
         run(.attentionSoftmax, encoder, softmaxBindings, arguments, groups: rows, threads: Self.rowThreads(4 * (start + n)))
         let combineBindings: [Binding] = [(scores, 0), (valueBuffer, 0), (attended, 0)]
         let quads = size / 4
-        run(.attentionCombine, encoder, combineBindings, arguments, groups: rows, threads: quads * max(1, 256 / quads))
+        run(cacheInHalf ? .attentionCombineHalf : .attentionCombine, encoder, combineBindings, arguments, groups: rows,
+            threads: quads * max(1, 256 / quads))
 
         linear(encoder, layer.output, input: attended, inStride: q, count: n, output: projected, outStride: d)
     }
@@ -1514,11 +1562,12 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
         arguments.scale = config.attentionScale
         arguments.softcap = config.attentionSoftcap
         let heads = shape.headCount
-        run(.attentionScores, encoder, [(drafter.queries, 0), (keyBuffer, 0), (scores, 0)], arguments, width: position, height: heads)
+        run(cacheInHalf ? .attentionScoresHalf : .attentionScores, encoder, [(drafter.queries, 0), (keyBuffer, 0), (scores, 0)],
+            arguments, width: position, height: heads)
         run(.attentionSoftmax, encoder, [(scores, 0)], arguments, groups: heads, threads: Self.rowThreads(4 * position))
         let quads = shape.headSize / 4
-        run(.attentionCombine, encoder, [(scores, 0), (valueBuffer, 0), (drafter.attended, 0)], arguments, groups: heads,
-            threads: quads * max(1, 256 / quads))
+        run(cacheInHalf ? .attentionCombineHalf : .attentionCombine, encoder, [(scores, 0), (valueBuffer, 0), (drafter.attended, 0)],
+            arguments, groups: heads, threads: quads * max(1, 256 / quads))
     }
 }
 #endif

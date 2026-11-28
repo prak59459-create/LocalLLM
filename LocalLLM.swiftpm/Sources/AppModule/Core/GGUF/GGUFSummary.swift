@@ -58,8 +58,15 @@ struct GGUFSummary: Codable, Hashable, Sendable {
         }
     }
 
-    /// 既定で使うコンテキスト長（KV キャッシュが大きくなりすぎないように、学習時の長さと 4096 の小さいほう）
-    var defaultContext: Int { max(256, min(contextLength, 4096)) }
+    /// 既定で使うコンテキスト長。KV キャッシュ（GPU では半精度）が 256MB までに収まる、いちばん長いもの
+    /// （4096・8192・16384・32768 のどれか。学習時の長さまで）。長い会話でも古い発言を省かずに済むように、
+    /// メモリに余裕のある小さなモデルほど長くする（KV キャッシュは使った分だけ増えるので、短い会話では増えない）
+    var defaultContext: Int {
+        let floor = max(256, min(contextLength, 4096))
+        let perToken = max(1, kvBytesPerToken / 2)
+        let longest = [8192, 16_384, 32_768].last { $0 <= contextLength && perToken * $0 <= 256 << 20 }
+        return max(floor, longest ?? 0)
+    }
 
     /// パラメータ数の短い表記（"494M"・"1.5B"）
     var parameterLabel: String {

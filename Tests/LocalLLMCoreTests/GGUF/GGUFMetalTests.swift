@@ -5,6 +5,46 @@ import XCTest
 
 /// GPU（Metal）での GGUF の計算が、CPU での計算・llama.cpp と同じ結果になるか（Mac の CI で動く。GPU が無ければ飛ばす）
 final class GGUFMetalTests: XCTestCase {
+    // llama.cpp の正解と CPU の計算は Float32 の KV キャッシュなので、小さなモデルとの比べは Float の KV キャッシュで行う。
+    // ふだん（アプリ）の半精度の KV キャッシュは、testHalfPrecisionCacheStaysClose と本物のモデルで確かめる
+    override func setUp() {
+        super.setUp()
+        GGUFMetalModel.halfPrecisionCache = false
+    }
+
+    override func tearDown() {
+        GGUFMetalModel.halfPrecisionCache = true
+        super.tearDown()
+    }
+
+    /// 半精度の KV キャッシュ（ふだん）でも、Float の KV キャッシュとほとんど同じ logits になる（1 トークンずつ・まとめて・先読みの確かめ）。
+    /// KV キャッシュのメモリが半分になる（長い会話でもメモリが足りなくなりにくい）
+    func testHalfPrecisionCacheStaysClose() throws {
+        try requireDevice()
+        var worst: Float = 0
+        for family in GGUFModelTests.families + ["gemma4", "lfm2"] {
+            let file = try convert(family, compact: true, groups: .q4Groups)
+            defer { try? FileManager.default.removeItem(at: file) }
+            let store = try GGUFWeightStore(url: file)
+            GGUFMetalModel.halfPrecisionCache = false
+            let float = try GGUFMetalModel(store: store)
+            GGUFMetalModel.halfPrecisionCache = true
+            let half = try GGUFMetalModel(store: store)
+            XCTAssertTrue(half.cacheInHalf)
+            XCTAssertFalse(float.cacheInHalf)
+            let tokens = try reference(family).tokens
+            let batched = GGUFModelFactory.relativeDifference(try half.evaluate(Array(tokens.prefix(8))),
+                                                              try float.evaluate(Array(tokens.prefix(8))))
+            var single: Float = 0
+            for token in tokens.dropFirst(8) {
+                single = max(single, GGUFModelFactory.relativeDifference(try half.evaluate([token]), try float.evaluate([token])))
+            }
+            worst = max(worst, batched, single)
+            XCTAssertLessThan(max(batched, single), 0.03, family)
+        }
+        print("GGUF Metal: half-precision KV cache, worst relative difference from Float \(worst)")
+    }
+
     private func requireDevice() throws {
         guard GGUFMetalModel.isAvailable else {
             print("GGUF Metal: no Metal device on this machine")
@@ -205,6 +245,8 @@ final class GGUFMetalTests: XCTestCase {
     func testRealModelsOnTheGPU() throws {
         try requireDevice()
         guard let directory = GGUFFixtures.realModels else { throw XCTSkip("set LOCALLLM_GGUF_MODELS to run") }
+        // 本物のモデルは、アプリと同じ半精度の KV キャッシュで確かめる
+        GGUFMetalModel.halfPrecisionCache = true
         // Gemma 4 E2B は大きいので、速さを測る専用の流れ（.github/workflows/bench.yml）だけで取ってくる
         let names = ["smollm2-135m-q4_k_m", "smollm2-135m-q8_0", "qwen2.5-0.5b-q4_k_m", "qwen2.5-1.5b-q4_k_m", "gemma-4-e2b-q4_0"]
         var checked = 0

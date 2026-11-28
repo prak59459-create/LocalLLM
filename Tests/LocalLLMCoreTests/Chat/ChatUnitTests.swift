@@ -79,14 +79,52 @@ final class ChatUnitTests: XCTestCase {
         XCTAssertLessThanOrEqual(trimmed.tokens.count, 80)
     }
 
+    /// 最後の発言だけでも長すぎるときは、発言の中ほどを省く（テンプレートの形と、発言の頭と終わりは残す）
     func testPromptAssemblerTruncatesTooLongLastMessage() throws {
         let renderer = ChatTemplateRenderer(template: nil, bosToken: nil, eosToken: nil, fallbackFormat: .plain)
-        let history = [ChatMessage(role: .user, content: String(repeating: "x", count: 500))]
-        let result = try PromptAssembler.assemble(systemPrompt: nil, history: history, renderer: renderer,
-                                                  tokenizer: CharacterMockTokenizer(), contextLength: 100, reserveTokens: 10,
+        let content = "HEAD" + String(repeating: "x", count: 500) + "TAIL"
+        let history = [ChatMessage(role: .user, content: content)]
+        let tokenizer = CharacterMockTokenizer()
+        let result = try PromptAssembler.assemble(systemPrompt: "SYS", history: history, renderer: renderer,
+                                                  tokenizer: tokenizer, contextLength: 100, reserveTokens: 10,
                                                   enableThinking: nil)
-        XCTAssertEqual(result.tokens.count, 90)
+        XCTAssertLessThanOrEqual(result.tokens.count, 90)
+        XCTAssertGreaterThan(result.tokens.count, 50)
         XCTAssertEqual(result.droppedMessageCount, 0)
+        XCTAssertEqual(result.tokens, tokenizer.encode(result.text, addSpecialTokens: false))
+        // 先頭（システムプロンプト）も、発言の頭と終わりも、生成の始まりの印も残る
+        XCTAssertTrue(result.text.hasPrefix("SYS\n\nUser: HEAD"), result.text)
+        XCTAssertTrue(result.text.contains("TAIL\nAssistant:"), result.text)
+        XCTAssertTrue(result.text.contains("…（"), result.text)
+    }
+
+    /// 長い会話で古い発言を捨てるとき、捨てる位置は会話が続いてもしばらく変わらない
+    /// （毎回 1 つずつずらすと、プロンプトの先頭が毎回変わって KV キャッシュが使えず、毎回会話全体を読み直すことになる）
+    func testPromptAssemblerKeepsTheSamePrefixAcrossTurns() throws {
+        let renderer = ChatTemplateRenderer(template: nil, bosToken: nil, eosToken: nil, fallbackFormat: .plain)
+        let tokenizer = CharacterMockTokenizer()
+        var messages: [ChatMessage] = []
+        var previous: PromptAssembler.Result?
+        var reused = 0, turns = 0
+        for turn in 0..<60 {
+            messages.append(ChatMessage(role: .user, content: "question \(turn) " + String(repeating: "q", count: 20)))
+            let result = try PromptAssembler.assemble(systemPrompt: "SYS", history: messages, renderer: renderer, tokenizer: tokenizer,
+                                                      contextLength: 1200, reserveTokens: 200, enableThinking: nil)
+            XCTAssertLessThanOrEqual(result.tokens.count, 1000)
+            XCTAssertTrue(result.text.hasPrefix("SYS\n\n"))
+            XCTAssertTrue(result.text.contains("question \(turn) "))
+            if let previous, result.droppedMessageCount > 0 {
+                turns += 1
+                // 前の回のプロンプト（「Assistant:」まで）が、そのまま今回の先頭にあれば、前の読み込みを使える
+                if result.text.hasPrefix(previous.text) { reused += 1 }
+            }
+            previous = result
+            messages.append(ChatMessage(role: .assistant, content: "answer \(turn) " + String(repeating: "a", count: 20)))
+        }
+        XCTAssertGreaterThan(turns, 30)
+        // 捨てる位置が変わった回以外は、前のプロンプトの続きになっている（1 回の発言が budget の 1/12 なら、6 割以上の回で使い回せる。
+        // 前は捨てる位置が毎回ずれて、0 回だった）
+        XCTAssertGreaterThan(reused, turns * 6 / 10, "reused \(reused) of \(turns)")
     }
 
     func testPromptAssemblerStripsThinkingAndMergesSystemForStrictTemplates() throws {

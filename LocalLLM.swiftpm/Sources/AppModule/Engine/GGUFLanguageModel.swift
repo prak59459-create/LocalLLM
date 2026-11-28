@@ -119,6 +119,7 @@ final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
         // 予想の数（当たり方・測った時間と、コンテキストの残りから。0 なら予想せずに 1 つだけ確かめる）
         let room = max(0, maxContext - cachedTokens.count - 1)
         let count = min(planner.next(), room)
+        let reserved = model.reservedTokens
         do {
             let (drafts, draftTime, verifyTime) = try await InferenceQueue.run { () throws -> ([Int], Double, Double) in
                 let start = Date()
@@ -127,6 +128,7 @@ final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
                 try target.verify([token] + drafts)
                 return (drafts, drafted.timeIntervalSince(start), Date().timeIntervalSince(drafted))
             }
+            noteReservation(from: reserved)
             planner.recordTimes(drafted: drafts.count, draftTime: draftTime, verified: drafts.count + 1, verifyTime: verifyTime)
             proposed = [token] + drafts
             proposedDrafts = drafts.count
@@ -134,11 +136,11 @@ final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
                 try await InferenceQueue.run { target.verifiedLogits(index) }
             }
         } catch let error as GGUFMetalError {
-            // GPU が使えなくなった: ここまでの系列ごと CPU で計算し直して、予想はやめる
+            // GPU の計算が失敗した（アプリが裏に回った など）: 予想はやめて、1 トークンだけ読む（そちらで GPU のやり直しをする。
+            // 失敗した計算は KV キャッシュの長さを進めていないので、続きから読める）
+            guard case .failed = error else { throw error }
             proposed = []
-            let tokens = cachedTokens + [token]
-            try await switchToCPU(error)
-            let scores = try await read(tokens, chunkSize: GGUFModel.maxBatch, progress: nil).scores
+            let scores = try await append(token: token)
             return SpeculativeProposal(drafts: []) { _ in
                 if case .logits(let logits) = scores { return logits }
                 return []
@@ -168,37 +170,86 @@ final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
         guard !tokens.isEmpty else { throw EngineError.emptyPrompt }
         guard tokens.count <= maxContext else { throw EngineError.contextOverflow(tokens.count, maxContext) }
         returnToGPU()
-        do {
-            return try await read(tokens, chunkSize: chunkSize, progress: progress)
-        } catch let error as GGUFMetalError {
-            try await switchToCPU(error)
-            return try await read(tokens, chunkSize: chunkSize, progress: progress)
+        // 再利用できた先頭は、最初の 1 回だけ数える（GPU のやり直しでは、読めたところから続けるので）
+        let reused = reusablePrefix(tokens)
+        let scores = try await withGPURetries { failures in
+            // 失敗するたびに、1 回に GPU に渡す量を半分にする（長い計算を GPU に止められたときのため）
+            try await self.read(tokens, chunkSize: max(1, chunkSize >> failures), progress: progress).scores
+        } cpu: {
+            try await self.read(tokens, chunkSize: chunkSize, progress: progress)
         }
+        return (scores, reused)
     }
 
     func append(token: Int) async throws -> NextTokenScores {
         guard cachedTokens.count < maxContext else { throw EngineError.contextOverflow(cachedTokens.count + 1, maxContext) }
-        let model = self.model
-        do {
+        // CPU に切り替えるときは、ここまでの系列ごと読み直す（切り替えると KV キャッシュは空になる）
+        let all = cachedTokens + [token]
+        let reserved = model.reservedTokens
+        let scores = try await withGPURetries { _ in
+            let model = self.model
             let logits = try await InferenceQueue.run { try model.evaluate([token]) }
-            cachedTokens.append(token)
-            return .logits(logits)
-        } catch let error as GGUFMetalError {
-            // GPU が使えなくなった: ここまでの系列ごと CPU で計算し直す
-            let tokens = cachedTokens + [token]
-            try await switchToCPU(error)
-            return try await read(tokens, chunkSize: GGUFModel.maxBatch, progress: nil).scores
+            self.cachedTokens.append(token)
+            return NextTokenScores.logits(logits)
+        } cpu: {
+            try await self.read(all, chunkSize: GGUFModel.maxBatch, progress: nil)
         }
+        noteReservation(from: reserved)
+        return scores
+    }
+
+    /// GPU の計算が失敗したとき、CPU に切り替える前に GPU でやり直す回数（アプリが前に出ているのに続けて失敗した回数）
+    private static let gpuRetries = 3
+    /// プロンプトを読む前に、生成のぶんとして KV キャッシュに足しておくトークン数
+    private static let generationReserve = 512
+
+    /// GPU の計算を、失敗したらやり直しながら行う。work(それまでに失敗した回数) は、前の回に読めたところから続ける
+    /// （失敗した計算は KV キャッシュの長さを進めていない）。
+    /// - アプリが裏に回っている間（iOS は GPU を使わせない）は、前に戻るまで待ってからやり直す（回数に数えない）。
+    ///   前は ここですぐ CPU に切り替えて、プロンプトを最初から CPU で読み直していた（とても遅く、止まったように見えた）
+    /// - 前に出ているのに gpuRetries 回より多く続けて失敗したら（GPU がおかしい）、CPU に切り替えて cpu() をする
+    private func withGPURetries(_ work: (Int) async throws -> NextTokenScores,
+                                cpu: () async throws -> (scores: NextTokenScores, reusedTokens: Int)) async throws -> NextTokenScores {
+        var failures = 0
+        while true {
+            do {
+                return try await work(failures)
+            } catch let error as GGUFMetalError {
+                guard case .failed = error, let metal, model === metal else { throw error }
+                if !AppActivity.isActive {
+                    try await AppActivity.waitUntilActive()
+                    continue
+                }
+                failures += 1
+                if failures <= Self.gpuRetries {
+                    try await Task.sleep(nanoseconds: UInt64(failures) * 200_000_000)
+                    continue
+                }
+                try await switchToCPU(error)
+                return try await cpu().scores
+            }
+        }
+    }
+
+    /// 前の計算と共通の先頭のトークン数（logits を得るため、最低 1 トークンは読む）
+    private func reusablePrefix(_ tokens: [Int]) -> Int {
+        var reused = 0
+        let limit = min(cachedTokens.count, tokens.count, model.length)
+        while reused < limit && cachedTokens[reused] == tokens[reused] { reused += 1 }
+        return min(reused, max(0, tokens.count - 1))
+    }
+
+    /// 計算の途中で KV キャッシュを大きくした（1 度きりの大きな確保）なら、メモリの見張りの「減り方」の記録をやり直す
+    /// （そのままだと、次の 1 回でも同じだけ減ると見なして止めてしまう）
+    private func noteReservation(from previous: Int) {
+        if model.reservedTokens != previous { gate?.begin() }
     }
 
     /// モデル内部の系列を tokens にそろえて、次のスコアを返す
     private func read(_ tokens: [Int], chunkSize: Int, progress: ((Int, Int) -> Void)?) async throws
         -> (scores: NextTokenScores, reusedTokens: Int) {
-        // 共通の先頭部分は計算し直さない。ただし logits を得るため最低 1 トークンは入力する
-        var reused = 0
-        let limit = min(cachedTokens.count, tokens.count, model.length)
-        while reused < limit && cachedTokens[reused] == tokens[reused] { reused += 1 }
-        if reused >= tokens.count { reused = tokens.count - 1 }
+        // 共通の先頭部分は計算し直さない
+        let reused = reusablePrefix(tokens)
         let fresh = Array(tokens[reused...])
         cachedTokens = Array(tokens[0..<reused])
         progress?(reused, tokens.count)
@@ -207,12 +258,24 @@ final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
         let gate = self.gate
         let total = tokens.count
         let batch = max(1, min(chunkSize, GGUFModel.maxBatch))
+        let wanted = min(maxContext, total + Self.generationReserve)
         let flag = CancellationFlag()
         // 途中で止まっても、読めたところまでは KV キャッシュに残っているので、それを覚えておく
         defer { cachedTokens = Array(tokens[0..<min(model.length, tokens.count)]) }
         let logits = try await withTaskCancellationHandler {
             try await InferenceQueue.run { () throws -> [Float] in
                 model.truncate(to: reused)
+                // 読む前に、KV キャッシュを読み終わり（と生成のぶん）まで 1 回で用意する。足りなければ読むぶんだけ。
+                // 用意で減ったメモリは 1 度きりなので、見張りの「減り方」の記録はそのあとから始める
+                if model.reservedTokens < wanted {
+                    if (try? model.reserve(wanted)) == nil {
+                        // 用意できない = メモリが足りない: 古いやり取りを省いて読み直してもらう（エラーで終わらせない）
+                        do { try model.reserve(total) } catch {
+                            throw EngineError.lowMemory(available: DeviceMemory.availableBytes)
+                        }
+                    }
+                    gate?.begin()
+                }
                 return try model.evaluate(fresh, batch: batch) { done in
                     progress?(reused + done, total)
                     if flag.isCancelled { throw CancellationError() }

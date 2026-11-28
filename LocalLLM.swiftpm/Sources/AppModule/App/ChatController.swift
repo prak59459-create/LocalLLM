@@ -64,6 +64,8 @@ final class ChatController {
     @ObservationIgnored private var memoryWarningObserver: NSObjectProtocol?
 
     init() {
+        // 裏に回っている間に失敗した GPU の計算は、前に戻るのを待ってからやり直す（GGUFLanguageModel）
+        AppActivity.start()
         refreshMemory()
         memoryTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.refreshMemory() }

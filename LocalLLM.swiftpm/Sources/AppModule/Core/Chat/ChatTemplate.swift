@@ -305,22 +305,61 @@ struct PromptAssembler {
         var droppedMessageCount: Int
     }
 
+    /// 描画に要るもの（何度か描き直すので、まとめておく）
+    private struct Parts {
+        var system: String?
+        var cleaned: [ChatMessage]
+        var renderer: ChatTemplateRenderer
+        var tokenizer: TextTokenizer
+        var enableThinking: Bool?
+        var tools: [ToolDefinition]
+
+        /// 先頭の dropped 個を捨てて描画する（last があれば、最後の発言をそれに替える）
+        func render(dropping dropped: Int, last: ChatMessage? = nil) throws -> Result {
+            var messages: [ChatMessage] = []
+            if let system, !system.isEmpty { messages.append(ChatMessage(role: .system, content: system)) }
+            var kept: [ChatMessage] = Array(cleaned[min(dropped, cleaned.count)...])
+            if let last, !kept.isEmpty { kept[kept.count - 1] = last }
+            messages.append(contentsOf: kept)
+            let text: String = try PromptAssembler.renderLeniently(messages, renderer: renderer, enableThinking: enableThinking,
+                                                                   tools: tools)
+            let tokens: [Int] = tokenizer.encode(text, addSpecialTokens: false)
+            return Result(text: text, tokens: tokens, droppedMessageCount: dropped)
+        }
+    }
+
     static func assemble(systemPrompt: String?, history: [ChatMessage], renderer: ChatTemplateRenderer,
                          tokenizer: TextTokenizer, contextLength: Int, reserveTokens: Int,
                          enableThinking: Bool?, tools: [ToolDefinition] = []) throws -> Result {
-        var system = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts: Parts = prepare(systemPrompt: systemPrompt, history: history, renderer: renderer, tokenizer: tokenizer,
+                                   enableThinking: enableThinking, tools: tools)
+        let budget: Int = max(1, contextLength - max(0, reserveTokens))
+        let full: Result = try parts.render(dropping: 0)
+        if full.tokens.count <= budget || parts.cleaned.isEmpty { return full }
+        if let fitted = try dropOldMessages(parts, full: full, budget: budget) { return fitted }
+        return try shortenLastMessage(parts, budget: budget)
+    }
+
+    /// システムプロンプトとツールの説明、思考を除いてまとめたやり取りを用意する
+    private static func prepare(systemPrompt: String?, history: [ChatMessage], renderer: ChatTemplateRenderer,
+                                tokenizer: TextTokenizer, enableThinking: Bool?, tools: [ToolDefinition]) -> Parts {
+        var system: String? = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
         // テンプレートがツールに対応していなければ、説明をシステムプロンプトに書き、ツールのやり取りを文章にする
-        let nativeTools = !tools.isEmpty && renderer.supportsTools
-        var source = history
+        let nativeTools: Bool = !tools.isEmpty && renderer.supportsTools
+        var source: [ChatMessage] = history
         if !tools.isEmpty && !nativeTools {
-            let instructions = ToolPrompt.instructions(for: tools)
-            system = (system?.isEmpty ?? true) ? instructions : system! + "\n\n" + instructions
+            let instructions: String = ToolPrompt.instructions(for: tools)
+            if let current = system, !current.isEmpty {
+                system = current + "\n\n" + instructions
+            } else {
+                system = instructions
+            }
             source = ToolPrompt.flatten(history)
         }
         // 過去のアシスタントの発話から思考部分を除き、同じ役割が続くものはまとめる（ツールのやり取りはまとめない）
         var cleaned: [ChatMessage] = []
         for message in source where message.role != .system {
-            var item = message
+            var item: ChatMessage = message
             if item.role == .assistant { item.content = ThinkingSplit.split(item.content).answer }
             if let last = cleaned.last, last.role == item.role, item.role != .tool,
                last.toolCalls == nil, item.toolCalls == nil {
@@ -329,75 +368,75 @@ struct PromptAssembler {
                 cleaned.append(item)
             }
         }
-        let budget = max(1, contextLength - max(0, reserveTokens))
-        /// 先頭の dropped 個を捨てて描画する（last があれば、最後の発言をそれに替える）
-        func render(dropping dropped: Int, last: ChatMessage? = nil) throws -> (text: String, tokens: [Int]) {
-            var messages: [ChatMessage] = []
-            if let system, !system.isEmpty { messages.append(ChatMessage(role: .system, content: system)) }
-            var kept = Array(cleaned[min(dropped, cleaned.count)...])
-            if let last, !kept.isEmpty { kept[kept.count - 1] = last }
-            messages.append(contentsOf: kept)
-            let text = try renderLeniently(messages, renderer: renderer, enableThinking: enableThinking,
-                                           tools: nativeTools ? tools : [])
-            return (text, tokenizer.encode(text, addSpecialTokens: false))
-        }
-        let full = try render(dropping: 0)
-        if full.tokens.count <= budget || cleaned.isEmpty {
-            return Result(text: full.text, tokens: full.tokens, droppedMessageCount: 0)
-        }
+        return Parts(system: system, cleaned: cleaned, renderer: renderer, tokenizer: tokenizer,
+                     enableThinking: enableThinking, tools: nativeTools ? tools : [])
+    }
 
-        // 古いものから捨てる（user から始まるように、続く assistant / tool も一緒に）。
-        // 捨てる量は「入りきらない分」ちょうどではなく、budget の 1/3 ごとの切りのよい量にする。
-        // ちょうどにすると、会話が続くたびに捨てる位置が 1 つずつずれてプロンプトの先頭が毎回変わり、
-        // KV キャッシュが使えずに毎回会話全体を読み直すことになる（長い会話で毎回「読み込み」がとても長くなっていた）。
-        // 切りのよい量にしておけば、次に捨てる位置が変わるまでの何回かは、前の読み込みをそのまま使える
-        // 捨ててよい位置（user の発言の始まりか、最後の発言だけを残す位置）
-        var boundaries: [Int] = []
-        for index in 1..<max(1, cleaned.count) where cleaned[index].role == .user || index == cleaned.count - 1 {
-            boundaries.append(index)
-        }
+    /// 古いものから捨てる（user から始まるように、続く assistant / tool も一緒に）。入らなければ nil。
+    /// 捨てる量は「入りきらない分」ちょうどではなく、budget の 1/3 ごとの切りのよい量にする。
+    /// ちょうどにすると、会話が続くたびに捨てる位置が 1 つずつずれてプロンプトの先頭が毎回変わり、
+    /// KV キャッシュが使えずに毎回会話全体を読み直すことになる（長い会話で毎回「読み込み」がとても長くなっていた）。
+    /// 切りのよい量にしておけば、次に捨てる位置が変わるまでの何回かは、前の読み込みをそのまま使える
+    private static func dropOldMessages(_ parts: Parts, full: Result, budget: Int) throws -> Result? {
+        let candidates: [Int] = boundaries(parts.cleaned)
         // 発言ごとのトークン数の見積もり（テンプレートの印の分を少し足す）。先頭からの合計は、前の発言が変わらない限り同じ
         var before: [Int] = [0]
-        for message in cleaned {
-            let count: Int = tokenizer.encode(message.content, addSpecialTokens: false).count
+        for message in parts.cleaned {
+            let count: Int = parts.tokenizer.encode(message.content, addSpecialTokens: false).count
             before.append(before[before.count - 1] + count + 4)
         }
         let quantum: Int = max(64, budget / 3)
         let excess: Int = full.tokens.count - budget
         let target: Int = (excess + quantum - 1) / quantum * quantum
-        var first: Int = max(0, boundaries.count - 1)
-        for (position, boundary) in boundaries.enumerated() where before[boundary] >= target {
+        var first: Int = max(0, candidates.count - 1)
+        for (position, boundary) in candidates.enumerated() where before[boundary] >= target {
             first = position
             break
         }
-        for dropped in boundaries[first...] {
-            let attempt = try render(dropping: dropped)
-            if attempt.tokens.count <= budget {
-                return Result(text: attempt.text, tokens: attempt.tokens, droppedMessageCount: dropped)
-            }
+        for dropped in candidates[first...] {
+            let attempt: Result = try parts.render(dropping: dropped)
+            if attempt.tokens.count <= budget { return attempt }
         }
+        return nil
+    }
 
-        // 最後の発言だけでも長すぎる: 発言の中ほどを省いて縮める（プロンプトの先頭（BOS やシステムプロンプト）を切ると、
-        // テンプレートの形が崩れて答えがおかしくなるので、切らない）
-        let dropped = boundaries.last ?? 0
-        var last = cleaned[cleaned.count - 1]
-        var attempt = try render(dropping: dropped)
+    /// 捨ててよい位置（user の発言の始まりか、最後の発言だけを残す位置）
+    private static func boundaries(_ cleaned: [ChatMessage]) -> [Int] {
+        var result: [Int] = []
+        let last: Int = cleaned.count - 1
+        for index in 1..<max(1, cleaned.count) where cleaned[index].role == .user || index == last {
+            result.append(index)
+        }
+        return result
+    }
+
+    /// 最後の発言だけでも長すぎる: 発言の中ほどを省いて縮める（プロンプトの先頭（BOS やシステムプロンプト）を切ると、
+    /// テンプレートの形が崩れて答えがおかしくなるので、切らない）
+    private static func shortenLastMessage(_ parts: Parts, budget: Int) throws -> Result {
+        let dropped: Int = boundaries(parts.cleaned).last ?? 0
+        var last: ChatMessage = parts.cleaned[parts.cleaned.count - 1]
+        var attempt: Result = try parts.render(dropping: dropped)
         for _ in 0..<4 where attempt.tokens.count > budget {
-            let characters = Array(last.content)
-            let contentTokens = max(1, tokenizer.encode(last.content, addSpecialTokens: false).count)
-            let keepTokens = contentTokens - (attempt.tokens.count - budget) - 16
-            let keep = Int(Double(characters.count) * Double(max(0, keepTokens)) / Double(contentTokens))
+            let characters: [Character] = Array(last.content)
+            let contentTokens: Int = max(1, parts.tokenizer.encode(last.content, addSpecialTokens: false).count)
+            let keepTokens: Int = max(0, contentTokens - (attempt.tokens.count - budget) - 16)
+            let keep: Int = characters.count * keepTokens / contentTokens
             guard keep > 0 else { break }
-            let head: Int = keep * 2 / 5
-            let opening = String(characters[..<head])
-            let closing = String(characters[(characters.count - (keep - head))...])
-            let marker = "\n…（" + L("中略", "omitted") + "）…\n"
-            last.content = opening + marker + closing
-            attempt = try render(dropping: dropped, last: last)
+            last.content = shortened(characters, keep: keep)
+            attempt = try parts.render(dropping: dropped, last: last)
         }
         // それでも入らない（テンプレートそのものが長すぎる）ときだけ、後ろを残して切る
-        let tokens = attempt.tokens.count > budget ? Array(attempt.tokens.suffix(budget)) : attempt.tokens
-        return Result(text: attempt.text, tokens: tokens, droppedMessageCount: dropped)
+        if attempt.tokens.count > budget { attempt.tokens = Array(attempt.tokens.suffix(budget)) }
+        return attempt
+    }
+
+    /// 文章の頭（4 割）と終わり（6 割）を残して、keep 文字にする
+    private static func shortened(_ characters: [Character], keep: Int) -> String {
+        let head: Int = keep * 2 / 5
+        let opening = String(characters[..<head])
+        let closing = String(characters[(characters.count - (keep - head))...])
+        let marker: String = "\n…（" + L("中略", "omitted") + "）…\n"
+        return opening + marker + closing
     }
 
     /// テンプレートが system を拒否したら最初の user にまとめて再挑戦し、それでもだめなら組み込みの書式にする。

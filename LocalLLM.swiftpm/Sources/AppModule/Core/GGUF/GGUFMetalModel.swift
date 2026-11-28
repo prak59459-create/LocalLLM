@@ -136,6 +136,20 @@ final class GGUFMetalModel: GGUFEvaluator {
 
     private var windows: [Window] = []
     private var copiedBytes = 0
+    /// 層ごとの重みの範囲と、出力層の範囲（RAM に入りきらないとき、計算の前に先に読んでおいてもらう）。
+    /// 別のスレッドに渡すので、アドレスを数で持つ
+    private typealias Span = (address: UInt, count: Int)
+    private var layerSpans: [[Span]] = []
+    private var outputSpans: [Span] = []
+
+    private static func spans(_ regions: [GGUFPages.Region]) -> [Span] {
+        regions.map { (UInt(bitPattern: $0.start), $0.count) }
+    }
+    /// 計算のたびに、これから使う重みを先に読んでおくよう OS に頼むか（重みが RAM に入りきらないときだけ。GGUFModelFactory が決める）。
+    /// 入りきらないと、OS が捨てた分を GPU が使う直前に読み直すので、そのあいだ GPU が待つ。先に頼んでおけば、
+    /// 前の層を計算しているあいだに次の層が読まれる
+    var prefetchesWeights = false
+    private let prefetchQueue = DispatchQueue(label: "LocalLLM.prefetch", qos: .userInitiated)
     /// 正規化の重み・バイアス・行ごとの倍率をまとめたもの
     private var pool: [Float] = [0, 0, 0, 0]
     private var vectors: MTLBuffer
@@ -311,6 +325,7 @@ final class GGUFMetalModel: GGUFEvaluator {
         }
         outputNorm = norm(globals.outputNorm, bias: globals.outputNormBias, count: config.embeddingSize)
         outputWeights = try weights(globals.output, bias: nil)
+        outputSpans = Self.spans(globals.output.regions)
         if let projection = globals.perLayerProjection {
             perLayerProjection = try weights(projection, bias: nil)
             perLayerProjectionNorm = norm(globals.perLayerProjectionNorm, bias: nil, count: config.perLayerInputSize)
@@ -325,6 +340,9 @@ final class GGUFMetalModel: GGUFEvaluator {
 
     private func bindLayer(_ index: Int) throws -> Layer {
         let source = try GGUFLayerWeights.load(index, store: store, config: config)
+        var matrices: [GGUFMatrix] = [source.query, source.output, source.up, source.down]
+        matrices += [source.key, source.value, source.gate, source.inputGate, source.projection].compactMap { $0 }
+        layerSpans.append(Self.spans(matrices.flatMap(\.regions)))
         let shape = shapes[index]
         let d = config.embeddingSize, size = shape.headSize
         let qNormCount = config.qkNormIsFull || source.queryNormPerHead ? shape.querySize : size
@@ -525,6 +543,7 @@ final class GGUFMetalModel: GGUFEvaluator {
     private func forward(_ tokens: [Int], wantsLogits: Bool, all: Bool = false, profile: Commands.Profile? = nil) throws -> [Float] {
         let n = tokens.count
         let start = length
+        if prefetchesWeights { prefetchWeights(wantsLogits: wantsLogits) }
         if cacheCapacity == 0 { try allocateCache(min(maxContext, Self.initialCache)) }
         try reserveCache(start + n)
         try reserveScores(n * config.maxHeadCount * (start + n))
@@ -558,6 +577,20 @@ final class GGUFMetalModel: GGUFEvaluator {
         }
         lastHidden = Array(UnsafeBufferPointer(start: rows, count: d))
         return readLogits()
+    }
+
+    /// これから使う重み（層の順に、最後に出力層）を、先に読んでおくよう OS に頼む（待たない）。
+    /// 頼むのは別のスレッドから、層ごとに順に（GPU が使う順と同じ）
+    private func prefetchWeights(wantsLogits: Bool) {
+        let order: [[Span]] = layerSpans + [wantsLogits ? outputSpans : []]
+        prefetchQueue.async {
+            for spans in order {
+                let regions: [GGUFPages.Region] = spans.compactMap { span in
+                    UnsafeRawPointer(bitPattern: span.address).map { ($0, span.count) }
+                }
+                GGUFPages.willNeed(regions)
+            }
+        }
     }
 
     /// 1 回の計算の、部分ごとの GPU の時間（秒）を測る（速さを調べる用。部分ごとに命令列を分けるので、全体は少し遅くなる）

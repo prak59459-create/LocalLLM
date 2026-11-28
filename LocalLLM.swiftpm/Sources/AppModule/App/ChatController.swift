@@ -106,14 +106,17 @@ final class ChatController {
 
     /// 重みのファイルが、このアプリが使えるメモリに入りきらないときのお知らせ。
     /// 落ちはしない（OS が読んだ分を捨てては読み直す）が、毎回ストレージから読むのでとても遅くなる。
-    private func warnIfWeightsDoNotFit() {
+    /// lookupBytes（トークンごとに 1 行引くだけの表。Gemma 4 の層ごとの入力など）は、ほとんど読まないので数えない
+    /// （前は数えていて、Gemma 4 E2B でも「入りきらない」と出ていた）
+    private func warnIfWeightsDoNotFit(lookupBytes: Int64) {
         let usage = MappedFile.usage()
         let room = (DeviceMemory.footprintBytes ?? 0) + DeviceMemory.availableBytes
-        guard usage.mapped > 0, room > 0, Double(usage.mapped) > Double(room) * 0.85 else { return }
-        notice = L("このモデルの重み（\(ByteFormat.string(usage.mapped))）は、アプリが使えるメモリ（約 \(ByteFormat.string(room))）に入りきりません。"
-                   + "落ちはしませんが、毎回ストレージから読み直すのでとても遅くなります。もっと小さいモデルがおすすめです。",
-                   "This model's weights (\(ByteFormat.string(usage.mapped))) do not fit in the memory the app can use (about \(ByteFormat.string(room))). "
-                   + "It will not crash, but it reads from storage every token and will be very slow. A smaller model is recommended.")
+        let used = usage.mapped - max(0, lookupBytes)
+        guard used > 0, room > 0, Double(used) > Double(room) * 0.85 else { return }
+        notice = L("このモデルの毎回読む重み（\(ByteFormat.string(used))）は、アプリが使えるメモリ（約 \(ByteFormat.string(room))）に入りきりません。"
+                   + "落ちはしませんが、毎回ストレージから読み直すので遅くなります（次の層を先に読んでおくようにしています）。もっと小さいモデルがおすすめです。",
+                   "The weights this model reads every token (\(ByteFormat.string(used))) do not fit in the memory the app can use (about \(ByteFormat.string(room))). "
+                   + "It will not crash, but it reads from storage every token and will be slower (the next layers are read ahead). A smaller model is recommended.")
     }
 
     // MARK: - モデルの読み込み
@@ -142,7 +145,7 @@ final class ChatController {
                                                  prefillChunkSize: settings.prefillChunkSize)
                 if Task.isCancelled { return }
                 loadState = .ready(info)
-                warnIfWeightsDoNotFit()
+                warnIfWeightsDoNotFit(lookupBytes: model.gguf?.lookupBytes ?? 0)
             } catch is CancellationError {
                 loadState = .idle
             } catch {

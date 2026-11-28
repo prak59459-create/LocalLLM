@@ -31,6 +31,11 @@ enum GGUFModelFactory {
         if useGPU && memory.allowsGPU {
             do {
                 let model = try GGUFMetalModel(store: store, maxContext: context)
+                // 毎回読む重みが空いているメモリの 8 割を超えるなら（RAM に入りきらず、OS が捨てては読み直すことになる）、
+                // 計算のたびに、これから使う重みを先に読んでおくよう OS に頼む
+                if let availableBytes, availableBytes > 0 {
+                    model.prefetchesWeights = Int64(store.hotBytes) > availableBytes / 10 * 8
+                }
                 try verifyOnce(model, store: store, key: url.path + "|\(store.header.dataBytes)")
                 var note: String?
                 if let drafter {

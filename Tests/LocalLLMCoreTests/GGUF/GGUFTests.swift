@@ -83,6 +83,22 @@ final class GGUFModelTests: XCTestCase {
     ]
     static var allFamilies: [String] { families + moreFamilies }
 
+    // llama.cpp の正解は Float32 の KV キャッシュで計算してあるので、読み込みの入口が GPU 用を作るテスト（Mac）も、
+    // Float の KV キャッシュで比べる（GPU のふだんの半精度の KV キャッシュは GGUFMetalTests で確かめている）
+    override func setUp() {
+        super.setUp()
+        #if canImport(Metal)
+        GGUFMetalModel.halfPrecisionCache = false
+        #endif
+    }
+
+    override func tearDown() {
+        #if canImport(Metal)
+        GGUFMetalModel.halfPrecisionCache = true
+        #endif
+        super.tearDown()
+    }
+
     private func load(_ family: String, compact: Bool, chunks: Int? = nil) throws -> (GGUFModel, URL) {
         let source = GGUFFixtures.root.appendingPathComponent("tiny-\(family).gguf")
         let destination = GGUFFixtures.temporaryFile("\(family).llw")

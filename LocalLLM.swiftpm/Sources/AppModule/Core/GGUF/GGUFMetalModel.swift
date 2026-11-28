@@ -362,15 +362,19 @@ final class GGUFMetalModel: GGUFEvaluator {
         return buffer
     }
 
-    /// 1 回の命令列が長くなりすぎないように、モデルが大きいほど少なくする
+    /// 1 回の計算でまとめて読むトークン数の上限。1 回の命令列が長くなりすぎないように、モデルが大きいほど少なくする。
+    /// まとめて読むと重みを読むのは 1 回なので、多いほど速い（プロンプトの読み込みは、ほぼ重みを読む速さで決まる）。
+    /// 命令列は何層かずつに分けて GPU に渡すので、1 つの命令列はこの数のトークンの 1/4 ほど（Gemma 4 E2B の 32 トークンで 16 GFLOP 弱）。
+    /// 行列の掛け算は 8 トークンずつなので、8 の倍数にする（前は 4 の倍数で、E2B は 12 トークン = 8 + 半端の 4 だった）
     private static func batchCapacity(config: GGUFModelConfig) -> Int {
         let d = Double(config.embeddingSize)
         let perToken = config.layers.reduce(0.0) { total, shape in
             let q = Double(shape.querySize), kv = Double(shape.kvSize), ff = Double(shape.feedForwardSize)
             return total + d * (q + 2 * kv) + q * d + 3 * d * ff
         }
-        let fitting = Int(24e9 / max(perToken, 1))
-        return max(4, min(GGUFModel.maxBatch, fitting / 4 * 4))
+        let fitting = Int(64e9 / max(perToken, 1))
+        let rounded = fitting >= 8 ? fitting / 8 * 8 : fitting / 4 * 4
+        return max(4, min(GGUFModel.maxBatch, rounded))
     }
 
     // MARK: - 用意

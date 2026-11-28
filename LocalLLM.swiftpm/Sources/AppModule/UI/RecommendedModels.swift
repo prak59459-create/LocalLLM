@@ -140,6 +140,13 @@ enum RecommendedModels {
             category: .gguf, isGGUF: true
         ),
         RecommendedModel(
+            repoID: "unsloth/gemma-4-E2B-it-GGUF", title: "Gemma 4 E2B Q4_K_M (GGUF)",
+            approximateBytes: 3_106_738_272, japanese: .good, isExperimental: true,
+            note: L("上の Gemma 4 E2B の、精度を重視した量子化（Q4_K_M。もっと精度がほしければ Q5_K_M）。少し大きいぶん答えが正確。先読み（MTP）用のモデルも入っています。",
+                    "Gemma 4 E2B with a more accurate quantization (Q4_K_M, or Q5_K_M for even more). A little larger, with more accurate answers. Includes the draft model (MTP)."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
             repoID: "ggml-org/gemma-4-E4B-it-GGUF", title: "Gemma 4 E4B (GGUF)",
             approximateBytes: 4_590_807_392, japanese: .good, isExperimental: true,
             note: L("Gemma 4 の大きいほう。E2B より賢く、考える・ツールにも対応（Q4_0 を選んでください。変換後は約 4.8GB、毎回読むのは約 3.2GB）。メモリ 8GB 以上の iPad 向け。",

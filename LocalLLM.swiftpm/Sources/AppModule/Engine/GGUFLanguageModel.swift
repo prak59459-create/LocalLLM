@@ -173,8 +173,9 @@ final class GGUFLanguageModel: LanguageModelRunner, SpeculativeRunner {
         // 再利用できた先頭は、最初の 1 回だけ数える（GPU のやり直しでは、読めたところから続けるので）
         let reused = reusablePrefix(tokens)
         let scores = try await withGPURetries { failures in
-            // 失敗するたびに、1 回に GPU に渡す量を半分にする（長い計算を GPU に止められたときのため）
-            try await self.read(tokens, chunkSize: max(1, chunkSize >> failures), progress: progress).scores
+            // 失敗したら、1 回に GPU に渡す量を 16・8・4 トークンと小さくする（長い計算を GPU に止められたときのため）
+            let size = failures == 0 ? chunkSize : max(1, 16 >> (failures - 1))
+            return try await self.read(tokens, chunkSize: size, progress: progress).scores
         } cpu: {
             try await self.read(tokens, chunkSize: chunkSize, progress: progress)
         }

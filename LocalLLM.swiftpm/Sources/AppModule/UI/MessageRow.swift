@@ -215,6 +215,7 @@ struct ToolResultView: View {
         case "web_search": return "globe"
         case "fetch_page": return "doc.richtext"
         case "current_time": return "clock"
+        case "calculate": return "function"
         case "read_file", "list_files", "search_files": return "doc.text.magnifyingglass"
         case "write_file", "edit_file", "create_file": return "square.and.pencil"
         case "delete_file", "move_file": return "folder.badge.gearshape"

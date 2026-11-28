@@ -51,6 +51,15 @@ enum ThinkingMode: String, CaseIterable, Codable, Identifiable, Sendable {
         }
     }
 
+    /// 実際に考えるか（modelDefault は、モデルの既定の向き。切り替えられないモデルは nil）
+    func isOn(modelDefault: Bool?) -> Bool {
+        switch self {
+        case .on: return modelDefault != nil
+        case .off: return false
+        case .modelDefault: return modelDefault == true
+        }
+    }
+
     var label: String {
         switch self {
         case .modelDefault: return L("モデルの既定", "Model default")
@@ -120,7 +129,7 @@ final class AppSettings {
 
     init() {
         let defaults = UserDefaults.standard
-        generation = Self.loadCodable(GenerationParameters.self, forKey: Keys.generation, from: defaults) ?? .default
+        generation = Self.migrated(Self.loadCodable(GenerationParameters.self, forKey: Keys.generation, from: defaults), defaults: defaults)
         systemPrompt = defaults.string(forKey: Keys.systemPrompt) ?? Self.defaultSystemPrompt
         thinkingMode = defaults.string(forKey: Keys.thinkingMode).flatMap(ThinkingMode.init(rawValue:)) ?? .modelDefault
         // 既定は CPU + GPU。可変長入力の LLM は Neural Engine で動かないことが多く、
@@ -142,6 +151,20 @@ final class AppSettings {
     /// 生成パラメータを既定値に戻す。
     func resetGeneration() {
         generation = .default
+    }
+
+    /// 前の版の既定値のまま保存されていた生成パラメータを、今の既定値にする（1 回だけ）。
+    /// 前の既定（繰り返しペナルティ 1.1・top-p 0.9・min-p 0）は、日本語やツールの呼び出しを崩していた
+    private static func migrated(_ stored: GenerationParameters?, defaults: UserDefaults) -> GenerationParameters {
+        let versionKey = "generationDefaultsVersion"
+        defer { defaults.set(2, forKey: versionKey) }
+        guard var parameters = stored else { return .default }
+        guard defaults.integer(forKey: versionKey) < 2 else { return parameters }
+        if abs(parameters.repetitionPenalty - 1.1) < 0.001 { parameters.repetitionPenalty = 1.0 }
+        if abs(parameters.topP - 0.9) < 0.001 { parameters.topP = 0.95 }
+        if parameters.minP == 0 { parameters.minP = 0.05 }
+        if let data = try? JSONEncoder().encode(parameters) { defaults.set(data, forKey: Keys.generation) }
+        return parameters
     }
 
     /// HF API クライアント（トークンがあれば付ける）

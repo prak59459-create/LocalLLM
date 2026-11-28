@@ -274,18 +274,19 @@ extension ComposerView where Accessory == EmptyView {
     }
 }
 
-/// 入力欄の左の、Web 検索とツールの切り替え。
+/// 入力欄の左の、考える・Web 検索・ツールの切り替え。
 struct ComposerOptions: View {
-    @Environment(AppSettings.self) private var settings
-    @Environment(ConnectorStore.self) private var connectors
+    @Environment(ChatController.self) private var chat
     @Binding var searchWeb: Bool
     @Binding var draft: String
     var onSend: () -> Void
 
     var body: some View {
-        @Bindable var settings = settings
         HStack(spacing: 4) {
             VoiceButton(text: $draft, onSend: onSend)
+            if let thinkingDefault = chat.loadedInfo?.thinkingDefault {
+                ThinkingToggle(modelDefault: thinkingDefault)
+            }
             Button {
                 searchWeb.toggle()
             } label: {
@@ -297,23 +298,83 @@ struct ComposerOptions: View {
             .buttonStyle(.plain)
             .accessibilityLabel(searchWeb ? L("Web 検索してから答える: オン", "Search the web first: on")
                                           : L("Web 検索してから答える: オフ", "Search the web first: off"))
-            Menu {
-                Toggle(L("モデルにツールを使わせる", "Let the model use tools"), isOn: $settings.toolsEnabled)
-                if settings.toolsEnabled {
-                    Section(L("使えるツール", "Available tools")) {
-                        ForEach(connectors.availableTools, id: \.name) { tool in
-                            Text(tool.name)
-                        }
+            ToolsMenu()
+        }
+    }
+}
+
+/// 入力欄の左の、ツールのメニュー（全体のオン・オフと、組み込みのツールを 1 つずつ）。
+/// 使わないツールを切ると、小さなモデルがツールの説明に迷いにくい
+private struct ToolsMenu: View {
+    @Environment(AppSettings.self) private var settings
+    @Environment(ConnectorStore.self) private var connectors
+
+    var body: some View {
+        @Bindable var settings = settings
+        Menu {
+            Toggle(L("モデルにツールを使わせる", "Let the model use tools"), isOn: $settings.toolsEnabled)
+            if settings.toolsEnabled {
+                Section(L("組み込みのツール", "Built-in tools")) {
+                    ForEach(ConnectorStore.BuiltinTool.allCases) { tool in
+                        BuiltinToolToggle(tool: tool)
                     }
                 }
-            } label: {
-                Image(systemName: settings.toolsEnabled ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver")
-                    .font(.system(size: 18))
-                    .foregroundStyle(settings.toolsEnabled ? Color.accentColor : Color.secondary)
-                    .frame(width: 34, height: 40)
+                externalTools
             }
-            .accessibilityLabel(L("ツール", "Tools"))
+        } label: {
+            Image(systemName: settings.toolsEnabled ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver")
+                .font(.system(size: 18))
+                .foregroundStyle(settings.toolsEnabled ? Color.accentColor : Color.secondary)
+                .frame(width: 34, height: 40)
         }
+        .accessibilityLabel(L("ツール", "Tools"))
+    }
+
+    /// MCP サーバーのツール（名前だけ。オン・オフはコネクタの画面で）
+    @ViewBuilder
+    private var externalTools: some View {
+        let external: [ToolDefinition] = connectors.availableTools.filter { ConnectorStore.BuiltinTool(rawValue: $0.name) == nil }
+        if !external.isEmpty {
+            Section(L("MCP のツール", "MCP tools")) {
+                ForEach(external, id: \.name) { tool in
+                    Text(tool.name)
+                }
+            }
+        }
+    }
+}
+
+private struct BuiltinToolToggle: View {
+    @Environment(ConnectorStore.self) private var connectors
+    let tool: ConnectorStore.BuiltinTool
+
+    var body: some View {
+        let isOn = Binding<Bool>(get: { connectors.isEnabled(tool) }, set: { connectors.setEnabled(tool, $0) })
+        Toggle(isOn: isOn) {
+            Label(tool.label, systemImage: tool.symbolName)
+        }
+    }
+}
+
+/// 「考えてから答える」の切り替え（思考モードを切り替えられるモデル: Gemma 4・Qwen3 など）。
+/// 設定の「思考モード」と同じもの。オンにすると、考える分も書けるように長めに生成する
+private struct ThinkingToggle: View {
+    @Environment(AppSettings.self) private var settings
+    let modelDefault: Bool
+
+    var body: some View {
+        let isOn = settings.thinkingMode.isOn(modelDefault: modelDefault)
+        Button {
+            settings.thinkingMode = isOn ? .off : .on
+        } label: {
+            Image(systemName: "brain.head.profile")
+                .font(.system(size: 19))
+                .foregroundStyle(isOn ? Color.accentColor : Color.secondary)
+                .frame(width: 34, height: 40)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isOn ? L("考えてから答える: オン", "Think before answering: on")
+                                 : L("考えてから答える: オフ", "Think before answering: off"))
     }
 }
 

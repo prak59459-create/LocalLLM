@@ -184,6 +184,18 @@ struct ChatTemplateRenderer {
         return template.contains("tools") && (template.contains("tool_calls") || template.contains("tool_call"))
     }
 
+    /// 思考モード（テンプレートの enable_thinking）を切り替えられるか、と既定の向き。
+    /// nil なら切り替えられない（オン・オフで同じプロンプトになる）。true なら既定で考える（Qwen3）、false なら既定は考えない（Gemma 4）
+    var thinkingDefault: Bool? {
+        guard compiled != nil else { return nil }
+        let probe = [ChatMessage(role: .user, content: "hi")]
+        func prompt(_ value: Bool?) -> String? {
+            try? self.render(messages: probe, addGenerationPrompt: true, enableThinking: value)
+        }
+        guard let on = prompt(true), let off = prompt(false), on != off else { return nil }
+        return prompt(nil) == on
+    }
+
     /// テンプレートから推定した「ターン終了」トークン
     var endOfTurnTokens: [String] {
         var tokens: [String] = []
@@ -339,14 +351,25 @@ struct PromptAssembler {
         // ちょうどにすると、会話が続くたびに捨てる位置が 1 つずつずれてプロンプトの先頭が毎回変わり、
         // KV キャッシュが使えずに毎回会話全体を読み直すことになる（長い会話で毎回「読み込み」がとても長くなっていた）。
         // 切りのよい量にしておけば、次に捨てる位置が変わるまでの何回かは、前の読み込みをそのまま使える
-        let boundaries = (1..<cleaned.count).filter { cleaned[$0].role == .user || $0 == cleaned.count - 1 }
+        // 捨ててよい位置（user の発言の始まりか、最後の発言だけを残す位置）
+        var boundaries: [Int] = []
+        for index in 1..<max(1, cleaned.count) where cleaned[index].role == .user || index == cleaned.count - 1 {
+            boundaries.append(index)
+        }
         // 発言ごとのトークン数の見積もり（テンプレートの印の分を少し足す）。先頭からの合計は、前の発言が変わらない限り同じ
-        var before = [0]
-        for message in cleaned { before.append(before[before.count - 1] + tokenizer.encode(message.content, addSpecialTokens: false).count + 4) }
-        let quantum = max(64, budget / 3)
-        let excess = full.tokens.count - budget
-        let target = (excess + quantum - 1) / quantum * quantum
-        let first = boundaries.firstIndex { before[$0] >= target } ?? max(0, boundaries.count - 1)
+        var before: [Int] = [0]
+        for message in cleaned {
+            let count: Int = tokenizer.encode(message.content, addSpecialTokens: false).count
+            before.append(before[before.count - 1] + count + 4)
+        }
+        let quantum: Int = max(64, budget / 3)
+        let excess: Int = full.tokens.count - budget
+        let target: Int = (excess + quantum - 1) / quantum * quantum
+        var first: Int = max(0, boundaries.count - 1)
+        for (position, boundary) in boundaries.enumerated() where before[boundary] >= target {
+            first = position
+            break
+        }
         for dropped in boundaries[first...] {
             let attempt = try render(dropping: dropped)
             if attempt.tokens.count <= budget {
@@ -365,9 +388,11 @@ struct PromptAssembler {
             let keepTokens = contentTokens - (attempt.tokens.count - budget) - 16
             let keep = Int(Double(characters.count) * Double(max(0, keepTokens)) / Double(contentTokens))
             guard keep > 0 else { break }
-            let head = keep * 2 / 5
-            last.content = String(characters[..<head]) + "\n…（" + L("中略", "omitted") + "）…\n"
-                + String(characters[(characters.count - (keep - head))...])
+            let head: Int = keep * 2 / 5
+            let opening = String(characters[..<head])
+            let closing = String(characters[(characters.count - (keep - head))...])
+            let marker = "\n…（" + L("中略", "omitted") + "）…\n"
+            last.content = opening + marker + closing
             attempt = try render(dropping: dropped, last: last)
         }
         // それでも入らない（テンプレートそのものが長すぎる）ときだけ、後ろを残して切る

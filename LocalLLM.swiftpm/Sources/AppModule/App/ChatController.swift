@@ -276,6 +276,9 @@ final class ChatController {
         UIApplication.shared.isIdleTimerDisabled = false
     }
 
+    /// 考えてから答えるときの、生成するトークン数の下限（考える分と答えの分）
+    static let thinkingTokens = 4096
+
     private func generateReply(in conversation: Conversation, context: ModelContext, settings: AppSettings,
                                assistant: Assistant?, connectors: ConnectorStore?) {
         guard let info = loadedInfo else {
@@ -296,6 +299,10 @@ final class ChatController {
         if let assistant {
             if assistant.useCustomGeneration { parameters = assistant.generation }
             if assistant.thinkingMode != .modelDefault { thinking = assistant.thinkingMode }
+        }
+        // 考えるときは、考える分も書けるように長めにする（短いと、考えている途中で止まって答えまで届かない）
+        if thinking.isOn(modelDefault: info.thinkingDefault) {
+            parameters.maxNewTokens = max(parameters.maxNewTokens, Self.thinkingTokens)
         }
         let tools = settings.toolsEnabled ? (connectors?.availableTools ?? []) : []
         let configuration = AgentLoop.Configuration(systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt,

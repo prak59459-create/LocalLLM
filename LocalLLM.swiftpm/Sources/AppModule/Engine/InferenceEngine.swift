@@ -35,6 +35,8 @@ struct LoadedModelInfo: Sendable, Hashable {
     var usesJinjaTemplate: Bool
     var vocabSize: Int
     var loadSeconds: Double
+    /// 思考モードを切り替えられるか（nil なら切り替えられない）と、既定で考えるか（Qwen3 は true、Gemma 4 は false）
+    var thinkingDefault: Bool? = nil
 }
 
 /// モデルの読み込みと文章生成をまとめて受け持つ actor。
@@ -110,7 +112,8 @@ actor InferenceEngine {
             computeDescription: model.computeDescription,
             usesJinjaTemplate: renderer.usesJinja,
             vocabSize: tokenizer.vocabSize,
-            loadSeconds: Date().timeIntervalSince(start)
+            loadSeconds: Date().timeIntervalSince(start),
+            thinkingDefault: renderer.thinkingDefault
         )
         loaded = Loaded(info: info, model: model, tokenizer: tokenizer, renderer: renderer,
                         stopTokenIDs: stopIDs, stopStrings: stopStrings.filter { !$0.isEmpty })

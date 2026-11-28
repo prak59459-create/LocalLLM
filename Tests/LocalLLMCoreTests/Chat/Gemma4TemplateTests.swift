@@ -123,6 +123,23 @@ final class Gemma4TemplateTests: XCTestCase {
         XCTAssertTrue(output.hasSuffix("<|turn>model\n" + generated + "<|tool_response>"), output)
     }
 
+    /// 思考モードは切り替えられ、既定は考えない（オンにするとシステムのターンの先頭に <|think|> が入る）
+    func testThinkingCanBeSwitchedAndIsOffByDefault() throws {
+        let renderer = ChatTemplateRenderer(template: try Self.template(), bosToken: "<bos>", eosToken: "<turn|>")
+        XCTAssertEqual(renderer.thinkingDefault, false)
+        let messages = [ChatMessage(role: .system, content: "S"), ChatMessage(role: .user, content: "Q")]
+        let on = try renderer.render(messages: messages, addGenerationPrompt: true, enableThinking: true)
+        XCTAssertTrue(on.hasPrefix("<bos><|turn>system\n<|think|>\nS<turn|>\n"), on)
+        // 既定の向きに合わせる: Qwen3 のようなテンプレートは既定で考える
+        let qwen = ChatTemplateRenderer(template: "{% for m in messages %}{{ m.content }}{% endfor %}"
+                                            + "{% if enable_thinking is defined and enable_thinking is false %}<think></think>{% endif %}",
+                                        bosToken: nil, eosToken: nil)
+        XCTAssertEqual(qwen.thinkingDefault, true)
+        // enable_thinking を使わないテンプレートは切り替えられない
+        let plain = ChatTemplateRenderer(template: "{% for m in messages %}{{ m.content }}{% endfor %}", bosToken: nil, eosToken: nil)
+        XCTAssertNil(plain.thinkingDefault)
+    }
+
     /// 思考（<|channel>thought … <channel|>）を答えと分ける
     func testSplitsGemma4Thinking() {
         var split = ThinkingSplit.split("<|channel>thought\n2 と 2 を足す<channel|>4 です。")

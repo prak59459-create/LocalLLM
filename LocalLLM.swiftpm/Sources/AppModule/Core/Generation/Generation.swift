@@ -10,11 +10,13 @@ struct GenerationParameters: Codable, Hashable, Sendable {
     /// 0 なら無効
     var topK: Int = 40
     /// 1.0 なら無効
-    var topP: Double = 0.9
-    /// 0 なら無効
-    var minP: Double = 0.0
-    /// 1.0 なら無効
-    var repetitionPenalty: Double = 1.1
+    var topP: Double = 0.95
+    /// 0 なら無効。一番高い確率の 5% 未満の候補を除く（llama.cpp の既定と同じ。ありえない言葉を選びにくくする）
+    var minP: Double = 0.05
+    /// 1.0 なら無効（既定は無効。llama.cpp の既定と同じ）。
+    /// 掛けると、直近に出た言葉の確率を大きく下げる（logits が 25 なら 1.1 で割って約 1/10）ので、
+    /// 日本語の「の」「は」「、」や、コード・ツールの呼び出しの記号のように何度も使う言葉まで選ばれにくくなり、文章が崩れる
+    var repetitionPenalty: Double = 1.0
     /// 繰り返しペナルティを掛ける直近のトークン数
     var repetitionWindow: Int = 64
     var maxNewTokens: Int = 1024

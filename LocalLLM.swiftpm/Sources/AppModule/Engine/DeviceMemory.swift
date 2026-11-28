@@ -74,6 +74,9 @@ final class MemoryGate {
     var bytesPerLogit = 2
     /// iOS からメモリ不足の警告を受けた（しばらくは控えめに計算する）
     private(set) var warnedAt: Date?
+    /// 計算に使うメモリを先にまとめて用意するモデル（GGUF）か。そうなら、警告のあとでも
+    /// 「少なめ」なだけでは止めない（計算の途中で増えないので、本当に危ないところまで続けられる）
+    var allocatesUpFront = false
 
     /// 1 回ごとの減り方（次の 1 回で尽きないかの見積もり）
     private var trend = MemoryTrend()
@@ -93,7 +96,7 @@ final class MemoryGate {
     func check() throws {
         guard let budget = DeviceMemory.budget else { return }
         trend.record(available: budget.available)
-        if budget.isCritical || (recentlyWarned && budget.isLow) || !trend.isSafe(budget) {
+        if budget.isCritical || (recentlyWarned && budget.isLow && !allocatesUpFront) || !trend.isSafe(budget) {
             throw EngineError.lowMemory(available: budget.available)
         }
     }

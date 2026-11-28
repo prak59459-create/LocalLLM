@@ -101,7 +101,22 @@ final class ModelLibrary {
                 downloads[model.id] = DownloadState(phase: .paused, progress: nil)
             }
         }
-        models = loaded.sorted { $0.createdAt > $1.createdAt }
+        models = migratedGGUFContexts(loaded).sorted { $0.createdAt > $1.createdAt }
+    }
+
+    /// 前の版の既定（4096）のままの GGUF のコンテキスト長を、今の既定にする（1 回だけ）。
+    /// KV キャッシュを半精度にしたので、同じメモリで倍の長さを覚えられる（長い会話で古い発言を早く省かずに済む）
+    private func migratedGGUFContexts(_ models: [InstalledModel]) -> [InstalledModel] {
+        let key = "gguf.contextDefaultsVersion"
+        guard UserDefaults.standard.integer(forKey: key) < 2 else { return models }
+        UserDefaults.standard.set(2, forKey: key)
+        return models.map { model in
+            guard let summary = model.gguf, model.maxContext == 4096, summary.defaultContext > 4096 else { return model }
+            var updated = model
+            updated.maxContext = summary.defaultContext
+            try? save(updated)
+            return updated
+        }
     }
 
     func directory(for model: InstalledModel) -> URL {

@@ -312,9 +312,17 @@ protocol GGUFEvaluator: AnyObject {
     /// tokens を今の系列の後ろに足して計算し、最後のトークンの次の logits を返す
     @discardableResult
     func evaluate(_ tokens: [Int], batch: Int, progress: ((Int) throws -> Void)?) throws -> [Float]
+    /// tokens トークンまで読む・書くぶんの KV キャッシュなどを、先にまとめて用意する（途中で大きくしないように）
+    func reserve(_ tokens: Int) throws
+    /// KV キャッシュを用意してあるトークン数（これを超えると、計算の途中で大きくする）
+    var reservedTokens: Int { get }
 }
 
 extension GGUFEvaluator {
+    /// CPU の計算は、KV キャッシュを最初から最大の長さで用意している（使うまで実メモリにはならない）
+    func reserve(_ tokens: Int) throws {}
+    var reservedTokens: Int { maxContext }
+
     @discardableResult
     func evaluate(_ tokens: [Int], batch: Int = GGUFModel.maxBatch) throws -> [Float] {
         try evaluate(tokens, batch: batch, progress: nil)

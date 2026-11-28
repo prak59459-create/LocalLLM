@@ -155,6 +155,16 @@ struct GGUFWeightStore {
 
     func has(_ name: String) -> Bool { index[name] != nil }
 
+    /// 計算のたびに読む重みのバイト数（トークンごとに 1 行引くだけの表（raw。Gemma 4 の層ごとの入力など）は、ほとんど読まないので除く）
+    var hotBytes: Int {
+        var lookup = 0
+        for entry in header.entries where entry.storage == .raw {
+            guard let code = entry.rawType, let type = GGUFTensorType(rawValue: code) else { continue }
+            lookup += entry.rows * (entry.columns / type.block.elements * type.block.bytes)
+        }
+        return max(0, header.dataBytes - lookup)
+    }
+
     func matrix(_ name: String) throws -> GGUFMatrix {
         guard let position = index[name] else { throw GGUFError.missingTensor(name) }
         let entry = header.entries[position]

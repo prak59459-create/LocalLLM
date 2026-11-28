@@ -32,7 +32,9 @@ final class ConnectorStore {
     enum BuiltinTool: String, CaseIterable, Identifiable {
         case webSearch = "web_search"
         case fetchPage = "fetch_page"
+        case calculate = "calculate"
         case currentTime = "current_time"
+        case javaScript = "run_javascript"
 
         var id: String { rawValue }
 
@@ -40,9 +42,24 @@ final class ConnectorStore {
             switch self {
             case .webSearch: return L("Web 検索", "Web search")
             case .fetchPage: return L("Web ページを読む", "Read web pages")
+            case .calculate: return L("計算", "Calculator")
             case .currentTime: return L("現在の日時", "Current date and time")
+            case .javaScript: return L("JavaScript を実行", "Run JavaScript")
             }
         }
+
+        var symbolName: String {
+            switch self {
+            case .webSearch: return "globe"
+            case .fetchPage: return "doc.richtext"
+            case .calculate: return "function"
+            case .currentTime: return "clock"
+            case .javaScript: return "play.rectangle"
+            }
+        }
+
+        /// 最初から使えるもの（JavaScript は、ツールの説明が長くなって小さなモデルが迷いやすいので、使うときだけオンにする）
+        static let enabledByDefault: [BuiltinTool] = [.webSearch, .fetchPage, .calculate, .currentTime]
 
         var definition: ToolDefinition {
             switch self {
@@ -55,10 +72,20 @@ final class ConnectorStore {
                 return ToolDefinition(name: rawValue,
                                       description: L("URL のページを取得して本文のテキストを返す。", "Fetch a web page and return its text."),
                                       arguments: [("url", L("ページの URL", "page URL"), true)])
+            case .calculate:
+                return ToolDefinition(name: rawValue,
+                                      description: L("数式を正確に計算して結果を返す。計算が必要なときは、暗算せずにこれを使う（例: (12.5 + 3) * 4、sqrt(2)、2^10、10!）。",
+                                                     "Calculate a math expression exactly. Use it instead of doing arithmetic in your head (e.g. (12.5 + 3) * 4, sqrt(2), 2^10, 10!)."),
+                                      arguments: [("expression", L("計算する式", "the expression"), true)])
             case .currentTime:
                 return ToolDefinition(name: rawValue,
                                       description: L("今の日付と時刻を返す。", "Return the current date and time."),
                                       arguments: [])
+            case .javaScript:
+                return ToolDefinition(name: rawValue,
+                                      description: L("JavaScript を実行して、console.log の出力と最後の式の値を返す。日付の計算や、くり返しの多い計算などに使う。",
+                                                     "Run JavaScript and return the console.log output and the value of the last expression. Use it for date math or repetitive calculations."),
+                                      arguments: [("code", L("実行するコード", "the code to run"), true)])
             }
         }
     }
@@ -89,8 +116,13 @@ final class ConnectorStore {
 
     init() {
         let defaults = UserDefaults.standard
-        enabledBuiltins = Set(defaults.stringArray(forKey: Keys.enabledBuiltins)
-                              ?? [BuiltinTool.webSearch.rawValue, BuiltinTool.fetchPage.rawValue, BuiltinTool.currentTime.rawValue])
+        var builtins = Set(defaults.stringArray(forKey: Keys.enabledBuiltins) ?? BuiltinTool.enabledByDefault.map(\.rawValue))
+        // あとから足した「計算」は、前に組み込みツールの設定を変えていても 1 回だけオンにする
+        if !defaults.bool(forKey: Keys.calculatorAdded) {
+            builtins.insert(BuiltinTool.calculate.rawValue)
+            defaults.set(true, forKey: Keys.calculatorAdded)
+        }
+        enabledBuiltins = builtins
         searchProvider = defaults.string(forKey: Keys.searchProvider).flatMap(WebSearchProvider.init(rawValue:)) ?? .duckDuckGo
         braveAPIKey = Keychain.get(Keys.braveKey) ?? ""
         searxngURL = defaults.string(forKey: Keys.searxngURL) ?? ""
@@ -220,10 +252,21 @@ final class ConnectorStore {
             } catch {
                 outcome = ToolOutcome(text: error.localizedDescription, isError: true)
             }
+        case .calculate:
+            let expression = call.argument("expression") ?? call.argument("expr") ?? call.argument("input") ?? ""
+            do {
+                outcome = ToolOutcome(text: "\(expression) = \(Calculator.format(try Calculator.evaluate(expression)))", isError: false)
+            } catch {
+                outcome = ToolOutcome(text: error.localizedDescription, isError: true)
+            }
         case .currentTime:
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyy-MM-dd (EEE) HH:mm zzz"
             outcome = ToolOutcome(text: formatter.string(from: Date()), isError: false)
+        case .javaScript:
+            let code = call.argument("code") ?? call.argument("input") ?? ""
+            let result = await JavaScriptRunner().run(code)
+            outcome = ToolOutcome(text: result.output.isEmpty ? "(no output)" : result.output, isError: result.isError)
         case nil:
             outcome = await executeMCP(call)
         }
@@ -257,5 +300,6 @@ final class ConnectorStore {
         static let searxngURL = "connectors.searxngURL"
         static let resultCount = "connectors.resultCount"
         static let servers = "connectors.mcpServers"
+        static let calculatorAdded = "connectors.calculatorAdded"
     }
 }

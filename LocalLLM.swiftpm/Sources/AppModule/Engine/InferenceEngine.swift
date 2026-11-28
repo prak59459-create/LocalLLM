@@ -35,6 +35,8 @@ struct LoadedModelInfo: Sendable, Hashable {
     var usesJinjaTemplate: Bool
     var vocabSize: Int
     var loadSeconds: Double
+    /// 思考モードを切り替えられるか（nil なら切り替えられない）と、既定で考えるか（Qwen3 は true、Gemma 4 は false）
+    var thinkingDefault: Bool? = nil
 }
 
 /// モデルの読み込みと文章生成をまとめて受け持つ actor。
@@ -96,6 +98,7 @@ actor InferenceEngine {
         guard generation == loadGeneration else { throw CancellationError() }
         gate.vocabSize = tokenizer.vocabSize
         gate.bytesPerLogit = model.logitsElementBytes
+        gate.allocatesUpFront = model is GGUFLanguageModel
         model.gate = gate
         reloadSource = (files, computeUnits)
         needsReload = false
@@ -109,7 +112,8 @@ actor InferenceEngine {
             computeDescription: model.computeDescription,
             usesJinjaTemplate: renderer.usesJinja,
             vocabSize: tokenizer.vocabSize,
-            loadSeconds: Date().timeIntervalSince(start)
+            loadSeconds: Date().timeIntervalSince(start),
+            thinkingDefault: renderer.thinkingDefault
         )
         loaded = Loaded(info: info, model: model, tokenizer: tokenizer, renderer: renderer,
                         stopTokenIDs: stopIDs, stopStrings: stopStrings.filter { !$0.isEmpty })
@@ -128,10 +132,11 @@ actor InferenceEngine {
         }
     }
 
-    /// iOS からメモリ不足の警告が来た。しばらく控えめに計算し、生成していなければ KV キャッシュを捨てて空ける。
+    /// iOS からメモリ不足の警告が来た。しばらく控えめに計算し、生成していなくて本当に残りが少なければ KV キャッシュを捨てて空ける。
+    /// （警告は残りに余裕があっても来ることがある。そのたびに捨てると、次の発言で会話全体を最初から読み直すことになる）
     func noteMemoryWarning() {
         gate.noteWarning()
-        if currentTask == nil { loaded?.model.resetCache() }
+        if currentTask == nil, DeviceMemory.budget?.isLow ?? false { loaded?.model.resetCache() }
     }
 
     /// Core ML の中に溜まったメモリを空けるため、モデルだけを読み直す（トークナイザなどはそのまま）

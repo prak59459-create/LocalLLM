@@ -140,6 +140,20 @@ enum RecommendedModels {
             category: .gguf, isGGUF: true
         ),
         RecommendedModel(
+            repoID: "unsloth/gemma-4-E2B-it-GGUF", title: "Gemma 4 E2B Q4_K_M (GGUF)",
+            approximateBytes: 3_106_738_272, japanese: .good, isExperimental: true,
+            note: L("上の Gemma 4 E2B の、精度を重視した量子化（Q4_K_M。もっと精度がほしければ Q5_K_M）。少し大きいぶん答えが正確。先読み（MTP）用のモデルも入っています。",
+                    "Gemma 4 E2B with a more accurate quantization (Q4_K_M, or Q5_K_M for even more). A little larger, with more accurate answers. Includes the draft model (MTP)."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
+            repoID: "ggml-org/gemma-4-E4B-it-GGUF", title: "Gemma 4 E4B (GGUF)",
+            approximateBytes: 4_590_807_392, japanese: .good, isExperimental: true,
+            note: L("Gemma 4 の大きいほう。E2B より賢く、考える・ツールにも対応（Q4_0 を選んでください。変換後は約 4.8GB、毎回読むのは約 3.2GB）。メモリ 8GB 以上の iPad 向け。",
+                    "The larger Gemma 4. Smarter than E2B, with thinking and tools (pick Q4_0; about 4.8 GB after conversion, about 3.2 GB read per token). For iPads with 8 GB of memory or more."),
+            category: .gguf, isGGUF: true
+        ),
+        RecommendedModel(
             repoID: "bartowski/SmolLM2-135M-Instruct-GGUF", title: "SmolLM2 135M (GGUF)",
             approximateBytes: 105_000_000, japanese: .none, isExperimental: false,
             note: L("一番小さい GGUF。動作確認に。", "The smallest GGUF, good for testing."),

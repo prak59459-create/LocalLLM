@@ -104,6 +104,27 @@ final class GGUFMetalModel: GGUFEvaluator {
         var outputScale: Float
         /// 短い畳み込みの重み（LFM2。vectors の中の位置）
         var convolutionKernel: Int?
+        /// Gated DeltaNet の層（Qwen3.5）の重み（query は q・k・v をまとめた射影、output は出力の射影）
+        var delta: DeltaWeights?
+    }
+
+    /// Gated DeltaNet の層の、注意の代わりの部分の重み（vectors の中の位置は Float の個数）
+    private struct DeltaWeights {
+        /// z（出力の正規化のあとに silu(z) を掛ける）・β・減衰の射影
+        var outputGate: Weights
+        var beta: Weights
+        var alpha: Weights
+        var timeStepBias: Int
+        var decay: Int
+        /// 出力のヘッドごとの RMSNorm の重み（どのヘッドも同じ）
+        var norm: Norm
+        /// 短い畳み込みの重み [チャンネル][長さ]
+        var kernel: Int
+    }
+
+    /// Gated DeltaNet の計算の作業用（1 回のまとまりのトークン数ぶん）
+    private struct DeltaWork {
+        let projected: MTLBuffer, mixed: MTLBuffer, z: MTLBuffer, beta: MTLBuffer, alpha: MTLBuffer, core: MTLBuffer
     }
 
     /// GPU に渡したメモリの範囲（同じ範囲を二重に渡さないため）
@@ -115,7 +136,22 @@ final class GGUFMetalModel: GGUFEvaluator {
 
     let config: GGUFModelConfig
     let maxContext: Int
-    private(set) var length = 0
+    /// KV キャッシュ（と DeltaNet の状態）に入っているトークン数
+    private(set) var computed = 0
+    /// 入っているトークン数（DeltaNet のモデルを巻き戻したときは、次の計算の前に読み直す分も含む）
+    var length: Int { computed + pending.count }
+
+    /// Gated DeltaNet（Qwen3.5）の層ごとの状態（記憶 S と畳み込みの直前の入力。位置によらない大きさ。ほかの層は nil）。
+    /// 状態は巻き戻せないので、読んだトークン（history）を覚えておき、巻き戻すときは、プロンプトを読み終えたときに
+    /// 写しておいた状態（無ければ最初）に戻して、そこから読み直す（pending。CPU の GGUFModel と同じ）
+    private var deltaStates: [MTLBuffer?] = []
+    private var deltaHistories: [MTLBuffer?] = []
+    private var deltaWork: DeltaWork?
+    private var history: [Int] = []
+    private var pending: [Int] = []
+    private var snapshot: (position: Int, states: [MTLBuffer?], histories: [MTLBuffer?])?
+    /// 注意の出力のゲート（Qwen3.5）: q とゲートをまとめた射影と、分けたゲート
+    private let queryGate: MTLBuffer, outputGate: MTLBuffer
     /// 重みをコピーせずに GPU へ渡せたか（false のときはコピーしている）
     private(set) var usesMappedWeights = true
     /// 最後の計算で GPU が動いていた時間（秒。速さを調べる用）
@@ -202,12 +238,18 @@ final class GGUFMetalModel: GGUFEvaluator {
         guard let queue = device.makeCommandQueue() else { throw GGUFMetalError.unavailable("command queue") }
         let config = store.config
         let shapes = config.layers
-        // Gated DeltaNet の層・出力のゲートは、まだ GPU では計算しない（CPU で動かす）
-        if config.deltaNet != nil || config.attentionOutputGate { throw GGUFMetalError.unavailable("Gated DeltaNet") }
-        // 専門家の混合（MoE）も、まだ GPU では計算しない
+        // 専門家の混合（MoE）は、まだ GPU では計算しない
         if config.moe != nil { throw GGUFMetalError.unavailable("mixture of experts") }
+        // Gated DeltaNet（Qwen3.5）: キーのヘッドの大きさは 8〜256 の 2 のべき乗、畳み込みの長さは 9 まで
+        if let delta = config.deltaNet {
+            guard GGUFMetalSource.deltaRecurrence(keyHeadSize: delta.keyHeadSize) != nil, delta.convolutionLength >= 1,
+                  delta.convolutionLength <= 9, delta.keyHeads > 0, delta.valueHeads > 0 else {
+                throw GGUFMetalError.unavailable("Gated DeltaNet size \(delta.keyHeadSize)")
+            }
+        }
         // 注意の足し合わせは、ヘッドの大きさ ÷ 4 個のスレッドを 1 つの threadgroup に入れる（256 まで）
-        for shape in shapes where shape.headSize % 4 != 0 || shape.headSize > 1024 || shape.headCount % shape.kvHeadCount != 0 {
+        for shape in shapes where !shape.deltaNet
+            && (shape.headSize % 4 != 0 || shape.headSize > 1024 || shape.kvHeadCount == 0 || shape.headCount % shape.kvHeadCount != 0) {
             throw GGUFMetalError.unavailable("head size \(shape.headSize)")
         }
         self.store = store
@@ -245,13 +287,63 @@ final class GGUFMetalModel: GGUFEvaluator {
         let widestKV = shapes.map(\.kvSize).max() ?? 0
         stagedKeys = try Self.floats(device, capacity * widestKV)
         stagedValues = try Self.floats(device, capacity * widestKV)
+        queryGate = try Self.floats(device, config.attentionOutputGate ? capacity * 2 * q : 4)
+        outputGate = try Self.floats(device, config.attentionOutputGate ? capacity * q : 4)
         scoresCapacity = 64 * 1024
         scores = try Self.floats(device, scoresCapacity)
         vectors = try Self.floats(device, 4)
 
         try makePipelines()
         try bindWeights()
+        try makeDeltaNet(capacity: capacity)
         try allocateCache(min(self.maxContext, Self.initialCache))
+    }
+
+    /// Gated DeltaNet（Qwen3.5）の状態と作業用のメモリを用意する
+    private func makeDeltaNet(capacity: Int) throws {
+        deltaStates = Array(repeating: nil, count: shapes.count)
+        deltaHistories = Array(repeating: nil, count: shapes.count)
+        guard let sizes = config.deltaNet else { return }
+        for (index, shape) in shapes.enumerated() where shape.deltaNet {
+            deltaStates[index] = try Self.floats(device, sizes.stateFloats)
+            deltaHistories[index] = try Self.floats(device, max(1, sizes.convolutionLength - 1) * sizes.channels)
+        }
+        deltaWork = DeltaWork(projected: try Self.floats(device, capacity * sizes.channels),
+                              mixed: try Self.floats(device, capacity * sizes.channels),
+                              z: try Self.floats(device, capacity * sizes.valueSize),
+                              beta: try Self.floats(device, capacity * sizes.valueHeads),
+                              alpha: try Self.floats(device, capacity * sizes.valueHeads),
+                              core: try Self.floats(device, capacity * sizes.valueSize))
+        resetDeltaStates()
+    }
+
+    /// DeltaNet の状態を最初（0）に戻す
+    private func resetDeltaStates() {
+        for buffer in deltaStates + deltaHistories {
+            guard let buffer else { continue }
+            buffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: buffer.length)
+        }
+    }
+
+    /// DeltaNet の状態を写しておく（プロンプトを読み終えたとき。巻き戻すときはここから読み直す）
+    private func saveSnapshot() {
+        func copy(_ buffers: [MTLBuffer?], into existing: [MTLBuffer?]?) -> [MTLBuffer?] {
+            buffers.enumerated().map { index, buffer in
+                guard let buffer else { return nil }
+                let target = existing?[index] ?? device.makeBuffer(length: buffer.length, options: .storageModeShared)
+                target?.contents().copyMemory(from: buffer.contents(), byteCount: buffer.length)
+                return target
+            }
+        }
+        snapshot = (computed, copy(deltaStates, into: snapshot?.states), copy(deltaHistories, into: snapshot?.histories))
+    }
+
+    private func restoreSnapshot() {
+        guard let snapshot else { return }
+        for (source, target) in zip(snapshot.states + snapshot.histories, deltaStates + deltaHistories) {
+            guard let source, let target else { continue }
+            target.contents().copyMemory(from: source.contents(), byteCount: min(source.length, target.length))
+        }
     }
 
     private static func floats(_ device: MTLDevice, _ count: Int) throws -> MTLBuffer {
@@ -342,6 +434,7 @@ final class GGUFMetalModel: GGUFEvaluator {
         let source = try GGUFLayerWeights.load(index, store: store, config: config)
         var matrices: [GGUFMatrix] = [source.query, source.output, source.up, source.down]
         matrices += [source.key, source.value, source.gate, source.inputGate, source.projection].compactMap { $0 }
+        if let delta = source.delta { matrices += [delta.outputGate, delta.beta, delta.alpha] }
         layerSpans.append(Self.spans(matrices.flatMap(\.regions)))
         let shape = shapes[index]
         let d = config.embeddingSize, size = shape.headSize
@@ -369,7 +462,18 @@ final class GGUFMetalModel: GGUFEvaluator {
             projection: try source.projection.map { try weights($0, bias: nil) },
             perLayerPostNorm: source.perLayerPostNorm.map { norm($0, bias: nil, count: d) },
             outputScale: source.outputScale,
-            convolutionKernel: source.convolutionKernel.map { pooled($0, d * config.convolutionLength) })
+            convolutionKernel: shape.deltaNet ? nil : source.convolutionKernel.map { pooled($0, d * config.convolutionLength) },
+            delta: try deltaWeights(source))
+    }
+
+    /// Gated DeltaNet の層の重み（ほかの層は nil）
+    private func deltaWeights(_ source: GGUFLayerWeights) throws -> DeltaWeights? {
+        guard let delta = source.delta, let sizes = config.deltaNet, let kernel = source.convolutionKernel else { return nil }
+        return DeltaWeights(outputGate: try weights(delta.outputGate, bias: nil), beta: try weights(delta.beta, bias: nil),
+                            alpha: try weights(delta.alpha, bias: nil),
+                            timeStepBias: pooled(delta.timeStepBias, sizes.valueHeads), decay: pooled(delta.decay, sizes.valueHeads),
+                            norm: norm(delta.norm, bias: nil, count: sizes.valueHeadSize),
+                            kernel: pooled(kernel, sizes.channels * sizes.convolutionLength))
     }
 
     private func norm(_ weight: UnsafePointer<Float>?, bias: UnsafePointer<Float>?, count: Int) -> Norm {
@@ -459,8 +563,8 @@ final class GGUFMetalModel: GGUFEvaluator {
             keys = Array(repeating: nil, count: shapes.count)
             values = Array(repeating: nil, count: shapes.count)
         }
-        for (index, shape) in shapes.enumerated() where shape.kvLayer == index {
-            // 畳み込みの層（LFM2）は、位置ごとの b × x を keys に覚える
+        for (index, shape) in shapes.enumerated() where shape.kvLayer == index && !shape.deltaNet {
+            // 畳み込みの層（LFM2）は、位置ごとの b × x を keys に覚える（DeltaNet の層は KV キャッシュを使わない）
             let width = shape.convolution ? config.embeddingSize : shape.kvSize
             let half = cacheInHalf && !shape.convolution
             let key = half ? try Self.halves(device, capacity * width) : try Self.floats(device, capacity * width)
@@ -468,7 +572,7 @@ final class GGUFMetalModel: GGUFEvaluator {
                 : (half ? try Self.halves(device, capacity * width) : try Self.floats(device, capacity * width))
             // 今入っている分は引き継ぐ
             let elementBytes = half ? 2 : MemoryLayout<Float>.size
-            let used = min(length, previous, capacity) * width * elementBytes
+            let used = min(computed, previous, capacity) * width * elementBytes
             if used > 0, let oldKey = keys[index], let oldValue = values[index] {
                 key.contents().copyMemory(from: oldKey.contents(), byteCount: used)
                 if !shape.convolution { value.contents().copyMemory(from: oldValue.contents(), byteCount: used) }
@@ -498,13 +602,44 @@ final class GGUFMetalModel: GGUFEvaluator {
         try reserveScores(min(Self.scoresBudget, batchCapacity * config.maxHeadCount * needed))
     }
 
+    /// KV キャッシュを newLength トークンまで巻き戻す。
+    /// DeltaNet の状態は巻き戻せないので、写しておいた状態（無ければ最初）に戻し、そこから newLength までを次の計算の前に読み直す
     func truncate(to newLength: Int) {
-        length = max(0, min(length, newLength))
+        let target = max(0, min(length, newLength))
+        guard config.hasRecurrentState else {
+            computed = target
+            return
+        }
+        if target >= computed {
+            pending = Array(pending.prefix(target - computed))
+            return
+        }
+        rewindRecurrentState(to: target)
+    }
+
+    /// DeltaNet の状態を target の位置（computed 以下）にする: 写しておいた状態（無ければ最初）に戻し、
+    /// そこから target までを、次の計算の前に読み直す
+    private func rewindRecurrentState(to target: Int) {
+        var from = 0
+        if let snapshot, snapshot.position <= target {
+            restoreSnapshot()
+            from = snapshot.position
+        } else {
+            snapshot = nil
+            resetDeltaStates()
+        }
+        pending = Array(history[from..<min(target, history.count)])
+        history = Array(history.prefix(from))
+        computed = from
     }
 
     /// KV キャッシュを空にして、使っていたメモリを返す（最初の大きさで用意し直す）
     func releaseCache() {
-        length = 0
+        computed = 0
+        pending = []
+        history = []
+        snapshot = nil
+        resetDeltaStates()
         keys = []
         values = []
         cacheCapacity = 0
@@ -518,6 +653,17 @@ final class GGUFMetalModel: GGUFEvaluator {
     @discardableResult
     func evaluate(_ tokens: [Int], batch: Int, progress: ((Int) throws -> Void)?) throws -> [Float] {
         try validate(tokens)
+        // 巻き戻したあとの読み直し（DeltaNet のモデル）
+        if !pending.isEmpty {
+            let replay = pending
+            pending = []
+            var offset = 0
+            while offset < replay.count {
+                let count = batchCount(wanted: min(batch, replay.count - offset))
+                _ = try forward(Array(replay[offset..<(offset + count)]), wantsLogits: false)
+                offset += count
+            }
+        }
         var offset = 0
         var result: [Float] = []
         while offset < tokens.count {
@@ -529,20 +675,22 @@ final class GGUFMetalModel: GGUFEvaluator {
             offset += count
             try progress?(offset)
         }
+        // まとめて読み込んだ（プロンプトの）終わりの DeltaNet の状態を写しておく（次の発言で、ここまで巻き戻して使う）
+        if config.hasRecurrentState && tokens.count > 1 { saveSnapshot() }
         return result
     }
 
     /// 次に 1 回で計算するトークン数（スコア用のメモリに収まる範囲で）
     private func batchCount(wanted: Int) -> Int {
         var count = max(1, min(wanted, batchCapacity))
-        while count > 1 && count * config.maxHeadCount * (length + count) > Self.scoresBudget { count /= 2 }
+        while count > 1 && count * config.maxHeadCount * (computed + count) > Self.scoresBudget { count /= 2 }
         return count
     }
 
     /// all: どの位置の logits と隠れ状態も計算する（先読みの確かめ。logits は verifiedLogitsBuffer に入る）
     private func forward(_ tokens: [Int], wantsLogits: Bool, all: Bool = false, profile: Commands.Profile? = nil) throws -> [Float] {
         let n = tokens.count
-        let start = length
+        let start = computed
         if prefetchesWeights { prefetchWeights(wantsLogits: wantsLogits) }
         if cacheCapacity == 0 { try allocateCache(min(maxContext, Self.initialCache)) }
         try reserveCache(start + n)
@@ -564,9 +712,17 @@ final class GGUFMetalModel: GGUFEvaluator {
             try commands.begin("output")
             encodeOutput(commands.encoder, count: n, all: all)
         }
-        try commands.finish()
+        do {
+            try commands.finish()
+        } catch {
+            // GPU の計算が途中で失敗した: DeltaNet の状態は途中まで書き換わっているかもしれないので、
+            // 写しておいた状態から、ここまでを読み直すことにする（KV キャッシュは長さを進めないので、そのままでよい）
+            if config.hasRecurrentState { rewindRecurrentState(to: start) }
+            throw error
+        }
         lastGPUSeconds = commands.gpuSeconds
-        length = start + n
+        computed = start + n
+        if config.hasRecurrentState { history.append(contentsOf: tokens) }
         guard wantsLogits else { return [] }
         // 出力層の前の隠れ状態（正規化したもの）を覚えておく
         let d = config.embeddingSize
@@ -1227,12 +1383,25 @@ final class GGUFMetalModel: GGUFEvaluator {
             encodeConvolution(encoder, layer: index, input: input, start: start, count: n)
             return
         }
+        if shape.deltaNet {
+            encodeDeltaNet(encoder, layer: index, input: input, count: n)
+            return
+        }
         let d = config.embeddingSize, q = shape.querySize, kv = shape.kvSize, size = shape.headSize
         let heads = shape.headCount, kvHeads = shape.kvHeadCount
         guard let keyBuffer = keys[shape.kvLayer], let valueBuffer = values[shape.kvLayer] else { return }
         let cacheOffset = start * kv
 
-        linear(encoder, layer.query, input: input, inStride: d, count: n, output: queries, outStride: q)
+        if config.attentionOutputGate {
+            // Qwen3.5: q の射影はヘッドごとに [q | ゲート]。分けて、ゲートは注意の出力に掛ける
+            linear(encoder, layer.query, input: input, inStride: d, count: n, output: queryGate, outStride: 2 * q)
+            var split = GGUFMetalArgs()
+            split.count = UInt32(n * heads)
+            split.size = UInt32(size)
+            run(.splitQueryGate, encoder, [(queryGate, 0), (queries, 0), (outputGate, 0)], split, width: size, height: n * heads)
+        } else {
+            linear(encoder, layer.query, input: input, inStride: d, count: n, output: queries, outStride: q)
+        }
         normalizeAndRotate(encoder, queries, layer.queryNorm, heads: heads, count: n, layer: index)
 
         if shape.kvLayer == index, let key = layer.key {
@@ -1271,8 +1440,57 @@ final class GGUFMetalModel: GGUFEvaluator {
         let quads = size / 4
         run(cacheInHalf ? .attentionCombineHalf : .attentionCombine, encoder, combineBindings, arguments, groups: rows,
             threads: quads * max(1, 256 / quads))
+        if config.attentionOutputGate {
+            var gate = GGUFMetalArgs()
+            gate.count = UInt32(n * q)
+            run(.sigmoidGate, encoder, [(attended, 0), (outputGate, 0)], gate, width: n * q)
+        }
 
         linear(encoder, layer.output, input: attended, inStride: q, count: n, output: projected, outStride: d)
+    }
+
+    /// Gated DeltaNet の層（Qwen3.5）の、注意の代わりの部分: q・k・v の射影 → 短い畳み込みと SiLU → 記憶の更新と出力
+    /// → ヘッドごとの RMSNorm × silu(z) → 出力の射影（projected に書く）。GGUFDeltaNetLayer（CPU）と同じ計算
+    private func encodeDeltaNet(_ encoder: MTLComputeCommandEncoder, layer index: Int, input: MTLBuffer, count n: Int) {
+        let layer = layers[index]
+        guard let delta = layer.delta, let sizes = config.deltaNet, let state = deltaStates[index], let history = deltaHistories[index],
+              let work = deltaWork, let recurrence = GGUFMetalSource.deltaRecurrence(keyHeadSize: sizes.keyHeadSize) else { return }
+        let d = config.embeddingSize, channels = sizes.channels
+        linear(encoder, layer.query, input: input, inStride: d, count: n, output: work.projected, outStride: channels)
+        linear(encoder, delta.outputGate, input: input, inStride: d, count: n, output: work.z, outStride: sizes.valueSize)
+        linear(encoder, delta.beta, input: input, inStride: d, count: n, output: work.beta, outStride: sizes.valueHeads)
+        linear(encoder, delta.alpha, input: input, inStride: d, count: n, output: work.alpha, outStride: sizes.valueHeads)
+
+        var convolution = GGUFMetalArgs()
+        convolution.columns = UInt32(channels)
+        convolution.count = UInt32(n)
+        convolution.size = UInt32(sizes.convolutionLength)
+        run(.deltaConvolve, encoder, [(work.projected, 0), (history, 0), vector(delta.kernel), (work.mixed, 0)], convolution,
+            width: channels, height: n)
+        run(.deltaHistory, encoder, [(work.projected, 0), (history, 0)], convolution, width: channels)
+
+        var step = GGUFMetalArgs()
+        step.count = UInt32(n)
+        step.heads = UInt32(sizes.valueHeads)
+        step.kvHeads = UInt32(sizes.keyHeads)
+        step.size = UInt32(sizes.keyHeadSize)
+        step.pairs = UInt32(sizes.valueHeadSize)
+        step.columns = UInt32(channels)
+        step.epsilon = config.normEpsilon
+        step.scale = 1 / Float(sizes.valueHeadSize).squareRoot()
+        // threadgroup 1 つで 32 行（GPU が 256 スレッドを入れられなければ、入るだけの行）
+        let limit = pipelines[recurrence]?.maxTotalThreadsPerThreadgroup ?? 256
+        let threads = max(32, min(GGUFMetalSource.deltaRows * GGUFMetalSource.deltaLanes, limit / 32 * 32))
+        let rowsPerGroup = threads / GGUFMetalSource.deltaLanes
+        let blocks = (sizes.valueHeadSize + rowsPerGroup - 1) / rowsPerGroup
+        let bindings: [Binding] = [(work.mixed, 0), (work.beta, 0), (work.alpha, 0), vector(delta.timeStepBias), vector(delta.decay),
+                                   (state, 0), (work.core, 0)]
+        run(recurrence, encoder, bindings, step, groups: sizes.valueHeads * blocks, threads: threads)
+
+        // ヘッドごとの RMSNorm × silu(z)（z = silu(z) × 正規化した出力。どのヘッドも同じ重み）
+        normalize(encoder, work.core, delta.norm, into: work.core, rows: n * sizes.valueHeads, columns: sizes.valueHeadSize, rms: true)
+        activate(encoder, work.z, up: work.core, activation: .silu, count: n * sizes.valueSize)
+        linear(encoder, layer.output, input: work.z, inStride: sizes.valueSize, count: n, output: projected, outStride: d)
     }
 
     private func encodeFeedForward(_ encoder: MTLComputeCommandEncoder, layer index: Int, input: MTLBuffer, count n: Int) {
@@ -1442,8 +1660,8 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
     var canDraft: Bool { drafter != nil }
 
     func draft(after token: Int, hidden state: [Float], count: Int) throws -> [Int] {
-        guard let drafter, count > 0, length > 0 else { return [] }
-        let position = length, outer = drafter.config.drafterOutputSize
+        guard let drafter, count > 0, computed > 0 else { return [] }
+        let position = computed, outer = drafter.config.drafterOutputSize
         let steps = min(count, Drafter.maxDrafts)
         try reserveScores(drafter.config.maxHeadCount * position)
         fill(drafter.rotation, drafter.fullRope, start: position, count: 1)
@@ -1519,7 +1737,7 @@ extension GGUFMetalModel: GGUFSpeculativeEvaluator {
         if (verifiedLogitsBuffer?.length ?? 0) < tokens.count * rows * MemoryLayout<Float>.size {
             verifiedLogitsBuffer = try Self.floats(device, max(tokens.count, 4) * rows)
         }
-        verifyStart = length
+        verifyStart = computed
         _ = try forward(tokens, wantsLogits: true, all: true)
     }
 

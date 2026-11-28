@@ -66,6 +66,18 @@ enum GGUFMetalSource {
         case attentionScoresHalf = "attention_scores_half"
         case attentionCombineHalf = "attention_combine_half"
         case storeKV = "store_kv"
+        /// Gated DeltaNet（Qwen3.5）: 短い畳み込み・その記録の更新・記憶の更新（数字はキーのヘッドの大きさ ÷ 8）
+        case deltaConvolve = "delta_convolve"
+        case deltaHistory = "delta_history"
+        case deltaRecurrence1 = "delta_recurrence_1"
+        case deltaRecurrence2 = "delta_recurrence_2"
+        case deltaRecurrence4 = "delta_recurrence_4"
+        case deltaRecurrence8 = "delta_recurrence_8"
+        case deltaRecurrence16 = "delta_recurrence_16"
+        case deltaRecurrence32 = "delta_recurrence_32"
+        /// 注意の出力のゲート（Qwen3.5）
+        case splitQueryGate = "split_query_gate"
+        case sigmoidGate = "sigmoid_gate"
         case scaleAdd = "scale_add"
         case gatedActivation = "gated_activation"
         case convolutionPrepare = "convolution_prepare"
@@ -122,6 +134,18 @@ enum GGUFMetalSource {
     }
 
     static let splitMax = 4
+    /// Gated DeltaNet の記憶の更新: threadgroup 1 つが受け持つ記憶の行と、1 行を分けるスレッドの数
+    static let deltaRows = 32
+    static let deltaLanes = 8
+
+    /// Gated DeltaNet の記憶の更新の計算（キーのヘッドの大きさ ÷ 8 の列を 1 つのスレッドが持つ。キーのヘッドの大きさは 8〜256 の 2 のべき乗）
+    static func deltaRecurrence(keyHeadSize: Int) -> Kernel? {
+        guard keyHeadSize % deltaLanes == 0 else { return nil }
+        let kernels: [Int: Kernel] = [1: .deltaRecurrence1, 2: .deltaRecurrence2, 4: .deltaRecurrence4, 8: .deltaRecurrence8,
+                                      16: .deltaRecurrence16, 32: .deltaRecurrence32]
+        return kernels[keyHeadSize / deltaLanes]
+    }
+
     /// 行列の掛け算（simdgroup の 8×8）でまとめて計算するときの、threadgroup 1 つが受け持つ行・トークンと、スレッドの数
     static let matrixRows = 32
     static let matrixTokens = 8
@@ -1392,6 +1416,153 @@ enum GGUFMetalSource {
         }
         device const float *row = projected + gid.y * 3u * a.columns;
         output[gid.y * a.columns + gid.x] = sum * row[a.columns + gid.x];
+    }
+
+    // Gated DeltaNet（Qwen3.5）の 1: 短い畳み込みと SiLU。out[t][c] = silu(Σ_i w[c][i] × x(t + i, c))。
+    // x は [直前の (長さ − 1) 行の記録, 新しい count 行]。gid.x = チャンネル、gid.y = トークン。columns = チャンネル数、size = 長さ
+    kernel void delta_convolve(device const float *projected [[buffer(0)]],
+                               device const float *history [[buffer(1)]],
+                               device const float *kernel_weights [[buffer(2)]],
+                               device float *output [[buffer(3)]],
+                               constant Args &a [[buffer(4)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= a.columns || gid.y >= a.count) { return; }
+        uint length = a.size;
+        uint keep = length - 1u;
+        float sum = 0.0f;
+        for (uint i = 0u; i < length; i++) {
+            uint source = gid.y + i;
+            float x = source < keep ? history[source * a.columns + gid.x] : projected[(source - keep) * a.columns + gid.x];
+            sum += kernel_weights[gid.x * length + i] * x;
+        }
+        output[gid.y * a.columns + gid.x] = silu(sum);
+    }
+
+    // 2: 畳み込みの記録を、並べた入力の最後の (長さ − 1) 行にする（delta_convolve のあと）。gid = チャンネル。
+    // どのスレッドも自分のチャンネルだけを読んでから書くので、記録をそのまま書き換えられる（長さは 9 まで）
+    kernel void delta_history(device const float *projected [[buffer(0)]],
+                              device float *history [[buffer(1)]],
+                              constant Args &a [[buffer(2)]],
+                              uint gid [[thread_position_in_grid]]) {
+        if (gid >= a.columns) { return; }
+        uint keep = min(a.size - 1u, 8u);
+        float values[8];
+        for (uint r = 0u; r < keep; r++) {
+            uint source = a.count + r;
+            values[r] = source < keep ? history[source * a.columns + gid] : projected[(source - keep) * a.columns + gid];
+        }
+        for (uint r = 0u; r < keep; r++) { history[r * a.columns + gid] = values[r]; }
+    }
+
+    // 8 つのスレッド（SIMD グループの中の、8 の倍数から並んだ 8 つ）での合計
+    inline float sum8(float v) {
+        v += simd_shuffle_xor(v, ushort(4));
+        v += simd_shuffle_xor(v, ushort(2));
+        v += simd_shuffle_xor(v, ushort(1));
+        return v;
+    }
+
+    #define DELTA_LANES 8u
+
+    // 3: 記憶の更新と出力。トークンを順に、バリューのヘッドごとに（llama.cpp の ggml_gated_delta_net、GGUFDeltaNetLayer と同じ）:
+    //   S ← S × 減衰、δ = (v − S·k̂) × β、S ← S + δ ⊗ k̂、出力 = S·q̂ × scale（k̂・q̂ は L2 正規化した k・q）
+    //   β = sigmoid(betaRaw)、減衰 = exp(softplus(alphaRaw + timeStepBias) × decay)
+    // S は [バリューのヘッド][バリューの次元 i][キーの次元 j]。行 i どうしは別々に更新できるので、threadgroup 1 つで
+    // 1 つのヘッドの 32 行を受け持ち、1 行を 8 つのスレッドで分ける。スレッドは C 列（キーのヘッドの大きさ ÷ 8）を
+    // レジスタに持ったまま全部のトークンを読み、最後に書き戻す。
+    // mixed = [トークン][q（キー全体） | k（キー全体） | v（バリュー全体）]（畳み込みと SiLU のあと）、columns はその行の長さ。
+    // heads = バリューのヘッドの数、kvHeads = キーのヘッドの数（バリューのヘッド h はキーのヘッド h % kvHeads を使う）、
+    // size = キーのヘッドの大きさ、pairs = バリューのヘッドの大きさ、epsilon = L2 正規化の ε、scale = 出力の倍率
+    template <uint C>
+    kernel void delta_recurrence_t(device const float *mixed [[buffer(0)]],
+                                   device const float *betaRaw [[buffer(1)]],
+                                   device const float *alphaRaw [[buffer(2)]],
+                                   device const float *timeStepBias [[buffer(3)]],
+                                   device const float *decay [[buffer(4)]],
+                                   device float *state [[buffer(5)]],
+                                   device float *core [[buffer(6)]],
+                                   constant Args &a [[buffer(7)]],
+                                   uint group [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_position_in_threadgroup]],
+                                   uint threads [[threads_per_threadgroup]]) {
+        uint dk = a.size, dv = a.pairs;
+        // threadgroup の行の数（ふつうは 32。GPU がそれだけのスレッドを入れられなければ少なく。32 の倍数のスレッドで 4 の倍数）
+        uint rowsPerGroup = threads / DELTA_LANES;
+        uint blocks = (dv + rowsPerGroup - 1u) / rowsPerGroup;
+        uint head = group / blocks;
+        uint i = (group % blocks) * rowsPerGroup + tid / DELTA_LANES;
+        uint lane = tid % DELTA_LANES;
+        if (head >= a.heads || i >= dv) { return; }
+        uint keySize = a.kvHeads * dk;
+        uint keyHead = head % a.kvHeads;
+        device float *row = state + (head * dv + i) * dk;
+        float s[C];
+        for (uint c = 0u; c < C; c++) { s[c] = row[lane + c * DELTA_LANES]; }
+        float bias = timeStepBias[head];
+        float rate = decay[head];
+        for (uint t = 0u; t < a.count; t++) {
+            device const float *x = mixed + t * a.columns;
+            device const float *q = x + keyHead * dk;
+            device const float *k = x + keySize + keyHead * dk;
+            float qq = 0.0f, kk = 0.0f;
+            for (uint c = 0u; c < C; c++) {
+                uint j = lane + c * DELTA_LANES;
+                qq += q[j] * q[j];
+                kk += k[j] * k[j];
+            }
+            float qn = rsqrt(sum8(qq) + a.epsilon);
+            float kn = rsqrt(sum8(kk) + a.epsilon);
+            float beta = 1.0f / (1.0f + exp(-betaRaw[t * a.heads + head]));
+            float g = alphaRaw[t * a.heads + head] + bias;
+            float softplus = g > 20.0f ? g : log(1.0f + exp(g));
+            float keep = exp(softplus * rate);
+            float recalled = 0.0f;
+            for (uint c = 0u; c < C; c++) {
+                s[c] *= keep;
+                recalled += s[c] * k[lane + c * DELTA_LANES];
+            }
+            recalled = sum8(recalled) * kn;
+            // δ × k̂ の k̂ の正規化（kn）も、ここで掛けておく
+            float written = (x[2u * keySize + head * dv + i] - recalled) * beta * kn;
+            float out = 0.0f;
+            for (uint c = 0u; c < C; c++) {
+                uint j = lane + c * DELTA_LANES;
+                s[c] += written * k[j];
+                out += s[c] * q[j];
+            }
+            out = sum8(out) * qn * a.scale;
+            if (lane == 0u) { core[t * a.heads * dv + head * dv + i] = out; }
+        }
+        for (uint c = 0u; c < C; c++) { row[lane + c * DELTA_LANES] = s[c]; }
+    }
+    typedef decltype(delta_recurrence_t<16>) delta_recurrence_kernel_t;
+    template [[host_name("delta_recurrence_1")]] kernel delta_recurrence_kernel_t delta_recurrence_t<1>;
+    template [[host_name("delta_recurrence_2")]] kernel delta_recurrence_kernel_t delta_recurrence_t<2>;
+    template [[host_name("delta_recurrence_4")]] kernel delta_recurrence_kernel_t delta_recurrence_t<4>;
+    template [[host_name("delta_recurrence_8")]] kernel delta_recurrence_kernel_t delta_recurrence_t<8>;
+    template [[host_name("delta_recurrence_16")]] kernel delta_recurrence_kernel_t delta_recurrence_t<16>;
+    template [[host_name("delta_recurrence_32")]] kernel delta_recurrence_kernel_t delta_recurrence_t<32>;
+
+    // 注意の出力のゲート（Qwen3.5）の 1: q の射影 [トークン × ヘッド][q, ゲート] を、q とゲートに分ける。
+    // gid.x = ヘッドの中の位置、gid.y = トークン × ヘッド（count 個）、size = ヘッドの大きさ
+    kernel void split_query_gate(device const float *full [[buffer(0)]],
+                                 device float *queries [[buffer(1)]],
+                                 device float *gate [[buffer(2)]],
+                                 constant Args &a [[buffer(3)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= a.size || gid.y >= a.count) { return; }
+        device const float *row = full + gid.y * 2u * a.size;
+        queries[gid.y * a.size + gid.x] = row[gid.x];
+        gate[gid.y * a.size + gid.x] = row[a.size + gid.x];
+    }
+
+    // 2: 注意の出力 × sigmoid(ゲート)。gid = 要素
+    kernel void sigmoid_gate(device float *x [[buffer(0)]],
+                             device const float *gate [[buffer(1)]],
+                             constant Args &a [[buffer(2)]],
+                             uint gid [[thread_position_in_grid]]) {
+        if (gid >= a.count) { return; }
+        x[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
     }
 
     // gate = act(gate) × up（flags に 128 があれば up と掛けない）。gid = 要素。
